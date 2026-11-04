@@ -6,7 +6,7 @@ import type { VectorMetaData } from '../../core/runtime-components/contracts'
  * `oldVersion === 0` (fresh database).
  */
 export const VECTOR_DATABASE_VERSION = 1
-export const VECTOR_DATABASE_NAME_PREFIX = 'yolo-vector:'
+export const VECTOR_DATABASE_NAME_PREFIX = 'ob-bot-vector:'
 export const CHUNKS_STORE = 'chunks'
 export const MODEL_INDEX = 'model'
 /**

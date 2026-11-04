@@ -78,6 +78,8 @@ export type ApplyStagedUpdateResult =
   | { ok: false; reason: 'not_ready' | 'min_app_version' | 'write_failed' }
 
 export function canSelfUpdate(plugin: YoloPlugin): boolean {
+  // The signed upstream feed distributes YOLO core, not this derivative.
+  if (plugin.manifest.id === 'ob-bot') return false
   if (!Platform.isDesktop) {
     return false
   }

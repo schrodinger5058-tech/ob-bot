@@ -1,0 +1,22 @@
+.yolo-ob-bot-workspace {
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
+  overflow-y: auto;
+}
+.yolo-ob-bot-workspace > div {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.yolo-ob-bot-workspace button {
+  min-height: 36px;
+  margin: 4px;
+}
+.yolo-ob-bot-workspace textarea {
+  display: block;
+  width: 100%;
+  min-height: 80px;
+  resize: vertical;
+}
+.yolo-ob-bot-workspace p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

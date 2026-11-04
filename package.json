@@ -158,5 +158,14 @@
     "@huggingface/transformers": {
       "onnxruntime-web": "$onnxruntime-web"
     }
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "sharp@0.34.5": true,
+    "sharp@0.33.5": true,
+    "@mongodb-js/zstd@7.0.0": true,
+    "onnxruntime-node@1.24.3": true,
+    "protobufjs@7.5.8": true,
+    "workerd@1.20250726.0": true
   }
 }

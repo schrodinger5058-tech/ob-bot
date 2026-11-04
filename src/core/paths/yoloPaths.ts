@@ -41,7 +41,7 @@ export const YOLO_COMPONENT_INTENT_DIR_NAME = 'component-intent-v1'
 // Fixed-name pointer file at vault root. Its content is a JSON object
 // { "dataPath": "<vault-relative path to .yolo_data.json>" } used to locate
 // the actual mirror file whose directory depends on `yolo.baseDir`.
-export const YOLO_SYNC_POINTER_FILE_NAME = '.yolo_sync'
+export const YOLO_SYNC_POINTER_FILE_NAME = '.ob-bot_sync'
 export const LEGACY_JSON_DB_DIR_NAME = '.smtcmp_json_db'
 export const LEGACY_VECTOR_DB_FILE_NAME = '.smtcmp_vector_db.tar.gz'
 

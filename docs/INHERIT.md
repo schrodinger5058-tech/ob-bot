@@ -1,3 +1,5 @@
 # Inherit from YOLO
 
 Baseline `975018f546602544b953f9a8f2bbd217e368a37b`. Preserve native runtime, ChatView and all placements, streaming store, conversation JSON, providers, RAG/vector storage, assistant/global memory, skills, MCP, tool dispatcher/approvals, Quick Ask, Sparkle, modules, Learning, Whiteboard, CLI and runtime components. Evidence: FEATURE_MATRIX.md and inherited FEATURE_MAP.md. Rebranding and additive bot integration are the intended exceptions; no module replacement is planned. Desktop dependencies stay behind existing platform/lazy-loading boundaries.
+
+Identity exceptions: default managed root is `ob-bot`, the sync pointer is `.ob-bot_sync`, native chat view ID is `ob-bot-chat-view`, and vector database prefix is `ob-bot-vector:`. These prevent core storage/view collisions with upstream. The upstream signed distribution feed remains the source of compatible modules/runtime components; core self-update is disabled for the derivative because installing upstream core assets would overwrite ob-bot identity and extensions. No runtime module is replaced.

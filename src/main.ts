@@ -10,7 +10,6 @@ import {
   TFile,
   TFolder,
   addIcon,
-  getLanguage,
   normalizePath,
   setIcon,
 } from 'obsidian'
@@ -67,7 +66,7 @@ import { getCliRuntimeDescriptor } from './core/cli-runtime/registry'
 import type { CliActiveRunState } from './core/cli-runtime/types'
 import { CLI_RUNTIME_IDS } from './core/cli-runtime/types'
 import { DistributionFeedClient } from './core/distribution/distributionFeedClient'
-import { localeStore } from './core/i18n/localeStore'
+import { localeStore, setPreferredLocale } from './core/i18n/localeStore'
 import {
   bindClaudeSdkHost,
   unbindClaudeSdkHost,
@@ -262,6 +261,7 @@ import {
   type StartSelectionRewriteOptions,
 } from './features/editor/selection-rewrite/selectionRewriteController'
 import { TabCompletionController } from './features/editor/tab-completion/tabCompletionController'
+import { registerBotWorkspace } from './features/ob-bot/view'
 import { enablePdfScreenshotFeature } from './features/pdf-screenshot'
 import {
   type Language,
@@ -1213,7 +1213,7 @@ export default class YoloPlugin extends Plugin {
   }
 
   private resolveObsidianLanguage(): Language {
-    return resolveLanguageFromLocale(getLanguage())
+    return resolveLanguageFromLocale(localeStore.getSnapshot().locale)
   }
 
   private warnIfInstallationIncomplete() {
@@ -2263,6 +2263,11 @@ export default class YoloPlugin extends Plugin {
     addIcon(YOLO_ICON_ID, YOLO_ICON_SVG)
 
     await this.loadSettings()
+    setPreferredLocale(
+      this.settings.obBotLocale === 'system'
+        ? undefined
+        : this.settings.obBotLocale,
+    )
     this.liteSkillRegistryDispose = initializeLiteSkillRegistryService({
       app: this.app,
       settings: this.settings,
@@ -2278,8 +2283,10 @@ export default class YoloPlugin extends Plugin {
       }
       moduleAutoDownloadEnabled = next
     })
+    await loadLocale('en')
     await loadLocale(this.resolveObsidianLanguage())
     this._tCache = undefined
+    await registerBotWorkspace(this)
     await this.migrateLegacyVaultMirrorIfNeeded()
     await this.migrateHiddenYoloBaseDirIfNeeded()
     try {
@@ -4106,7 +4113,7 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     // The Feed and the module catalog are loaded in every mode: they are also
     // what `设置 → 模块` shows. Only prompting and installing follow the mode.
     const [core] = await Promise.all([
-      this.distributionFeedClient
+      this.manifest.id !== 'ob-bot' && this.distributionFeedClient
         ? checkForUpdate(this.manifest.version, this.distributionFeedClient)
         : null,
       this.moduleService?.checkForUpdates().catch((error: unknown) => {

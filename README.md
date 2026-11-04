@@ -1,3 +1,15 @@
+# ob-bot · YOLO-based multi-bot workspace
+
+This branch (`refactor/yolo-base`) derives from YOLO v1.6.14 at `975018f546602544b953f9a8f2bbd217e368a37b`. Plugin identity/version: `ob-bot` / `0.2.0-dev`. The original YOLO README follows below; its upstream release/install links refer to YOLO, not this derivative.
+
+Build with `npm ci` then `npm run build`. Copy `main.js`, `styles.css`, and `manifest.json` into your vault's configured plugins directory under `ob-bot/`. Enable ob-bot, configure a provider/model using the inherited settings, and run the **机器人工作区 / Bot workspace** command. Create a bot with a lowercase handle, open its native YOLO chat, or create a group with a lead and members. Use `@handle` for direct routing; an unaddressed message invokes lead planning, separate workers and lead merge. Advanced bot tools, skills, avatars and vault scope use inherited assistant settings. Chinese is the default; workspace language preference applies on plugin reload.
+
+Group runs currently have no tool capabilities. DM retains native YOLO tools and approvals. Memory flags/knowledge-base IDs are stored extension hooks, not new enforcement. The workspace is a functional first slice, not an observed Grokbot visual replica. See [rebase summary](docs/REBASE_SUMMARY.md), [feature evidence](docs/FEATURE_MATRIX.md), and [build status](docs/BUILD_STATUS.md). iPhone on-device unverified; upstream remote MCP is disabled on mobile. Upstream core self-update is disabled for ob-bot; compatible module/runtime distribution remains inherited.
+
+Original v0.1.0 data must be backed up before installing this branch. No automatic legacy importer is included. Do not overwrite legacy data.json; see migration design in the summary.
+
+---
+
 <h1 align="center">YOLO</h1>
 <p align="center">
   Agent-native AI assistant for Obsidian — chat, write, knowledge base, and orchestration, all in one place.

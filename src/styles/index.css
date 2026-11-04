@@ -52,3 +52,5 @@
 @import './pdf-screenshot.css';
 @import './pdf/text-layer.css';
 @import './config-transfer.css';
+
+@import './panels/ob-bot-workspace.css';

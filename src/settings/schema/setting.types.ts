@@ -408,6 +408,7 @@ export const pluginUpdateModeSchema = z.enum(['auto', 'notify', 'off'])
 export type PluginUpdateMode = z.infer<typeof pluginUpdateModeSchema>
 
 export const yoloSettingsSchema = z.object({
+  obBotLocale: z.enum(['zh', 'en', 'system']).catch('zh'),
   // Version
   version: z.literal(SETTINGS_SCHEMA_VERSION).catch(SETTINGS_SCHEMA_VERSION),
 
@@ -574,10 +575,10 @@ export const yoloSettingsSchema = z.object({
   // YOLO workspace configuration
   yolo: z
     .object({
-      baseDir: z.string().catch('YOLO'),
+      baseDir: z.string().catch('ob-bot'),
     })
     .catch({
-      baseDir: 'YOLO',
+      baseDir: 'ob-bot',
     }),
 
   debug: z

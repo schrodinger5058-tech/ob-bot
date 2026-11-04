@@ -57,7 +57,8 @@ export function createTranslationFunction(language: Language) {
 
   return function translate(keyPath: string, fallback?: string): string {
     const keys = keyPath.split('.')
-    const value = getNestedString(t, keys)
+    const value =
+      getNestedString(t, keys) ?? getNestedString(translations.en ?? null, keys)
 
     return typeof value === 'string' ? value : fallback || keyPath
   }

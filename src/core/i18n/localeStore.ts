@@ -81,8 +81,15 @@ export function normalizeLocale(value: unknown): string {
   return normalized || 'en'
 }
 
+let preferredLocale: string | undefined = 'zh-CN'
+export function setPreferredLocale(locale: string | undefined) {
+  preferredLocale = locale
+  localeStore.refresh()
+}
+
 export const localeStore = new LocaleStore({
   readLocale: () =>
+    preferredLocale ??
     String(typeof getLanguage === 'function' ? (getLanguage() ?? '') : 'en'),
   document: typeof document === 'undefined' ? undefined : document,
   window: typeof window === 'undefined' ? undefined : window,

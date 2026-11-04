@@ -7,6 +7,44 @@ export type DeepPartial<T> = {
 }
 
 export type TranslationKeys = {
+  obBot?: {
+    title: string
+    createBot: string
+    editBot: string
+    handle: string
+    name: string
+    prompt: string
+    model: string
+    defaultModel: string
+    openChat: string
+    groups: string
+    createGroup: string
+    lead: string
+    groupPrompt: string
+    send: string
+    cancel: string
+    refresh: string
+    tasks: string
+    language: string
+    systemLanguage: string
+    restartLanguage: string
+    profileHint: string
+    plan: string
+    work: string
+    merge: string
+    running: string
+    complete: string
+    failed: string
+    interrupted: string
+    invalidMention: string
+    invalidPlan: string
+    invalidBot: string
+    invalidModel: string
+    invalidGroup: string
+    invalidStore: string
+    busy: string
+  }
+
   // Commands
   commands: {
     openChat: string
