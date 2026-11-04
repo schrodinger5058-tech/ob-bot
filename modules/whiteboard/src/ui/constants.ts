@@ -1,0 +1,902 @@
+// Canvas tuning constants for the `.yoloboard` file view, ported from the
+// S2/S3 spikes (`git show
+// spike/s2-editor-lifecycle:src/features/whiteboard-spike/constants.ts`).
+// UI/host-loop tuning, not domain data — kept out of domain/ per that layer's
+// zero-dependency contract (it doesn't need these; only src/ui/canvas.ts's
+// rAF loop does).
+
+import { parseBoard } from '../domain/fileFormat'
+import { fileNodeKind } from '../domain/naming'
+import { portalSizeFor } from '../domain/portals'
+
+/** Camera scale clamp range. `min` is the floor for a board that fits inside
+ * it; a board too big to fit gets a lower one — see MIN_SCALE_FIT_MARGIN.
+ * `max` is set by reading: a PDF card tiled into many columns has small
+ * pages, and 5x is what lets one of them fill the screen. What that costs a
+ * page's bitmap is bounded by the PDF engine's own per-canvas pixel cap. */
+export const SCALE_BOUNDS = Object.freeze({ min: 0.08, max: 5 })
+
+/** The closest a fit (Shift+1 / Shift+2) will frame its target. Lower than
+ * SCALE_BOUNDS.max because a fit chooses the zoom for the user: framing a
+ * small note at 5x fills the screen with one sentence, whereas zooming that
+ * far by hand is someone asking to. */
+export const FIT_MAX_SCALE = 2.5
+
+/**
+ * How far past "the whole board fits" the wheel may zoom out, as a fraction of
+ * the fit scale — so a board that needs 0.04 to fit can be wheeled down to
+ * 0.036 and shows a margin of empty canvas around itself rather than stopping
+ * with its edges flush against the viewport.
+ *
+ * The floor is `min(SCALE_BOUNDS.min, fitScale * this)`: it only ever *lowers*
+ * the fixed floor, so every board that already fits at 0.08 behaves exactly as
+ * before, and only a board that does not gains the room to be seen whole. That
+ * asymmetry is the point — 0.08 is a legibility floor for a board you are
+ * working in, not a statement about boards larger than it was chosen for
+ * (fit-to-all already ignores it entirely; see domain/camera.ts's
+ * fitViewToBounds). See cameraController.ts's `zoomScaleBounds`.
+ */
+export const MIN_SCALE_FIT_MARGIN = 0.9
+
+/**
+ * Wheel delta that doubles the zoom: 100·ln 2, the rate at which the board
+ * follows a trackpad pinch exactly.
+ *
+ * Chromium reports a pinch as a stream of ctrl-wheel events whose deltas sum
+ * to -100·ln(finger scale) — measured through CDP's synthesizePinchGesture
+ * (2026-09-26): a 2x spread arrived as 107 events of 0.4-0.9 summing to
+ * -69.31. The figure this replaced, 300 (Obsidian Canvas's, measured with
+ * mouse-sized events), made that same 2x spread zoom the board 1.17x.
+ *
+ * A mouse notch (~100 delta, one event) at this rate would be a 2.7x jump, so
+ * it is held back by WHEEL_ZOOM_MAX_DELTA_PER_EVENT rather than by slowing
+ * the rate for everyone.
+ */
+export const WHEEL_DELTA_PER_ZOOM_DOUBLING = 100 * Math.LN2
+
+/**
+ * The most wheel delta a single event may zoom by: a third of a doubling
+ * (2^(1/3) ≈ 1.26x), which is exactly what one ~100-delta mouse notch did
+ * under the old 300-per-doubling rate, so ctrl/cmd + mouse wheel feels as it
+ * did. A pinch never reaches it — its events are a few delta each — so the
+ * cap only ever touches the one-big-event-per-notch input it is meant for.
+ */
+export const WHEEL_ZOOM_MAX_DELTA_PER_EVENT = WHEEL_DELTA_PER_ZOOM_DOUBLING / 3
+
+/** Screen-space margin kept around the content when the camera fits to all
+ * nodes or to the selection (Shift+1 / Shift+2). */
+export const FIT_CAMERA_PADDING_PX = 48
+
+/** Time constant of the glide the camera takes toward where a gesture asked
+ * it to go, rather than snapping there. Measured off Obsidian Canvas by
+ * sampling its transform every frame through one wheel notch: the remaining
+ * distance decays by ~0.876 per frame on a 120Hz display, i.e. e-folding
+ * every ~63ms, and the whole glide is over in ~255ms. Its own source has the
+ * decay as `0.984 ** dtMs`, an e-folding every 62.0ms — the measurement was
+ * reading the real constant. Short enough that the easing reads as weight
+ * rather than lag: twice this already feels floaty. See canvas.ts's
+ * advanceCameraGlide(). */
+export const CAMERA_GLIDE_TAU_MS = 63
+
+/**
+ * The same law for a wheel *pan*, which is a shorter glide than a zoom.
+ *
+ * A wheel pan used to write the camera straight from the event, which made
+ * the motion exactly as smooth as the event stream: measured on a 120Hz
+ * display (2026-09-03), the frames that moved were exactly the frames a wheel
+ * event landed in — 10-12% of them — with the whole delta in one frame
+ * (peaks of 236-290px). Obsidian's own document scroller, given the same
+ * three seconds from the same mouse, moved on 41-49% of frames along an
+ * accelerate-peak-decelerate curve that peaked at 84-106px and kept going for
+ * ~90ms after the last event: an accumulating target eased per frame, which
+ * is what this glide already is. A trackpad delivers an event most frames and
+ * so was already smooth, and the two devices are not distinguishable from the
+ * event stream on macOS (both `deltaMode: 0`, both accelerated and
+ * fractional) — hence one law for both rather than a device test.
+ *
+ * 30ms rather than the zoom's 63: the tail above is over in ~90ms, which is
+ * three e-foldings of 30. Long enough to spread a notch across ~7 frames,
+ * short enough that a trackpad — which asks for a new target most frames —
+ * still reads as tracking the fingers rather than following them.
+ */
+export const WHEEL_PAN_GLIDE_TAU_MS = 30
+
+/** Remaining distance, in doublings, below which the glide is finished and
+ * the camera snaps to its target — an exponential approach never arrives, and
+ * a hundredth of a doubling is a fifth of a pixel on a 260px card. */
+export const CAMERA_GLIDE_EPSILON_DOUBLINGS = 0.01
+
+/** The same cutoff for the pan half of a fit's glide. Half a pixel is below
+ * anything a display can show, and unlike the zoom tolerance it is already in
+ * the units the transform is written in. */
+export const CAMERA_GLIDE_EPSILON_PX = 0.5
+
+/** Screen-pixel buffer band around the viewport for virtualization, divided
+ * by scale before use so its on-screen width stays constant across zoom
+ * levels (see domain/virtualization.ts's computeWorldViewportRect). */
+export const VIEWPORT_BUFFER_PX = 150
+
+/** Visibility recompute throttle — matches the spikes' measured sweet spot
+ * between responsiveness and recompute cost at a few hundred cards. */
+export const RECOMPUTE_INTERVAL_MS = 70
+
+/**
+ * Per-frame drain quotas for the two *uniform-cost* halves of virtualization:
+ * putting a card's frame in the world and taking it out again. Both are plain
+ * DOM work whose cost does not depend on what the card holds, which is what
+ * makes a count an honest budget for them.
+ *
+ * Building a card's **content** is not in here — that has a budget of its own
+ * (CONTENT_BUILD_START_CAP_PER_FRAME) and a gate of its own (FRAME_ON_TIME_MS),
+ * because its cost is a property of the note behind the card rather than of
+ * the card.
+ */
+export const MOUNT_QUOTA_PER_FRAME = 6
+export const UNMOUNT_QUOTA_PER_FRAME = 40
+
+/**
+ * How many card-content builds one frame may *start*.
+ *
+ * Separate from MOUNT_QUOTA_PER_FRAME, which it used to share, because the two
+ * are not the same size of work: putting a card's frame in the world is a few
+ * DOM nodes, while building its content is ~3.3ms of parse, style and layout
+ * (measured 2026-09-01 on the 3000-card board, real Obsidian over CDP). At six
+ * a frame that is ~20ms of content work in one frame — a frame that is already
+ * over budget before anything else on it runs, which is where the 33–50ms
+ * outliers in that measurement came from.
+ *
+ * Three, because a pan fast enough to be worth pacing brings cards in at about
+ * 2.3 a frame (140/s at 60Hz, same measurement): a cap just above the arrival
+ * rate keeps up with a steady pan while forbidding the burst. It does not
+ * reduce the work — the same builds happen, spread over more frames — which is
+ * the whole point: one 50ms frame is visible and three 17ms frames are not.
+ *
+ * A cap on *starts*, not on builds in flight. A note card reads its file
+ * before it can render, and the read is nearly free; each build re-checks the
+ * frame gate when it lands (`renderMarkdownInto`), so this only has to be
+ * finite, not tight.
+ */
+export const CONTENT_BUILD_START_CAP_PER_FRAME = 3
+
+/**
+ * Frame interval, in milliseconds, above which the canvas treats the last
+ * frame as having overrun and stops starting new content builds *while the
+ * camera is moving*.
+ *
+ * A count cannot bound content building the way it bounds the quotas above,
+ * because what a card costs to build is a property of the note behind it:
+ * ~2ms for a five-line card and ~25ms for a 160-line one at the point the
+ * work is asked for — but most of the bill arrives later still, inside the
+ * host renderer's own scheduling (measured 2026-08-31: a pan over long-note
+ * cards spends its time in `measureSection` and the layout that measuring
+ * forces, none of it inside the call that started it). So neither a count nor
+ * a stopwatch around the call can price this work in advance.
+ *
+ * What can be observed is the consequence: whether frames are still arriving
+ * on time. So that is what gates building — start work only after a frame
+ * that came in under this bar, and the pacing tunes itself to the board, the
+ * machine and the display without anyone estimating a cost. On a light board
+ * every frame qualifies and nothing changes; on a heavy one the canvas builds
+ * on the frames it can afford and skips the ones it cannot.
+ *
+ * 20ms is the same bar the benchmark counts dropped frames at: comfortably
+ * above a 120Hz frame (8.3ms) and a 60Hz one (16.7ms), so an on-time frame at
+ * either rate qualifies, and nothing slower than 50fps does.
+ *
+ * Only while the camera moves. At rest a long frame costs nothing visible and
+ * the only thing waiting is the content itself, so building runs at full rate
+ * — a board opening fills as fast as it can.
+ */
+export const FRAME_ON_TIME_MS = 20
+
+/** How long the camera counts as "interacting" (which paces content
+ * building — see FRAME_ON_TIME_MS) after the last pan/zoom input. */
+export const INTERACTING_TIMEOUT_MS = 250
+
+/** How long the camera must sit idle after the last pan/zoom input before
+ * it's folded into the board ("手势结束（而非逐帧）把 camera 写回
+ * board"), which saves it with whatever is saved next. */
+export const CAMERA_SETTLE_MS = 300
+
+/** Pointer movement (screen px) beyond which a press-and-move gesture that
+ * started on a card is treated as a drag rather than a click-to-edit. */
+export const DRAG_THRESHOLD_PX = 4
+
+// -----------------------------------------------------------------------
+// The one rendering-tier switch. At and above the threshold a
+// card is a DOM element with its content built; below it no card has DOM at
+// all and the whole board is drawn on one screen-space canvas
+// (ui/canvas/overviewLayer.ts).
+//
+// There used to be a third state between the two — a mounted card whose
+// content was not built, showing only its title block. It was deleted because
+// it bought nothing and cost the most expensive transition on the board: it
+// looked exactly like the canvas by construction (same title, same font size,
+// same wash), could not be edited either, and everything else it offered —
+// select, marquee, drag, resize, connect — the canvas tier offers too. What it
+// did do was keep hundreds of cards mounted through the zoom band where a
+// viewport holds the most of them, which is precisely the cost the canvas tier
+// exists to remove.
+//
+// Merging the two fixes where the line goes rather than leaving it a choice:
+// it has to be where building a card's content stops being worth it, because a
+// mounted card builds its content. Lower and the board would render markdown
+// nobody can read; higher and it would drop the DOM while the DOM is still
+// saying something.
+//
+// Rendering tier and capability stay separate ideas: what is drawn how is a
+// performance detail the user never asked for, and what can be done at a
+// given zoom is a product rule. Selecting, marquee, dragging, resizing and
+// connecting all keep working below the threshold, because there is no reason
+// for them not to. What does key off it is what genuinely cannot
+// be done to a card with no element — editing it — and alignment, which has no
+// precision to offer here and whose candidate set would be the whole board.
+// -----------------------------------------------------------------------
+
+/**
+ * Scale below which cards leave the DOM for the canvas.
+ *
+ * Placed where a card's content stops earning its construction: below this a
+ * card is ~90px wide and its 13px body type is under 5 screen pixels, so what
+ * a reader gets from it is its title and its colour — both of which a
+ * rectangle and one `fillText` give for a rounding error of the cost. Above it
+ * the mounted count is bounded by what a screen holds; below it the count is
+ * bounded by the board, which is the whole problem.
+ */
+export const OVERVIEW_SCALE_THRESHOLD = 0.35
+
+/**
+ * Width of the hysteresis band above OVERVIEW_SCALE_THRESHOLD, in zoom
+ * doublings: once the canvas has the board, the DOM takes it back only after
+ * the camera comes this far past the threshold it fell through.
+ *
+ * Crossing this line unmounts or rebuilds every card on screen, so a zoom that
+ * settles on the boundary would do exactly that on alternate throttle ticks
+ * ("跨越阈值来回抖动时不能反复构造/销毁打爆帧").
+ *
+ * Expressed in doublings because that is the unit the wheel works in (see
+ * WHEEL_DELTA_PER_ZOOM_DOUBLING): a quarter doubling is less than the third
+ * of a doubling one mouse notch zooms, so one deliberate notch still crosses
+ * the band in one go, and a pinch has to travel ~1.2x of finger spread past
+ * the threshold before it flips back.
+ */
+const OVERVIEW_RESTORE_DOUBLINGS = 0.25
+
+/** Scale the DOM takes the board back at — see above. */
+export const OVERVIEW_RESTORE_SCALE =
+  OVERVIEW_SCALE_THRESHOLD * 2 ** OVERVIEW_RESTORE_DOUBLINGS
+
+/**
+ * Screen width, in pixels, below which an overview card is drawn as a plain
+ * tile with no title. Not a legibility bar — the type
+ * is already small by then — but the point past which drawing a title costs a
+ * `fillText` per card and returns a smudge.
+ */
+export const OVERVIEW_TITLE_MIN_CARD_PX = 40
+
+/** Font size of a card's title block, in world units — style.css's
+ * `.yolo-whiteboard-card-title-block`. The overview canvas draws its titles at
+ * the same size so the switch between the two tiers is invisible; the two must
+ * stay in step. */
+export const TITLE_BLOCK_WORLD_FONT_PX = 32
+
+/** Line height of a card's title block, as a multiple of its font size, and
+ * the block's padding in world units — the same stylesheet rule. The overview
+ * canvas wraps a title into the box these leave, as the element does. */
+export const TITLE_BLOCK_LINE_HEIGHT = 1.25
+export const TITLE_BLOCK_WORLD_PADDING = { x: 12, y: 8 } as const
+
+/** A PDF spread's title line, in world units — spread.css's
+ * `.yolo-whiteboard-spread-title` and its parts, which the overview canvas
+ * draws at the same sizes so the title keeps its face below the tier. */
+export const SPREAD_TITLE_WORLD = {
+  padding: 12,
+  paddingBlock: 6,
+  gap: 8,
+  badgeFont: 12,
+  badgePadding: 6,
+  badgeHeight: 20,
+  nameFont: 16,
+  nameLineHeight: 1.5,
+} as const
+
+/** Alpha of the colour wash over an overview card with no picture yet —
+ * style.css's `.yolo-whiteboard-card-title-block` background, which is
+ * `color-mix(… 10% …)`, expressed as the `globalAlpha` a canvas needs. */
+export const OVERVIEW_CARD_WASH_ALPHA = 0.1
+
+/** Alpha of the colour wash under an overview card's picture: a coloured
+ * card's own, cards/color.css's `color-mix(… 7% …)`. */
+export const OVERVIEW_THEMED_CARD_WASH_ALPHA = 0.07
+
+/** Alpha of a coloured card's border, matching the stylesheet's
+ * `color-mix(in oklch, var(--yolo-whiteboard-color) 70%, transparent)`. */
+export const OVERVIEW_THEMED_BORDER_ALPHA = 0.7
+
+/** Edge stroke weight in world units at 1:1 — style.css's
+ * `.yolo-whiteboard-edge-path`, before its counter-scale. */
+export const EDGE_STROKE_WORLD_PX = 1.5
+
+/** Radius of the ring on an edge end that reaches a passage, in world units
+ * at 1:1 — edges.css's `.yolo-whiteboard-edge-passage-end`, before its
+ * counter-scale. */
+export const EDGE_PASSAGE_MARK_WORLD_PX = 3.5
+
+/** Arrowhead length in world units at 1:1 — the `markerWidth` canvas.ts gives
+ * the shared SVG marker, before its counter-scale. */
+export const EDGE_ARROW_WORLD_PX = 10
+
+/** Screen weight an overview edge is never drawn below: a sub-pixel line is
+ * rasterised as a faded one, and a board of faded lines is haze rather than
+ * edges. */
+export const OVERVIEW_MIN_EDGE_STROKE_PX = 0.75
+
+/** Screen length an arrowhead must reach before it is drawn at all — below it
+ * a triangle is three dark pixels at the end of a line, which reads as a
+ * thicker line. */
+export const OVERVIEW_ARROW_MIN_SCREEN_PX = 4
+
+// --- an overview edge's label ---------------------------------------------
+// Labels are drawn here too, unlike everything else the DOM edge layer holds.
+// They were not, while the tier only ever ran below 0.15, on the grounds that
+// the type was a smudge by then — true there, and false now that the tier
+// reaches 0.35, where a label is the one piece of text on the board naming
+// what a line *means*. The three numbers below mirror style.css's
+// `.yolo-whiteboard-edge-label`; the two must stay in step.
+
+/** Label type size in screen pixels at 1:1, before the counter-scale below. */
+export const EDGE_LABEL_FONT_PX = 15
+
+/** The label chip's padding at 1:1, in screen pixels — the stylesheet's
+ * `2px 6px`, counter-scaled the same way the type is. */
+export const EDGE_LABEL_PADDING_PX = { x: 6, y: 2 } as const
+
+/** The stylesheet's `max-width: 17em`, in ems so it follows the type size. A
+ * canvas cannot wrap the way the element does, so past this the label is
+ * ellipsised on one line: at the zoom this tier covers a wrapped label would
+ * be two rows of unreadable type instead of one. */
+export const EDGE_LABEL_MAX_WIDTH_EM = 17
+
+/** Screen type size below which a label is not drawn. A label is opaque — it
+ * has to be, to stay legible where it crosses its own curve — so an unreadable
+ * one is not a faint smudge but a solid chip sitting on the board, and a
+ * thousand of them are a rash. 6px lands just under where the old DOM tier
+ * started showing them (15 * sqrt(0.15) = 5.8), so nothing readable is lost. */
+export const OVERVIEW_LABEL_MIN_FONT_PX = 6
+
+/**
+ * Width of an edge's transparent hit stroke in world units at 1:1 —
+ * style.css's `.yolo-whiteboard-edge-hit`, before its counter-scale. The two
+ * must stay in step: the overview tier has no such element (the canvas draws
+ * its edges, and a canvas is not a pointer target), so it reproduces this
+ * stroke's reach arithmetically instead — half of it, counter-scaled by the
+ * same 1/sqrt(scale), is the tolerance canvas.ts hands `edgeAtPoint`. Stated
+ * once here so "how close you have to be to a line" cannot come out different
+ * in the tier that measures it from the one that is hit through it.
+ */
+export const EDGE_HIT_STROKE_WORLD_PX = 16
+
+/** Font size of a group's label in world units — style.css's
+ * `.yolo-whiteboard-group-label`. The two must stay in step: the overview tier
+ * counter-scales this value rather than replacing it. */
+export const GROUP_LABEL_WORLD_FONT_PX = 20
+
+/**
+ * Screen size a group's label is held at in the overview tier, however far the
+ * board is zoomed out.
+ *
+ * Everything else in the world layer shrinks with the board, which is right for
+ * a card — at this zoom a card is a tile, and its title is not the point. A
+ * group's label is: the whole value of an overview is seeing which region is
+ * which, and a 20-unit label at 0.1 is two pixels of grey. So it is
+ * counter-scaled and pinned, like a place name on a map, which stays the same
+ * size whether you are looking at a city or a country.
+ */
+export const OVERVIEW_GROUP_LABEL_MIN_SCREEN_PX = 12
+
+/**
+ * Dot-grid spacing in world units — the finest the lattice ever gets, and the
+ * canvas's base unit of length. Card sizes, the floor a card may be dragged
+ * to, and the step drags and tidy snap to are all whole multiples of it.
+ *
+ * A literal, and independent of any card size, because it is the coordinate
+ * system every board's contents are already laid out on. Deriving it from the
+ * default card — as this once did — made a purely cosmetic change to that card
+ * a breaking one: every card on every existing board would stop sitting on the
+ * lattice, and snapping and tidy would land somewhere new.
+ *
+ * 13 puts 20 cells across a default card, which is Obsidian Canvas's ratio for
+ * its own (a 400-unit card on a 20-unit grid). Its default *text* node, 250x60,
+ * would give 12.5, but that is a one-line sticky rather than a card, and its
+ * own file cards do not follow it.
+ */
+export const GRID_WORLD_STEP_PX = 13
+
+/**
+ * Size a text card is created at, in grid cells. Deliberately at the small end
+ * of what the spikes' boards used (226-334 wide) — an empty card should not
+ * take half the screen; the user resizes the ones that grow.
+ *
+ * 5:3 rather than square-ish: a card holds prose, and prose wants lines long
+ * enough to read. 20 x 12 still holds four or five lines of body text, which is
+ * more than an empty card has to promise.
+ *
+ * Whole cells — a card whose height were not would have its top edge on the
+ * lattice and its bottom edge between two lines once a drag snapped it there,
+ * so a column of cards could never be given even gaps by dragging alone.
+ */
+const NEW_CARD_CELLS = Object.freeze({ w: 20, h: 12 })
+
+export const NEW_CARD_SIZE = Object.freeze({
+  w: GRID_WORLD_STEP_PX * NEW_CARD_CELLS.w,
+  h: GRID_WORLD_STEP_PX * NEW_CARD_CELLS.h,
+})
+
+/**
+ * Size bare text (fileFormat.ts's `plain`) is made at: one short line. Only
+ * a guess to stand on until it has laid itself out — its box is its
+ * content's from then on (cardRenderer.ts's `releaseTextSize`).
+ */
+export const NEW_TEXT_SIZE = Object.freeze({
+  w: GRID_WORLD_STEP_PX * 4,
+  h: GRID_WORLD_STEP_PX * 2,
+})
+
+/** On bare text whose width follows its longest line (`autoWidth`); taken
+ * off while a resize gives it a width of its own. */
+export const PLAIN_TEXT_AUTO_CLASS = 'yolo-whiteboard-text-auto'
+
+/**
+ * Size a card that shows something else is created at: a note, an image, a
+ * web page.
+ *
+ * Bigger than an empty text card, and for the opposite reason. What a text
+ * card will hold does not exist yet, so the small end is the polite guess;
+ * what these hold exists already and is not ours to abridge — a note shown
+ * two lines at a time, or a picture at a fifth of its size, is a card that
+ * has to be resized before it can be read at all.
+ *
+ * 30 cells square is 390, the whole-cell neighbour of Obsidian Canvas's own
+ * 400 x 400 `defaultFileNodeDimensions` (its text nodes are 250 x 60, and it
+ * splits the two for the same reason).
+ */
+const NEW_EMBED_CARD_CELLS = 30
+
+export const NEW_EMBED_CARD_SIZE = Object.freeze({
+  w: GRID_WORLD_STEP_PX * NEW_EMBED_CARD_CELLS,
+  h: GRID_WORLD_STEP_PX * NEW_EMBED_CARD_CELLS,
+})
+
+/**
+ * Size a PDF card is created at, given its first page's size: an embed
+ * card's width, and the height that page needs at it — the whole first page
+ * and nothing of the next, whatever paper the document is set on (A4,
+ * Letter, landscape). A square showed seven tenths of an A4 page, and no one
+ * fixed ratio fits both of the papers papers come on. Rounded down to a whole
+ * cell, which trims at most a cell of the page's bottom margin rather than
+ * showing a sliver of the page after it.
+ */
+export function pdfCardSize(
+  page: Readonly<{ width: number; height: number }>,
+): Readonly<{ w: number; h: number }> {
+  if (!(page.width > 0 && page.height > 0)) return NEW_PDF_CARD_SIZE
+  const w = NEW_EMBED_CARD_SIZE.w
+  const cells = Math.floor((w * page.height) / page.width / GRID_WORLD_STEP_PX)
+  return { w, h: Math.max(MIN_CARD_SIZE.h, cells * GRID_WORLD_STEP_PX) }
+}
+
+/** A PDF card's size when its first page cannot be read: A4 (√2 : 1), the
+ * paper most documents are set on. The card's reader says what is wrong. */
+export const NEW_PDF_CARD_SIZE = Object.freeze({
+  w: NEW_EMBED_CARD_SIZE.w,
+  h: GRID_WORLD_STEP_PX * Math.floor(NEW_EMBED_CARD_CELLS * Math.SQRT2),
+})
+
+/**
+ * The size a card showing the vault file at `path` is created at, however it
+ * is made — dropped, pasted, picked, or by the agent. A PDF's is measured
+ * from its first page (`pdfCardSize`), which costs opening the file: about a
+ * tenth of a second once the engine is loaded, before a card that would open
+ * it anyway.
+ */
+export async function fileCardSize(
+  host: Pick<YoloModuleHostApiV1, 'pdf' | 'vault'>,
+  path: string,
+): Promise<Readonly<{ w: number; h: number }>> {
+  const kind = fileNodeKind(path)
+  if (kind === 'board') return portalCardSize(host, path)
+  if (kind !== 'pdf') return NEW_EMBED_CARD_SIZE
+  const { pdf } = host
+  try {
+    const document = await pdf.open(path)
+    try {
+      return pdfCardSize(await document.getPage(1))
+    } finally {
+      document.release()
+    }
+  } catch {
+    return NEW_PDF_CARD_SIZE
+  }
+}
+
+/** A portal's border, in world units — a card's (styles/cards/card.css).
+ * What is behind a portal shows inside it, so the frame is never covered by
+ * what it frames (canvas.ts's `portalClip`). */
+export const PORTAL_BORDER_WORLD_PX = 1
+
+/** A portal onto a board with nothing on it yet: room to start in. */
+export const NEW_PORTAL_SIZE = Object.freeze({
+  w: GRID_WORLD_STEP_PX * 48,
+  h: GRID_WORLD_STEP_PX * 32,
+})
+
+/** The most of a board a portal made onto it shows at first; it can be made
+ * bigger by hand. */
+const MAX_PORTAL_SIZE = Object.freeze({
+  w: GRID_WORLD_STEP_PX * 120,
+  h: GRID_WORLD_STEP_PX * 80,
+})
+
+/** A portal's size: all of the board behind it, up to a size a board can
+ * hold (domain/portals.ts's `portalSizeFor`). */
+async function portalCardSize(
+  host: Pick<YoloModuleHostApiV1, 'vault'>,
+  path: string,
+): Promise<Readonly<{ w: number; h: number }>> {
+  try {
+    const parsed = parseBoard(await host.vault.readText(path))
+    return parsed.ok
+      ? portalSizeFor(parsed.board, NEW_EMBED_CARD_SIZE, MAX_PORTAL_SIZE)
+      : NEW_PORTAL_SIZE
+  } catch {
+    return NEW_PORTAL_SIZE
+  }
+}
+
+/** `fileCardSize` for each of `paths`, measured together. */
+export async function fileCardSizes(
+  host: Pick<YoloModuleHostApiV1, 'pdf' | 'vault'>,
+  paths: readonly string[],
+): Promise<Map<string, Readonly<{ w: number; h: number }>>> {
+  const sizes = await Promise.all(
+    paths.map(async (path) => [path, await fileCardSize(host, path)] as const),
+  )
+  return new Map(sizes)
+}
+
+/** World-space stagger between cards created by one multi-file drop, so
+ * three dropped notes read as three cards rather than one. */
+export const DROP_STAGGER_PX = 24
+
+/** How far down and right Mod+D puts a copy of the selection: two grid
+ * steps, so the copy sits on the same lattice the original was snapped to and
+ * is plainly a second thing rather than a thicker border on the first. */
+export const DUPLICATE_OFFSET_WORLD_PX = 26
+
+/** Arrow keys move the selection one grid step; with Shift, this many. */
+export const NUDGE_SHIFT_STEPS = 4
+
+/** How long an in-progress card edit may sit unwritten. Blur used to be the
+ * only write point, which left everything typed since the card was opened
+ * living in the editor and nowhere else; this bounds what a crash costs.
+ * Throttled rather than per-keystroke because a note card's write is a real
+ * file write, and the board's own save is debounced downstream anyway. */
+export const EDIT_PERSIST_THROTTLE_MS = 400
+
+/**
+ * How long a card takes to travel to the place an align, distribute or tidy
+ * put it, and on what curve.
+ *
+ * The host's `--yolo-anim-duration-enter` and `--yolo-anim-ease-out`, in
+ * numbers, because a Web Animation cannot read a CSS custom property. The
+ * host pairs `tokens/motion.css` with `tokens/motion.ts` for the same reason;
+ * a module cannot import the host's, so this is the mirror — if those move,
+ * move these.
+ */
+export const ARRANGE_ANIMATION_MS = 220
+export const ARRANGE_ANIMATION_EASING = 'cubic-bezier(0.22, 1, 0.36, 1)'
+
+/**
+ * A PDF spread being opened deals its sheets out of the card's corner, one
+ * after another in page order: each leaves this long after the one before,
+ * and none later than the cap, so a long document is dealt in the same
+ * breath as a short one. Sheets that mount within the window after the
+ * spread opens (virtualization mounts a few per frame) are dealt too; later
+ * ones, brought on screen by a pan, just appear.
+ */
+export const SPREAD_DEAL_STAGGER_MS = 12
+export const SPREAD_DEAL_MAX_DELAY_MS = 200
+export const SPREAD_DEAL_WINDOW_MS = 500
+
+/**
+ * A node arriving on the board (created, pasted, restored by an undo) and one
+ * leaving it (deleted, cut). The same mirror of the host's motion tokens as
+ * the arrangement above: entering is `--yolo-anim-duration-enter` on the
+ * ease-out curve, leaving is `--yolo-anim-duration-exit` on the ease-in one.
+ *
+ * The scale is small on purpose. A card is already where it will be — the
+ * motion only has to say "this is new" or "this is going", not travel — so it
+ * grows out of 94% and shrinks into 96%, which reads as a settle rather than a
+ * zoom.
+ */
+export const NODE_ENTER_MS = 220
+export const NODE_ENTER_FROM_SCALE = 0.94
+export const NODE_EXIT_MS = 160
+export const NODE_EXIT_TO_SCALE = 0.96
+export const NODE_EXIT_EASING = 'cubic-bezier(0.4, 0, 1, 1)'
+/** How long a node added to the board still counts as arriving. A node that
+ * only mounts after this — added off screen and panned to later — is not new
+ * to anyone looking at it, and appears like any other mounted card. */
+export const NODE_ENTER_WINDOW_MS = 600
+
+/**
+ * The fling a pointer pan ends with: the camera keeps the velocity the hand
+ * released it at and loses it exponentially, with this time constant.
+ *
+ * An exponential decay of velocity is an exponential approach of position,
+ * which is exactly the glide the camera already runs (domain/camera.ts's
+ * `approachView`): a fling is a view glide aimed at release position plus
+ * velocity × tau, carried by the same machinery as a wheel pan. Kept short:
+ * the coast only has to say the board has some mass. At 300ms (iOS's own
+ * deceleration) an ordinary pan overshot where the hand had put the board,
+ * and every release became a correction; 150ms still coasted further than
+ * wanted. 75ms is a settle rather than a slide — a quarter of the first
+ * figure's travel, over in about a fifth of a second.
+ */
+export const PAN_FLING_TAU_MS = 75
+/** Velocity is measured over the last stretch of the drag, not the whole of
+ * it: what the hand was doing when it let go. */
+export const PAN_FLING_SAMPLE_MS = 80
+/** Below this release speed (screen px/ms) a pan simply stops — a hand that
+ * slowed to a halt before letting go meant to put the board down there. */
+export const PAN_FLING_MIN_SPEED = 0.25
+/** A release this long after the last move was a hold, not a throw. */
+export const PAN_FLING_MAX_IDLE_MS = 50
+
+/**
+ * The band along the viewport's edge where a drag starts carrying the board
+ * with it (a card, a marquee, a connection, a card coming off the creation
+ * bar), and the fastest it carries it. Speed grows linearly with how deep into
+ * the band the pointer is, and is at its maximum at and beyond the edge.
+ */
+export const EDGE_AUTO_PAN_BAND_PX = 40
+/** Screen pixels per millisecond — about 15px a frame at 60Hz. */
+export const EDGE_AUTO_PAN_MAX_SPEED = 0.9
+
+/**
+ * On-screen spacing the grid refuses to go below. The visible step is
+ * GRID_WORLD_STEP_PX doubled as many times as it takes to clear this floor.
+ *
+ * This is what keeps the grid a grid once the cards it belongs to are no
+ * longer the thing being looked at: zoomed all the way out, an unbounded
+ * 13-unit step would land dots ~1px apart, which is not a grid but a grey
+ * wash. 10 is Obsidian Canvas's floor, measured off the `<pattern>` tile in
+ * its svg.canvas-background across the zoom range — a lower bound in screen
+ * pixels is a legibility limit, not a matter of taste, so there is no reason
+ * to differ from a value that visibly works. See canvas.ts's applyGrid().
+ */
+export const GRID_MIN_SCREEN_STEP_PX = 10
+
+/**
+ * Smallest a card may be dragged, in grid cells.
+ *
+ * Obsidian Canvas enforces no floor at all — `node.resize({width: 1})` sticks,
+ * collapsing a node into a line that cannot be grabbed again. Expressed in
+ * cells rather than pixels because the floor has to agree with the lattice the
+ * card is being dragged along: a card stopped by it should stop on a grid line,
+ * not a step short of one.
+ *
+ * 4x3 is the smallest rectangle that still holds one line of 13px body text
+ * with its 6px/10px padding and border — below that a card cannot show its
+ * own content, which is the point at which "small" turns into "broken".
+ */
+const MIN_CARD_CELLS = Object.freeze({ w: 4, h: 3 })
+
+export const MIN_CARD_SIZE = Object.freeze({
+  w: GRID_WORLD_STEP_PX * MIN_CARD_CELLS.w,
+  h: GRID_WORLD_STEP_PX * MIN_CARD_CELLS.h,
+})
+
+/**
+ * Resize-handle size in screen pixels at 1:1 zoom.
+ *
+ * The handle is laid out in world space (it lives in the transformed layer
+ * with the cards), so the canvas divides this by the square root of the scale
+ * — Obsidian Canvas's own law, measured off its `--zoom-multiplier` across
+ * the zoom range: 1/sqrt(scale) exactly, at every sample. The effect is a
+ * handle whose *screen* size is 20*sqrt(scale): ~9px zoomed right out, 20px
+ * at 1:1, ~28px zoomed right in. Constant world size would make it
+ * ungrabbable when zoomed out; constant screen size would make it swallow the
+ * card when zoomed in. See cameraController.ts's applyZoomScale(), which
+ * writes the multiplier every dimension in the world layer that is chrome
+ * rather than drawing is computed from.
+ */
+export const RESIZE_HANDLE_PX = 20
+
+/**
+ * How far outside a card a connection drag still counts as landing on it, in
+ * world units.
+ *
+ * A band, not a point, because the pointer that is *at* a card's border is
+ * ambiguous by a pixel or two, and the connection points sit on the border.
+ * 12 is Obsidian Canvas's 15 scaled to our card (its default node is 400
+ * units wide to our 260) — the figure that matters is how big the band is
+ * relative to the card it forgives you for missing.
+ */
+export const CONNECT_SNAP_WORLD_PX = 12
+
+/**
+ * How near two edges must be, in *screen* pixels, for a drag or a resize to
+ * line them up (domain/snapping.ts).
+ *
+ * Screen rather than world: this is a statement about the pointer, which has
+ * the same precision however far the board is zoomed, so the canvas divides
+ * it by the scale before handing it over. 15 is Obsidian Canvas's
+ * `objectSnapDistance`, and it does the same division.
+ */
+export const SNAP_SCREEN_PX = 15
+
+/**
+ * Clear space between the selection toolbar and the selection it acts on, in
+ * screen pixels — the toolbar lives in the viewport layer, so this is a fact
+ * about the screen and does not scale with the camera.
+ *
+ * Obsidian Canvas's own gap is measured in world units and so grows with zoom
+ * (24px on screen at scale 0.48). We keep it constant instead: ours is a
+ * screen-space chrome element, and chrome that drifts away from what it acts
+ * on as you zoom in is chrome that has to be chased.
+ */
+export const TOOLBAR_GAP_PX = 8
+
+/** How close to the viewport's edge the toolbar may come before it is clamped
+ * back in — the same figure decides when it flips below the selection. */
+export const TOOLBAR_MARGIN_PX = 8
+
+// -----------------------------------------------------------------------
+// Constants shared across canvas.ts and its `ui/canvas/*` collaborators
+// (CardRenderer, EdgeLayer). Everything below is either a DOM class name or a
+// tiny data constant read on both sides of one of those class boundaries; a
+// constant used by only one file lives locally in that file instead (see
+// cardRenderer.ts's and edgeLayer.ts's own top-of-file consts).
+// -----------------------------------------------------------------------
+
+export const SVG_NS = 'http://www.w3.org/2000/svg'
+
+/** Obsidian's own link nodes load nothing but http(s) (`setFrameUrl`), which
+ * is also what keeps `data:`/`javascript:` URLs out of the frame. */
+export const WEB_URL_PATTERN = /^https?:\/\//i
+
+export const CARD_SELECTED_CLASS = 'yolo-whiteboard-card-selected'
+/** The single-selected card, mirroring Obsidian Canvas's `is-focused`. */
+export const CARD_FOCUSED_CLASS = 'yolo-whiteboard-card-focused'
+export const GROUP_LABEL_CLASS = 'yolo-whiteboard-group-label'
+/** On every sheet of a spread whose title is selected: where the document
+ * the selection names is on the board. */
+export const SPREAD_SHEET_OF_SELECTED_CLASS =
+  'yolo-whiteboard-spread-sheet-of-selected'
+/** Marks a body whose content is its own interaction surface — media
+ * transport controls, an embedded web page — and so is the one kind of body
+ * the content mask can be lifted from. Lifting it takes CARD_ENTERED_CLASS;
+ * this class only says the body is capable of it. See style.css. */
+export const CARD_BODY_LIVE_CLASS = 'yolo-whiteboard-card-body-live'
+/**
+ * The card the pointer has been let into: its live body is interactive and
+ * the board has given up its claim on that surface.
+ *
+ * Separate from CARD_FOCUSED_CLASS, and that separation is the point.
+ * Selecting a card must never cost the ability to drag it — but a live body
+ * that is reachable by a pointer is a body the card can no longer be dragged
+ * by, because the press lands in the page instead. So entering is its own
+ * gesture (double-click, or Enter), exactly as it is for a markdown card;
+ * what differs between the two kinds of card is what "opened" gives you, not
+ * how you ask for it. Escape leaves.
+ */
+export const CARD_ENTERED_CLASS = 'yolo-whiteboard-card-entered'
+/**
+ * Marks a body that currently holds the whole document rather than the slice
+ * the card can show — the windowed preview, which is the one content surface
+ * with somewhere to scroll to.
+ *
+ * Deliberately not the focus class, even though only the focused card ever
+ * gets one. A scroll container that stops being scrollable is snapped back to
+ * the top by the browser, and focus leaves a card a frame or more before its
+ * content is rebuilt: keying `overflow` on the selection therefore paints one
+ * frame of the top of the note on the way out. Keying it on what is actually
+ * mounted cannot, because the class and the content it describes are put up
+ * and taken down together. See style.css.
+ */
+export const CARD_BODY_SCROLLS_CLASS = 'yolo-whiteboard-card-body-scrolls'
+/**
+ * Marks the render that is on its way out while the card hands its body over
+ * from the clipped one-pass render to the scrollable preview, and holds it
+ * over the incoming one until that has found the card's reading window.
+ *
+ * The window is a source line, and Obsidian's preview cannot go to a line it
+ * has not rendered yet: mounted, it sits at the top of the note and moves to
+ * the line a frame or more later. Something has to fill that gap, and the only
+ * thing already showing the right content is the render being replaced — so it
+ * is the *outgoing* surface that gets a class, it stays exactly where it was,
+ * and what the class hides is everything mounted after it. Removing it is what
+ * ends the handover. See style.css.
+ */
+export const CARD_HANDOFF_CLASS = 'yolo-whiteboard-card-handoff'
+
+export const EDGE_HIT_CLASS = 'yolo-whiteboard-edge-hit'
+export const EDGE_LABEL_CLASS = 'yolo-whiteboard-edge-label'
+export const EDGE_HIDDEN_CLASS = 'yolo-whiteboard-edge-hidden'
+/**
+ * An edge culled by viewport virtualization (edgeLayer.ts's
+ * `updateVisibility`). A separate class from EDGE_HIDDEN_CLASS, which a
+ * connection drag owns for the length of a gesture: the two states are
+ * independent and each has to be able to end without clearing the other.
+ */
+export const EDGE_CULLED_CLASS = 'yolo-whiteboard-edge-culled'
+
+// -----------------------------------------------------------------------
+// Card content budget.
+//
+// A card's body clips and does not scroll (style.css's content mask), so
+// everything a card renders past its own height is work whose result no user
+// can reach. Handing the whole note to a renderer costs a full parse, an
+// image decode per image and a post-processor pass over the entire document,
+// and — with the windowed preview — a measurement pass over every section on
+// top, repeated on every remount. So the card asks for a prefix instead, and
+// the prefix is sized from the card rather than from the note: what a card
+// costs becomes a property of its geometry, which is the invariant a board
+// needs.
+// -----------------------------------------------------------------------
+
+/**
+ * The tightest line box a card body can produce, in world pixels — 13px type
+ * (style.css's `.yolo-whiteboard-card-body .markdown-preview-view`) at the
+ * smallest line height a theme is likely to set.
+ *
+ * Deliberately an underestimate: it is the divisor that turns a card's height
+ * into a *line budget*, so a value below the truth over-provisions the prefix
+ * and a value above it would clip content the card can show. Every source
+ * line renders as at least one line box, so a budget of height/this many
+ * lines cannot render shorter than the card is tall.
+ */
+export const CARD_CONTENT_MIN_LINE_WORLD_PX = 16
+
+/**
+ * Lines granted on top of the height-derived budget, covering the ways a
+ * source line can occupy no line box of its own: a table's delimiter row, a
+ * closing code fence, a frontmatter block drawn as one compact property list.
+ */
+export const CARD_CONTENT_EXTRA_LINES = 4
+
+/**
+ * Hard ceiling on the prefix, in characters. The line budget bounds a normal
+ * note; this bounds the pathological one — a minified file, a base64 data URI,
+ * a whole document written on one line — where a single "line" is the entire
+ * cost the budget exists to avoid.
+ */
+export const CARD_CONTENT_MAX_CHARS = 4000
+
+/**
+ * How long the creation bar stays out after the pointer leaves it, or after a
+ * tap on its handle (ui/cardMenu.ts). Reaching for the bar says it is about to
+ * be wanted again; a bar that tucks itself away the moment the pointer moves
+ * on to place what it just made has to be fetched back every time.
+ */
+export const CARD_MENU_HOVER_LINGER_MS = 10_000
+
+/**
+ * How long the creation bar stays out after a card is made from it — a
+ * stronger sign than a hover. Cards tend to be made in runs, a few words typed
+ * or a card nudged into place between one and the next; this covers that gap,
+ * and every card made starts it again, so a run keeps the bar out throughout.
+ */
+export const CARD_MENU_CREATE_LINGER_MS = 30_000
+
+/** How small, on screen, a portal may be and still open — show what is
+ * behind it (canvas.ts's `wantsPortalOpen`). Smaller, there is nothing in
+ * it to make out, and opening it would only add every card behind it to the
+ * board's work. */
+export const PORTAL_OPEN_MIN_PX = 48
+
+/** How long the wheel may pause over a portal before the next turn of it is
+ * a new step to undo (canvas.ts's `panPortalBy`): one flick, or one run of
+ * them, is one thing done. */
+export const PORTAL_PAN_STEP_GAP_MS = 500

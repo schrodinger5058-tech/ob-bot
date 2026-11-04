@@ -1,0 +1,94 @@
+# Feature Map
+
+目录职责和模块边界已经由 `AGENTS.md` 承担，这里不重复。它的作用是让「产品行为 ↔ 代码位置 ↔ 怎么验证」这条映射可以直接查到，而不用每次接到涉及某个产品面的任务都从头 grep 摸索。下面每条记录都写清楚：这个行为在哪触发、真正实现它的文件是哪些（对照当前代码树核实过，不是靠命名猜的）、改动之后怎么验证。把它当索引用，不是教程：一旦发现和代码对不上，以代码为准，并顺手把这份文档改对。
+
+## Chat surfaces
+
+下面两个入口（Quick Ask、Chat 视图）的 Ask/Agent 模式都通过 `AgentSessionService.run` (`src/core/agent/service.ts`) 派发；每次调用拿到的运行时权限由 `resolveChatModeRuntime` 计算 (`src/core/agent/chat-runtime-profiles.ts`，被 `src/core/agent/tool-gateway.ts` 消费)。Quick Ask 另外还有第三档模式（续写），完全不走 `AgentSessionService`——见下方对应条目。
+没有聊天界面的调用方（宿主 feature、模块经 `host.agent.stream`）不走这两个入口，而是走 `AgentRunApi` (`src/core/agent/agent-api.ts`)，用 `capability` 声明信任档位（`none` / `vault-read` / `vault-write`，见 `src/core/agent/capability-profile.ts`），最终落到同一个 runtime。
+
+### Quick Ask
+- 触发方式：编辑器内快捷键/命令唤起的浮层，由 `QuickAskController`（`src/features/editor/quick-ask/quickAskController.ts`）在 `src/main.ts` 中挂载。面板本体 `src/components/panels/quick-ask/QuickAskPanel.tsx` 有三档模式（`QuickAskVisibleMode = 'ask' | 'agent' | 'continue'`，`src/features/editor/quick-ask/quickAsk.types.ts`）：Ask/Agent 两档走 `AgentSessionService.run`；「续写」档不走 agent runtime，而是通过 `plugin.continueWriting()` 调用下面「灵光写作 / Sparkle」一节的 `ContinuationController`。三档是同一面板内切换，不是三个独立入口。
+- 核心代码：`src/features/editor/quick-ask/`（唤起、锚点定位、生命周期）+ UI 在 `QuickAskPanel.tsx`、`QuickAskWidget.tsx`。
+- 依赖子系统：Ask/Agent 档走 `AgentSessionService`（`plugin.getAgentService()`）+ `assistantRenderStreamStore`（流式渲染，见下）；续写档走 `ContinuationController`（`src/features/editor/continuation/continuationController.ts`）→ `executeSingleTurn`（`src/core/ai/single-turn.ts`）。
+- 验证路径：dev vault 手测，在任意笔记编辑器内分别触发 Quick Ask 的 Ask/Agent/续写三档。
+
+### Chat 视图（侧边栏 / 标签页 / 分屏 / 独立窗口）
+- 触发方式：只有一个视图类型 `CHAT_VIEW_TYPE`（`src/ChatView.tsx`，挂载 `src/components/chat-view/Chat.tsx`），通过 `plugin.openChatView({ placement })` 打开到四种 Obsidian leaf 位置之一——`ChatLeafPlacement = 'sidebar' | 'split' | 'tab' | 'window'`（`src/features/chat/chatLeafSessionManager.ts`）。对应四个命令：`open-new-chat`（侧栏）、`open-chat-tab`、`open-chat-split`、`open-chat-window`（`src/main.ts`），实际打开/复用/新建 leaf 的逻辑在 `ChatViewNavigator`（`src/features/chat/chatViewNavigator.ts`）。四种挂载位置是同一份功能，不是四个不同的产品面；`ChatMode` 不是挂载位置的一部分，是下面这条正交的能力轴。
+- 核心代码：`src/components/chat-view/`（`ChatSessionController.ts` 管理会话状态与 `AgentSessionService` 订阅、`ChatConversationPane.tsx`/`ChatTimelineList.tsx` 渲染时间线）。
+- 依赖子系统：任一挂载位置内部都叠加同一层 `ChatMode`（`'ask' | 'agent' | ModuleChatModeId`，定义于 `ChatModeSelect.tsx`）切换出的能力集——Ask 模式屏蔽写文件/vault shell/终端/todo 等能力（`CHAT_BLOCKED_CAPABILITY_IDS`，`chat-runtime-profiles.ts`）；`AgentSessionService`、`resolveChatModeRuntime`、模块自定义聊天模式（`RegisteredModuleChatModeV1`，见「模块系统」）都接入同一个 `ChatMode` 类型体系。另有一条与 `ChatMode` 正交的运行时轴：同一个视图既可以跑 YOLO 原生 agent（`YoloChatSurface.tsx`），也可以整体切到外部 CLI 运行时（`CliChatSurface.tsx`，切换入口 `RuntimeSelector.tsx`）——见下方「外部 CLI 运行时」条目，那条路径不经过 `AgentSessionService`。挂载到独立窗口（`placement: 'window'`）时叠加下方「Popout / 多窗口」一节的约束。
+- 验证路径：dev vault 手测——四种 placement 各自打开/复用 leaf 是否正确（`chatViewNavigator.test.ts` 覆盖对应状态机），以及任一 placement 下 Ask/Agent 两种 ChatMode 的能力屏蔽是否符合预期（`ChatSessionController.test.ts`）。
+
+### Streaming 渲染约束（跨 Ask/Agent 模式的所有入口）
+- 生成中的内容/推理不进会话快照，活在 `assistantRenderStreamStore`（`src/core/agent/assistantRenderStreamStore.ts`）里；快照只在语义边界折叠回去。改流式渲染前务必先读这个文件，不要引入逐 token 发布会话快照的路径。
+
+## 外部 CLI 运行时（Chat 视图内的第二种执行面）
+- 触发方式：Chat 视图顶部的 `RuntimeSelector.tsx` 从 YOLO 原生 agent 切到某个外部 CLI 代理，之后整条对话由该 CLI 进程驱动，UI 换成 `CliChatSurface.tsx`。这不是 `AgentSessionService` 的另一种编排，而是并列的另一类执行面——AGENTS.md「不要造第二条 agent 编排路径」约束的是前者内部，不是这里。
+- 核心代码：`src/core/cli-runtime/`——`registry.ts`（描述符驱动的运行时注册面）、`coordinator.ts`（工厂装配与生命周期）、`conversation-controller.ts`（会话状态机）、`session-service.ts`/`session-index.ts`（会话落盘与索引）、`permission-profile.ts`（权限档）、`model-catalog.ts`；各家实现在 `claude/`、`codebuddy/`、`codex/`、`grok/`、`hermes/`、`pi/` 与 `acp/`（Agent Client Protocol）。
+- 依赖子系统：桌面端独占（子进程 + 登录 shell 环境，`desktop.ts`/`login-shell-env.ts`）。`index.ts` 会被移动端一起加载，桌面实现必须留在它的静态图之外。
+- 验证路径：目录内测试与源文件基本一一对应（`registry.test.ts`、`coordinator.test.ts`、`conversation-controller.test.ts`、`permission-profile.test.ts` 等）；`src/components/chat-view/CliChatSurface.test.tsx` 覆盖 UI 侧；真机手测需要本地装好对应 CLI。
+
+## 灵光写作 / Sparkle（单轮编辑器功能族）
+- 产品命名注记：这条线在设置页/侧边栏统一品牌为「灵光写作 / Sparkle」（`fdcc10ff`），代码里没有与之对应的统一目录——`src/features/editor/` 下 Tab 补全、选区改写、续写是并列的兄弟目录，只是共用同一条底层执行路径。不要再用「Write Assist」指代这整条产品线，那是改名前遗留的说法；`continuation` 现在专指续写这一个子能力（见下）。
+- 触发方式：笔记内联的低延迟单轮生成，三个触发点共享同一条实现：Tab 补全（`tab-completion`）、选区改写（`selection-rewrite`）、续写（`continuation`，被 Quick Ask 的「续写」档通过 `plugin.continueWriting()` 调用，见上「Quick Ask」条目）。
+- 核心代码：共同的执行路径是 `executeSingleTurn`（`src/core/ai/single-turn.ts`，709 行）。三个调用方：`src/features/editor/tab-completion/tabCompletionController.ts`、`src/features/editor/selection-rewrite/selectionRewriteController.ts`、`src/features/editor/continuation/continuationController.ts`（`ContinuationController`，仅被 `QuickAskPanel.tsx` 续写档调用，不直接被其他 UI 使用）。
+- 依赖子系统：**不接入** `AgentSessionService` 或 agent 编排——这是一条独立的单轮路径，改动时不要把它并入 agent runtime，也不要给它加工具循环。改 `single-turn.ts` 时要意识到三个调用方都会受影响。
+- 验证路径：dev vault 手测，分别触发 Tab 补全、选区改写、Quick Ask 续写档，确认响应延迟和不经过 Agent 权限体系。
+
+## 工具系统
+- 核心代码：`src/core/tools/`。`capabilities/`（`file-editing.ts`、`file-reading.ts`、`vault-shell.ts`、`terminal.ts`、`todo-list.ts`、`web-access.ts`、`js-sandbox.ts`、`subagent-delegation.ts`、`user-questions.ts`、`context-compaction.ts`、`context-pruning.ts`）是唯一注册点——工具目录、设置项、审批策略、持久化 key 都从这里派生，不要另开侧表。`dispatcher.ts`（43 行）是唯一执行路径。
+- 按需披露（1.6.8 起是唯一模式，全局开关已下线）：不进请求 `tools` 数组的工具以裸名字活在系统提示词目录里，由 `src/core/agent/tool-catalog.ts` 构造、`tool-selection.ts` 决定哪些常驻；模型经 `src/core/tools/internal/invoke_tool/` 发起调用，需要 schema 时批量走 `internal/load_tool_schemas/`。两者都是协议内工具，不走 `defineTool`/`CAPABILITIES`、不进设置页；`tool-gateway.ts` 在任何策略求值之前把 `invoke_tool` 请求改写成真实工具的请求——这个顺序是安全不变量。
+- 模块自有格式：`structured-vault-formats.ts` 是一张静态扩展名表（当前只有 `.yoloboard` → `yolo_whiteboard__edit_board`），让 `fs_edit`/`fs_write` 拒绝把这类文件当纯文本改写。它刻意不查运行时注册表，好让同一次调用的行为跟机器上装没装那个模块无关。
+- 具体工具实现目录：`bash/`、`fs_edit/`、`fs_read/`、`fs_write/`、`terminal_command/`、`todo_write/`、`web_search/`、`web_scrape/`、`js_eval/`、`ask_user_question/`、`delegate_subagent/`、`context_compact/`、`context_prune_tool_results/`，以及协议内的 `internal/`。
+- 验证路径：`dispatcher.test.ts`、`registry.test.ts`、`tool-catalog-equivalence.test.ts` 覆盖分发与目录一致性；单个工具改动看对应目录下的 `*.test.ts`。
+
+## 记忆系统
+- 触发方式：无用户入口，也没有专用工具。记忆是 vault 里的普通 markdown：`<YOLO baseDir>/memory/global/` 对所有助手生效，`<YOLO baseDir>/memory/<助手名>/` 只对该助手生效（`global` 是保留名）。每个目录一份 `MEMORY.md` 索引加若干条子文档，索引全文进系统提示词，子文档由模型按需用通用文件工具读写。
+- 核心代码：`src/core/memory/memoryStore.ts`（目录/索引路径解析、助手目录名去重与保留名、索引读取，是唯一一份路径算法）、`legacyMemoryMigration.ts`（插件加载时把 v1 的 `memory/global.md`、`memory/<助手名>.md` 一次性合并成 `legacy-memory.md` + 索引行，由 `main.ts` 在 `onLayoutReady` 触发）、`src/utils/chat/requestContextBuilder.ts` 里 `buildCustomInstructionsSubsections` 的 memory 段（`<memory>` 与固定英文 `<memory_rules>` 的唯一装配点，不要再开第二条读记忆的路径）。
+- 依赖子系统：读写全靠通用文件工具（`fs_read`/`fs_edit`/`fs_write`，Max 下是 `read_file`/`write_file`/`edit_file`），因此没有文件写入能力的模式（Ask）只读不写。两个记忆目录在 `workspaceScope.ts` 的 `buildScopeExemptPathSet` 里与 skill 路径一起豁免工作区范围，别的助手的目录不豁免。索引路径进 `computeSystemPromptFingerprint` 与 `PromptSourceWatcher`，用户手改 `MEMORY.md` 会让系统提示词快照失效；模型自己写的那次由 `maybeWithInternalWrite` 抑制，下个会话生效。上下文占用走 `contextBreakdown` 的 `memory` 桶。
+- 验证路径：`src/core/memory/memoryStore.test.ts`、`legacyMemoryMigration.test.ts`、`src/utils/chat/requestContextBuilder.test.ts`（注入与指纹）、`src/core/agent/workspaceScope.test.ts`（豁免）；手测在 dev vault 建两级 `MEMORY.md`，开会话看 Context Usage 的 memory 桶，再让模型记一条偏好看它是否自发建子文档并更新索引。
+
+## MCP
+- 核心代码：`src/core/mcp/`——`mcpManager.ts`/`mcpCoordinator.ts`（生命周期与协调）、`desktopLocalMcpServer.ts`/`inProcessToolServer.ts`（本地/进程内 server）、`mcpOAuth*.ts`（OAuth 流程）、`localFileTools.ts`（vault 文件工具作为本地 MCP server 暴露）、`jsSandboxTool.ts`。
+- 验证路径：目录内测试覆盖率很高（几乎每个源文件都有对应 `*.test.ts`），改动先看同名测试；`mcpManager.selfHeal.test.ts` 专门覆盖自愈重连路径。
+
+## RAG / 检索 / 多知识库
+- 核心代码：`src/core/rag/`——`ragEngine.ts`/`ragCoordinator.ts`（索引与查询编排）、`ragIndexService.ts`（增量索引）、`ragAutoUpdateService.ts`（自动更新）、`knowledgeBaseCatalog.ts`（多知识库目录）、`embedding.ts`、`local-embedding/`（本地嵌入，运行时组件化，见下）、`reconciler.ts`。
+- 向量库：`src/database/vector-store/`，IndexedDB 后端，`vectorDatabase.ts` 持有 `VECTOR_DATABASE_VERSION`——schema v1 是 final，改 schema 必须 bump 版本号并在该文件加升级路径，不能原地改字段语义。
+- 验证路径：`ragEngine.test.ts`、`ragCoordinator.test.ts`、`IndexedDbVectorStore.test.ts`、`vectorDatabase.test.ts` 等；本地嵌入模型改动额外看 `runtime-components/embedding-engine/`（下方「运行时组件」）。
+
+## Skills
+- 核心代码：`src/core/skills/`——`builtinSkills.ts`（内置 skill 目录，`builtin/` 子目录存放具体 skill）、`githubSkillImporter.ts`（从 GitHub 导入）、`skillPolicy.ts`（启用策略）、`skillValidation.ts`、`liteSkills.ts`。
+- 依赖子系统：模块也可以打包 skill（见下「模块系统」中的 skill 投影机制），二者共用同一份 vault skill 语义，但注册入口不同。
+- 验证路径：对应 `*.test.ts`，导入类改动重点看 `githubSkillImporter.test.ts`、`skillImportLimits.test.ts`。
+
+## 模块系统
+- 核心代码：`src/core/modules/`，覆盖发现（`officialModuleCatalog.ts`/`devModuleCatalogSource.ts`）、安装（`moduleInstallationCoordinator.ts`/`moduleArtifactInstaller.ts`/`moduleArtifactVerifier.ts`）、加载（`moduleLoader.ts`/`moduleRuntime.tsx`）、激活（`moduleActivationCoordinator.ts`）、生命周期（`lifecycleScope.ts`/`moduleStartupReconciler.ts`）、Host API 暴露（`hostCapabilities.ts`）。`modules/host-sdk.d.ts`（仓库根 `modules/` 目录下）是模块可见的 API 契约，模块不能越过它 import `src/core/`。
+- 已知第一方模块：`modules/learning/`（完整实现：`src/domain/`、`src/generation/`、`src/host/`、`src/ui/`、`src/anki/`）与 `modules/whiteboard/`（见下方「白板 / .yoloboard」）——产品逻辑全部在各自模块内，host 侧只负责通用的模块生命周期。
+- 模块自定义聊天模式：`moduleChatModeRegistry.ts`，产出 `RegisteredModuleChatModeV1`，接入前述 `ChatMode` 类型体系（`src/components/chat-view/chat-input/ChatModeSelect.tsx` 里的 `ModuleChatModeId`）。
+- 模块向宿主贡献的注册面（都在 `src/core/modules/`，Host API 当前 `1.10.0`，版本号在 `officialModuleCompatibilityProvider.ts` 与 `modules/host-sdk.d.ts`；未发布的版本号并回而不是再涨）：`moduleToolSetRegistry.ts`（向**普通对话**贡献常驻工具集，与上一条的模式内工具正交，经 `McpCoordinator` 回放成进程内 MCP server）、`moduleFileTextRendererRegistry.ts`（模块定义自有格式对模型呈现的文本形态）、`moduleFileView.ts`（文件视图与文件菜单动作）、`obsidianMarkdownEditor.ts`/`obsidianMarkdownContentView.ts`（模块直接复用宿主 Live Preview 编辑器与分段渲染）、`moduleVault.ts` 的 `getResourceUrl`、`generateLink`（按用户链接设置生成 wiki/Markdown 链接，含 `#page=…&selection=…` 子路径与显示别名）与 `getAvailableAttachmentPath`（按用户附件位置设置为新附件取可用路径）、`hostCapabilities.ts` 的 `chat.addSelection`（把模块自绘视图里的选区以文件/页码 mention 引用进聊天，落到 `ChatViewNavigator.addSelectionBlockToChat`）、`modulePdf.ts`（`host.pdf`：按 vault 路径打开共享、引用计数的 PDF 文档句柄，渲染页面、文字层、选区↔原生 `selection=a,b,c,d` 元组与 quadpoints、区域 PNG、页面 `cleanup()`、不建文字层取页面文本项 `getTextItems()`（供文内搜索）；`addAnnotations(pdf, annotations)` 把标准 Highlight/Square 注释（自带外观流）写进一份 PDF 副本字节，实现在 `runtime-components/pdf-engine/src/annotations.ts`（pdf-lib，测试 `src/core/runtime-components/pdfEngineAnnotations.test.ts`）；缓存与文件变更失效在 `src/utils/pdf/pdfDocumentCache.ts`，实现在 `runtime-components/pdf-engine/src/document.ts`，文字层样式在 `src/styles/pdf/text-layer.css`）。
+- 模块 skill 投影：`moduleSkillMaterializer.ts`——声明的 skill 包在激活时物化到 `<YOLO base>/modules/<moduleId>/skills/<package>/`，之后按普通 vault skill 走，没有单独的协议层。
+- 验证路径：`src/core/modules/` 下测试文件与源文件几乎一一对应；模块侧改动需要 `npm run module:typecheck` + `npm run module:build`（重建 `modules/<id>/<version>/` 与 `modules/bundled.json`，这些是构建产物，都被忽略、不提交；`bundled.json` 只供开发版的本地安装通道读取）。
+
+## 白板 / .yoloboard（第一方模块）
+- 触发方式：命令或文件菜单新建 `.yoloboard`，由模块注册的文件视图接管（`registerFileView`）；也可从 Obsidian Canvas 导入（`domain/canvasImport.ts`）。卡片是笔记的一扇取景窗，窗口位置存进板子本身。
+- 核心代码：`modules/whiteboard/src/`——`domain/`（纯逻辑，文件格式、提交与历史、选区、对齐吸附、分组、整理、虚拟化判定，测试与源文件一一对应）、`ui/canvas/`（`cardRenderer.ts`/`edgeLayer.ts`/`cameraController.ts`/`overviewLayer.ts`/`snapGuideLayer.ts`/`toolbarController.ts`；控制器共享的读取与提交口 `core.ts`，指针分派与平移/框选/悬停手柄层 `interactionController.ts`，拖动/缩放/建卡拖出与对齐吸附 `dragGestures.ts`，连线 `connectGesture.ts`，编辑与重命名 `editingController.ts`，键位与分层键链 `keymapController.ts`）、`ui/lod.ts`（分档渲染：`OVERVIEW_SCALE_THRESHOLD = 0.35` 以下整块交给 canvas 概览档，卡片与边不进 DOM；回升有滞回带避免抖动）、`host/boardTools.ts`（白板 Agent 工具集，编辑落在已打开的视图上）。PDF 卡片是 `ui/pdf/pdfReader.ts`（自足的阅读器组件：连续滚动、页面虚拟化、缩放停止 250ms 后按屏幕密度重绘、页码跳转、深色反相；只经 `host.pdf`，与卡片/相机解耦，面板可复用）+ `ui/pdf/readerLayout.ts`（纯几何，有测试）；阅读位置存节点 `startPage`（1 起的小数页）。视图内阅读面板 `ui/pdf/readerPanel.ts`（右侧分栏，同一 `PdfReader` 再挂一份；入口是 PDF 卡片工具条/右键「展开阅读」，与卡片的位置同步、`startPage` 回写、视口让位都在 `ui/canvas/pdfIntegration.ts`；宽度存 `host/readerPanelPrefs.ts` 的设备本地私有存储）；文内搜索 `ui/pdf/pdfSearch.ts`（按页文本扫描、CSS Custom Highlight 绘制、Mod+F 仅在有阅读器时由 `pdfIntegration.ts` 的 `syncReaderKeymap` 绑定）+ `ui/pdf/textSearch.ts`（纯匹配，有测试）。PDF 标注：伴随文件 `<pdf 路径>.annotations.json` 的格式与解析在 `domain/pdfAnnotations.ts`；按 PDF 路径共享、引用计数的存储与「跟随 PDF 改名/删除」在 `host/annotationStore.ts`（模块激活级，`AnnotationStores`）；每页高亮层 `ui/pdf/annotationLayer.ts`、几何/命中/引文重定位 `ui/pdf/annotationGeometry.ts`（有测试）；选区浮动工具条、批注编辑、复制原生链接、引用到聊天在 `ui/pdf/annotationController.ts`（每个白板视图一份，复用 `ui/selectionToolbar.ts`）；默认高亮色 `host/annotationPrefs.ts`（同步私有存储）。摘录到白板：卡片 Markdown 形态、原生链接子路径解析、卡片尺寸估算在 `domain/excerpt.ts`（有测试），摆放用 `domain/placement.ts` 的 `placeBeside`（PDF 卡片右侧一列向下找空位）；建卡、区域裁图落附件在 `ui/canvas/pdfExcerpts.ts`；拖出选区落到画布经 `ui/canvas/dropImport.ts` 的 `onDrop` 交给 `pdfIntegration.ts` 的 `dropExcerpt`（经 `AnnotationController.takeExcerptDrag` 识别）；点卡片里指向本板 PDF 的原生链接 → 阅读面板跳页并闪烁选区在 `pdfIntegration.ts` 的 `followPdfLinkAt` 与 `PdfReader.revealLocation`。导出带注释的 PDF：`host/exportAnnotatedPdf.ts`（读标注→`host.pdf.addAnnotations`→在原 PDF 旁写 `<名> (annotated).pdf`），颜色映射在 `domain/pdfExport.ts`（有测试）；入口为 PDF 的文件菜单（含原生 PDF 标签页的更多菜单）、PDF 卡片右键、阅读面板标题栏「…」菜单。Mod+Z/Escape/Delete 是 `ui/canvas/keymapController.ts` 的分层键链（`addLayer`/`run`，按 `KEY_LAYER_RANK` 排序），各控制器注册自己那一层：PDF 的那一层（`activeReader`、`undoAnnotation`、`escapeReader`、`deleteActiveAnnotation`）在 `pdfIntegration.ts` 的构造函数里注册。
+- 依赖子系统：只经 Host API 触达宿主（文件视图、Live Preview 编辑器、内容视图、`getResourceUrl`、工具集注册）；宿主侧对 `.yoloboard` 的写保护见上方「工具系统」的 `structured-vault-formats.ts`。
+- 验证路径：`npm --prefix modules/whiteboard run test`、`test:boundary`（边界脚本）、`typecheck`，改源码后 `npm run module:build`（产物都被忽略、不提交）。
+
+## 运行时组件（Runtime Components）
+- 核心代码：`src/core/runtime-components/` 负责发现、下载、安装、生命周期（`runtimeComponentDownloader.ts`/`runtimeComponentInstaller.ts`/`runtimeComponentLoader.ts`/`runtimeComponentService.ts`）。仓库根 `runtime-components/<id>/` 存放各组件自己的源码与构建产物，`runtime-components/sdk.d.ts` 是组件侧契约。
+- 已知组件目录（仓库根）：`tokenizer/`、`pdf-engine/`、`bash-engine/`、`embedding-engine/`、`pglite-engine/`——重量级 native/WASM 依赖闭包只能进这里，不能被 host 或普通模块静态 import（`npm run runtime:verify` 会在 host bundle 意外拉入组件依赖时失败）。
+- `claude-agent-sdk/` 是唯一可用 Node 内置模块的组件：`component.config.json` 声明 `"node": true`（构建脚本只允许 `platforms` 恰为 `["desktop"]` 时声明），内置模块保持外部依赖，运行时经桌面渲染进程的全局 `require` 解析。SDK 包 `@yolo/claude-agent-sdk-runtime` 就放在它的 `sdk-runtime/` 下，宿主只做 `import type`，值经 `src/core/cli-runtime/claude/sdk-loader.ts` 取组件。
+- 验证路径：`npm run runtime:typecheck`、组件目录内测试（如 `bashEngineReadOnly.test.ts`、`embeddingEngineRequestQueue.test.ts`）、`npm run runtime:build` + `npm run runtime:verify`。
+
+## Settings
+- 核心代码：`src/settings/SettingTab.tsx`（设置面板主体）、`src/settings/schema/`（设置项 schema/迁移）、`src/settings/chatQuickAccess.ts`。
+- 依赖子系统：设置项变更常联动工具能力（`src/core/tools/capabilities/`）、模块设置贡献（`moduleSettingsContributions.ts`/`moduleSettingsStore.ts`）、RAG 知识库配置（`knowledgeBaseCatalog.ts`）。
+- 验证路径：dev vault 手测设置页交互；schema 迁移改动看 `src/settings/schema/` 下测试，新增迁移前检查当前版本之后是否已有未发布迁移，能合并就合并，避免无意义递增版本号。
+
+## Popout / 多窗口（跨领域约束，非独立功能）
+- 说明：Obsidian popout 是独立 `BrowserWindow`，插件 JS 仍在同一 JS realm，但每个窗口有自己的 `document`/`window`/键盘映射。全局 `document`/`window` 只指向主窗口。
+- 核心代码：`src/utils/dom/window-context.ts`——任何 view-local DOM 操作（portal、事件监听、`requestAnimationFrame`、`ResizeObserver`/`IntersectionObserver`、`getComputedStyle`、`activeElement`、定时器）必须走节点的 `ownerDocument`/`defaultView`，不能默认用全局 `document`/`window`。
+- 依赖子系统：键盘/Escape 层级/菜单要走 Obsidian 的 `Scope`/`app.keymap.pushScope`/`Menu`/`Modal`，纯 React `onKeyDown` + Radix/document-capture 只在主窗口有效，在 popout 里会失效。
+- 验证路径：没有自动化测试覆盖 popout 行为——任何 overlay/快捷键/portal 改动必须手动在弹出窗口（不只是主窗口）里验证一遍才算完成。

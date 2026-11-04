@@ -1,0 +1,153 @@
+import type { ModuleDeviceState } from './moduleDeviceStateStore'
+import { ModuleUninstallCoordinator } from './moduleUninstallCoordinator'
+
+describe('ModuleUninstallCoordinator', () => {
+  test('discards a pending installation before removing local state', async () => {
+    const state: ModuleDeviceState = {
+      moduleId: 'learning',
+      platform: 'desktop',
+      active: null,
+      pending: {
+        descriptor: {
+          id: 'learning',
+          version: '1.0.0',
+          hostApi: '^1.0.0',
+          platform: 'desktop',
+          dataSchemas: {},
+          manifestUrl:
+            'https://github.com/Lapis0x0/obsidian-yolo/releases/download/learning-v1.0.0/module.json',
+          manifest: { byteSize: 1, sha256: 'a'.repeat(64) },
+        },
+      },
+    }
+    const remove = jest.fn(async () => undefined)
+    const write = jest.fn(async (next: ModuleDeviceState) => next)
+    const removeState = jest.fn(async () => undefined)
+    const coordinator = new ModuleUninstallCoordinator({
+      artifactStore: { removeVersionArtifacts: remove },
+      deviceStateStore: {
+        runExclusive: async (_id, operation) =>
+          operation({
+            read: async () => state,
+            write,
+            remove: removeState,
+          }),
+      },
+      intentStore: {
+        get: async () => 'uninstalled',
+      },
+      manager: { refresh: async () => undefined },
+      runtime: {
+        deactivate: async () => undefined,
+        runWithModuleQuiesced: async (_id, operation) => operation(),
+      },
+      platform: 'desktop',
+    })
+    await expect(coordinator.uninstall('learning')).resolves.toBeUndefined()
+    expect(write).toHaveBeenCalledWith({ ...state, pending: null })
+    expect(removeState).toHaveBeenCalledTimes(1)
+    expect(remove).toHaveBeenCalledWith('learning', '1.0.0')
+  })
+
+  test('drops the vault skill projection even when no device state remains', async () => {
+    const removeSkillProjection = jest.fn(async () => undefined)
+    const coordinator = new ModuleUninstallCoordinator({
+      artifactStore: { removeVersionArtifacts: jest.fn() },
+      deviceStateStore: {
+        runExclusive: async (_id, operation) =>
+          operation({
+            read: async () => null,
+            write: async (next) => next,
+            remove: async () => undefined,
+          }),
+      },
+      intentStore: { get: async () => 'uninstalled' },
+      manager: { refresh: async () => undefined },
+      runtime: {
+        deactivate: async () => undefined,
+        runWithModuleQuiesced: async (_id, operation) => operation(),
+      },
+      platform: 'desktop',
+      removeSkillProjection,
+    })
+
+    await expect(coordinator.uninstall('learning')).resolves.toBeUndefined()
+    expect(removeSkillProjection).toHaveBeenCalledWith('learning')
+  })
+
+  test('does not touch the projection when the intent is not uninstalled', async () => {
+    const removeSkillProjection = jest.fn(async () => undefined)
+    const coordinator = new ModuleUninstallCoordinator({
+      artifactStore: { removeVersionArtifacts: jest.fn() },
+      deviceStateStore: {
+        runExclusive: async (_id, operation) =>
+          operation({
+            read: async () => null,
+            write: async (next) => next,
+            remove: async () => undefined,
+          }),
+      },
+      intentStore: { get: async () => 'enabled' },
+      manager: { refresh: async () => undefined },
+      runtime: {
+        deactivate: async () => undefined,
+        runWithModuleQuiesced: async (_id, operation) => operation(),
+      },
+      platform: 'desktop',
+      removeSkillProjection,
+    })
+
+    await expect(coordinator.uninstall('learning')).rejects.toThrow(
+      /requires uninstalled intent/,
+    )
+    expect(removeSkillProjection).not.toHaveBeenCalled()
+  })
+})
+
+describe('ModuleUninstallCoordinator intent guard', () => {
+  function coordinator(
+    intent: 'enabled' | 'disabled' | 'uninstalled' | undefined,
+    remove: jest.Mock,
+  ) {
+    return new ModuleUninstallCoordinator({
+      artifactStore: { removeVersionArtifacts: jest.fn() },
+      deviceStateStore: {
+        runExclusive: async (_id, operation) =>
+          operation({
+            read: async () => null,
+            write: async (next) => next,
+            remove,
+          }),
+      },
+      intentStore: { get: async () => intent },
+      manager: { refresh: async () => undefined },
+      runtime: {
+        deactivate: async () => undefined,
+        runWithModuleQuiesced: async (_id, operation) => operation(),
+      },
+      platform: 'desktop',
+    })
+  }
+
+  // The guard exists to protect a module someone still wants, and an intent
+  // that is gone entirely wants nothing. Requiring the `uninstalled` value
+  // stranded every device state whose Vault-side declaration had been deleted:
+  // its artifacts were unreachable and its row could never be cleaned up.
+  test('cleans up a module whose intent no longer exists', async () => {
+    const remove = jest.fn(async () => undefined)
+    await expect(
+      coordinator(undefined, remove).uninstall('learning'),
+    ).resolves.toBeUndefined()
+  })
+
+  test.each(['enabled', 'disabled'] as const)(
+    'refuses to remove a module the %s intent still wants',
+    async (intent) => {
+      const remove = jest.fn(async () => undefined)
+      await expect(
+        coordinator(intent, remove).uninstall('learning'),
+      ).rejects.toThrow(/requires uninstalled intent/)
+      expect(remove).not.toHaveBeenCalled()
+    },
+  )
+})

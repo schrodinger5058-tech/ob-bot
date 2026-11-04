@@ -1,0 +1,552 @@
+import { App, Notice, Platform, normalizePath } from 'obsidian'
+import { useCallback, useEffect, useState } from 'react'
+
+import {
+  DEFAULT_CHAT_MODELS,
+  DEFAULT_CHAT_MODEL_ID,
+  DEFAULT_CHAT_TITLE_MODEL_ID,
+  DEFAULT_EMBEDDING_MODELS,
+  DEFAULT_PROVIDERS,
+} from '../../../constants'
+import { useLanguage } from '../../../contexts/language-context'
+import { useSettings } from '../../../contexts/settings-context'
+import { isPortableVaultPathSegment } from '../../../core/paths/portableVaultPath'
+import { ensureUserDataRootDir } from '../../../core/paths/yoloManagedData'
+import { hasHiddenYoloBaseDirSegment } from '../../../core/paths/yoloPaths'
+import {
+  clearAllEditReviewSnapshotStores,
+  getEditReviewSnapshotUsageBytes,
+} from '../../../database/edit-review/editReviewSnapshotStore'
+import { ChatManager } from '../../../database/json/chat/ChatManager'
+import { clearAllPromptSnapshotStores } from '../../../database/json/chat/promptSnapshotStore'
+import { CHAT_DIR } from '../../../database/json/constants'
+import {
+  clearLocalCache,
+  getLocalCacheUsageBytes,
+} from '../../../database/local-cache/localCacheStore'
+import type YoloPlugin from '../../../main'
+import {
+  pluginUpdateModeSchema,
+  yoloSettingsSchema,
+} from '../../../settings/schema/setting.types'
+import { ObsidianButton } from '../../common/ObsidianButton'
+import { ObsidianDropdown } from '../../common/ObsidianDropdown'
+import { ObsidianSetting } from '../../common/ObsidianSetting'
+import { ObsidianTextInput } from '../../common/ObsidianTextInput'
+import { ObsidianToggle } from '../../common/ObsidianToggle'
+import { ConfirmModal } from '../../modals/ConfirmModal'
+
+type EtcSectionProps = {
+  app: App
+  plugin: YoloPlugin
+  className?: string
+}
+
+type StorageUsage = {
+  chatHistoryBytes: number | null
+  chatSnapshotBytes: number | null
+}
+
+const CHAT_SNAPSHOT_DIR = 'chat_snapshots'
+const formatBytes = (bytes: number): string => {
+  if (bytes < 1024) {
+    return `${bytes} B`
+  }
+
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unitIndex = 0
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+
+  const digits = value >= 10 ? 0 : 1
+  return `${value.toFixed(digits)} ${units[unitIndex]}`
+}
+
+const getPathSize = async (app: App, path: string): Promise<number> => {
+  if (!(await app.vault.adapter.exists(path))) {
+    return 0
+  }
+
+  const stat = await app.vault.adapter.stat(path)
+  if (!stat) {
+    return 0
+  }
+
+  if (stat.type === 'file') {
+    return stat.size
+  }
+
+  const listing = await app.vault.adapter.list(path)
+  const childSizes = await Promise.all([
+    ...listing.files.map(async (filePath) => {
+      const fileStat = await app.vault.adapter.stat(filePath)
+      return fileStat?.size ?? 0
+    }),
+    ...listing.folders.map((folderPath) => getPathSize(app, folderPath)),
+  ])
+
+  return childSizes.reduce((sum, size) => sum + size, 0)
+}
+
+const loadStorageUsage = async (
+  app: App,
+  settings: Parameters<typeof ensureUserDataRootDir>[1],
+): Promise<StorageUsage> => {
+  const rootDir = await ensureUserDataRootDir(app, settings)
+  const chatDir = normalizePath(`${rootDir}/${CHAT_DIR}`)
+
+  // 编辑评审快照和本地缓存都在设备本地的 IndexedDB 里，Obsidian 的 adapter
+  // 看不到，由各自的库自己计量。
+  const [
+    chatDirBytes,
+    promptSnapshotBytes,
+    editReviewSnapshotBytes,
+    localCacheBytes,
+  ] = await Promise.all([
+    getPathSize(app, chatDir),
+    getPathSize(app, normalizePath(`${chatDir}/${CHAT_SNAPSHOT_DIR}`)),
+    getEditReviewSnapshotUsageBytes(app),
+    getLocalCacheUsageBytes(app),
+  ])
+
+  return {
+    chatHistoryBytes: Math.max(0, chatDirBytes - promptSnapshotBytes),
+    chatSnapshotBytes:
+      promptSnapshotBytes + editReviewSnapshotBytes + localCacheBytes,
+  }
+}
+
+const StorageBadge = ({ value }: { value: number | null }) => {
+  const { t } = useLanguage()
+
+  return (
+    <span className="yolo-setting-size-badge">
+      {value === null ? t('common.loading', '加载中...') : formatBytes(value)}
+    </span>
+  )
+}
+
+const normalizeYoloBaseDirInput = (value: string): string =>
+  normalizePath(value.trim()).replace(/^\/+/, '') || 'YOLO'
+
+export function EtcSection({ app, plugin, className }: EtcSectionProps) {
+  const { settings, setSettings } = useSettings()
+  const { t } = useLanguage()
+  const canSelfUpdate = plugin.canSelfUpdatePlugin()
+  const yoloBaseDir = settings.yolo?.baseDir ?? 'YOLO'
+  const [storageUsage, setStorageUsage] = useState<StorageUsage>({
+    chatHistoryBytes: null,
+    chatSnapshotBytes: null,
+  })
+  const [yoloBaseDirInput, setYoloBaseDirInput] = useState(yoloBaseDir)
+  const normalizedYoloBaseDirInput = normalizeYoloBaseDirInput(yoloBaseDirInput)
+  const yoloBaseDirError = hasHiddenYoloBaseDirSegment(yoloBaseDirInput)
+    ? t(
+        'settings.etc.yoloBaseDirHiddenPath',
+        'YOLO root cannot use hidden folders. Remove the dot at the beginning of the folder name, for example change .yolo to yolo.',
+      )
+    : normalizedYoloBaseDirInput
+          .split('/')
+          .some((segment) => !isPortableVaultPathSegment(segment))
+      ? t(
+          'settings.etc.yoloBaseDirInvalidPath',
+          'YOLO root contains a folder name that is not supported across devices. Avoid control characters, Windows reserved names, and the characters <>:"\\|?*.',
+        )
+      : null
+
+  useEffect(() => {
+    setYoloBaseDirInput(yoloBaseDir)
+  }, [yoloBaseDir])
+
+  const refreshStorageUsage = useCallback(() => {
+    let cancelled = false
+
+    void loadStorageUsage(app, settings)
+      .then((nextUsage) => {
+        if (!cancelled) {
+          setStorageUsage(nextUsage)
+        }
+      })
+      .catch((error: unknown) => {
+        console.error('Failed to load storage usage', error)
+        if (!cancelled) {
+          setStorageUsage({
+            chatHistoryBytes: 0,
+            chatSnapshotBytes: 0,
+          })
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [app, settings])
+
+  useEffect(() => refreshStorageUsage(), [refreshStorageUsage])
+
+  const handleYoloBaseDirBlur = (value: string) => {
+    const normalized = normalizeYoloBaseDirInput(value)
+    setYoloBaseDirInput(normalized)
+    if (
+      hasHiddenYoloBaseDirSegment(normalized) ||
+      normalized
+        .split('/')
+        .some((segment) => !isPortableVaultPathSegment(segment))
+    ) {
+      return
+    }
+    if (normalized === yoloBaseDir) return
+
+    void Promise.resolve(
+      setSettings({
+        ...settings,
+        yolo: {
+          ...(settings.yolo ?? { baseDir: 'YOLO' }),
+          baseDir: normalized,
+        },
+      }),
+    )
+      .catch((error: unknown) => {
+        console.error('[YOLO] Failed to change YOLO root', error)
+        new Notice(t('common.error', 'Something went wrong.'))
+      })
+      .finally(() => {
+        setYoloBaseDirInput(plugin.settings.yolo.baseDir)
+      })
+  }
+
+  const handlePluginUpdateModeChange = (value: string) => {
+    const mode = pluginUpdateModeSchema.safeParse(value)
+    if (!mode.success) return
+    void setSettings({
+      ...settings,
+      pluginUpdateMode: mode.data,
+    }).catch((error: unknown) => {
+      console.error('Failed to update plugin update mode', error)
+    })
+  }
+
+  // Debug logs live under the YOLO base dir, which every knowledge base's
+  // engine now excludes unconditionally (see `getYoloBaseDir` usage in
+  // `core/rag/ragCoordinator.ts`) — no per-base exclude rule is needed for
+  // them anymore.
+  const handleCaptureRawRequestDebugChange = (value: boolean) => {
+    void setSettings({
+      ...settings,
+      debug: {
+        ...settings.debug,
+        captureRawRequestDebug: value,
+      },
+    }).catch((error: unknown) => {
+      console.error('Failed to update raw request debug setting', error)
+      new Notice(t('common.error'))
+    })
+  }
+
+  const handleResetSettings = () => {
+    new ConfirmModal(app, {
+      title: t('settings.etc.resetSettings'),
+      message: t('settings.etc.resetSettingsConfirm'),
+      ctaText: t('settings.etc.reset'),
+      onConfirm: () => {
+        void (async () => {
+          const defaultSettings = yoloSettingsSchema.parse({})
+          await setSettings(defaultSettings)
+          new Notice(t('settings.etc.resetSettingsSuccess'))
+        })().catch((error: unknown) => {
+          console.error('Failed to reset settings', error)
+          new Notice(t('common.error'))
+        })
+      },
+    }).open()
+  }
+
+  const handleClearChatHistory = () => {
+    new ConfirmModal(app, {
+      title: t('settings.etc.clearChatHistory'),
+      message: t('settings.etc.clearChatHistoryConfirm'),
+      ctaText: t('common.clear'),
+      onConfirm: () => {
+        void (async () => {
+          const manager = new ChatManager(app, settings)
+          const list = await manager.listChats()
+          for (const meta of list) {
+            await manager.deleteChat(meta.id)
+          }
+          // Drop all frozen system prompts so no snapshot outlives its conversation.
+          await plugin.warmupAgentService()
+          plugin.getAgentService().clearSystemPromptSnapshots()
+          const nextUsage = await loadStorageUsage(app, settings)
+          setStorageUsage(nextUsage)
+          // Notify UI hooks (useChatHistory) to refresh chat list immediately
+          window.dispatchEvent(new Event('yolo:chat-history-cleared'))
+          new Notice(t('settings.etc.clearChatHistorySuccess'))
+        })().catch((error: unknown) => {
+          console.error('Failed to clear chat history', error)
+          new Notice(t('common.error'))
+        })
+      },
+    }).open()
+  }
+
+  const handleResetProviders = () => {
+    new ConfirmModal(app, {
+      title: t('settings.etc.resetProviders'),
+      message: t('settings.etc.resetProvidersConfirm'),
+      ctaText: t('settings.etc.reset'),
+      onConfirm: () => {
+        void (async () => {
+          const defaultChatModelId =
+            DEFAULT_CHAT_MODELS.find((v) => v.id === DEFAULT_CHAT_MODEL_ID)
+              ?.id ?? DEFAULT_CHAT_MODELS[0].id
+          const defaultChatTitleModelId =
+            DEFAULT_CHAT_MODELS.find(
+              (v) => v.id === DEFAULT_CHAT_TITLE_MODEL_ID,
+            )?.id ?? DEFAULT_CHAT_MODELS[0].id
+          const defaultEmbeddingModelId = DEFAULT_EMBEDDING_MODELS[0].id
+
+          await setSettings({
+            ...settings,
+            providers: [...DEFAULT_PROVIDERS],
+            chatModels: [...DEFAULT_CHAT_MODELS],
+            embeddingModels: [...DEFAULT_EMBEDDING_MODELS],
+            chatModelId: defaultChatModelId,
+            chatTitleModelId: defaultChatTitleModelId,
+            embeddingModelId: defaultEmbeddingModelId,
+          })
+          new Notice(t('settings.etc.resetProvidersSuccess'))
+        })().catch((error: unknown) => {
+          console.error('Failed to reset providers', error)
+          new Notice(t('common.error'))
+        })
+      },
+    }).open()
+  }
+
+  const handleClearChatSnapshots = () => {
+    new ConfirmModal(app, {
+      title: t('settings.etc.clearChatSnapshots'),
+      message: t('settings.etc.clearChatSnapshotsConfirm'),
+      ctaText: t('common.clear'),
+      onConfirm: () => {
+        void (async () => {
+          await clearAllPromptSnapshotStores(app, settings)
+          await clearAllEditReviewSnapshotStores(app)
+          await clearLocalCache(app)
+          const nextUsage = await loadStorageUsage(app, settings)
+          setStorageUsage(nextUsage)
+          new Notice(t('settings.etc.clearChatSnapshotsSuccess'))
+        })().catch((error: unknown) => {
+          console.error('Failed to clear chat snapshots', error)
+          new Notice(t('common.error'))
+        })
+      },
+    }).open()
+  }
+
+  const handleResetAgents = () => {
+    new ConfirmModal(app, {
+      title: t('settings.etc.resetAgents'),
+      message: t('settings.etc.resetAgentsConfirm'),
+      ctaText: t('settings.etc.reset'),
+      onConfirm: () => {
+        void (async () => {
+          await setSettings({
+            ...settings,
+            assistants: [],
+            currentAssistantId: undefined,
+            quickAskAssistantId: undefined,
+          })
+          new Notice(t('settings.etc.resetAgentsSuccess'))
+        })().catch((error: unknown) => {
+          console.error('Failed to reset agents', error)
+          new Notice(t('common.error'))
+        })
+      },
+    }).open()
+  }
+
+  return (
+    <div
+      className={['yolo-settings-section', className].filter(Boolean).join(' ')}
+    >
+      <section className="yolo-settings-block">
+        <div className="yolo-settings-block-head">
+          <div className="yolo-settings-block-head-title-row">
+            <div className="yolo-settings-sub-header yolo-settings-block-title">
+              {t('settings.etc.maintenanceSectionTitle', 'Maintenance')}
+            </div>
+          </div>
+        </div>
+
+        <div className="yolo-settings-block-content">
+          <ObsidianSetting
+            name={t('settings.etc.pluginUpdateMode')}
+            desc={
+              settings.pluginUpdateMode === 'auto'
+                ? Platform.isDesktop && canSelfUpdate
+                  ? t('settings.etc.pluginUpdateModeAutoDesc')
+                  : t('settings.etc.pluginUpdateModeAutoDescUnavailable')
+                : settings.pluginUpdateMode === 'off'
+                  ? t('settings.etc.pluginUpdateModeOffDesc')
+                  : t('settings.etc.pluginUpdateModeNotifyDesc')
+            }
+            className="yolo-settings-card"
+          >
+            <ObsidianDropdown
+              value={settings.pluginUpdateMode}
+              options={{
+                auto: t('settings.etc.pluginUpdateModeAuto'),
+                notify: t('settings.etc.pluginUpdateModeNotify'),
+                off: t('settings.etc.pluginUpdateModeOff'),
+              }}
+              onChange={handlePluginUpdateModeChange}
+            />
+          </ObsidianSetting>
+
+          <ObsidianSetting
+            name={t('settings.etc.exportConfig', '导出配置')}
+            desc={t(
+              'settings.etc.exportConfigDesc',
+              '将当前插件配置导出为 JSON 文件，方便在其他笔记库中导入使用。',
+            )}
+            className="yolo-settings-card"
+          >
+            <ObsidianButton
+              text={t('settings.etc.export', '导出')}
+              onClick={() => {
+                void import(
+                  '../../../features/config-transfer/components/ExportConfigModal'
+                ).then(({ ExportConfigModal }) => {
+                  new ExportConfigModal(app, plugin).open()
+                })
+              }}
+            />
+          </ObsidianSetting>
+
+          <ObsidianSetting
+            name={t('settings.etc.importConfig', '导入配置')}
+            desc={t(
+              'settings.etc.importConfigDesc',
+              '从导出文件或其他笔记库导入插件配置。',
+            )}
+            className="yolo-settings-card"
+          >
+            <ObsidianButton
+              text={t('settings.etc.import', '导入')}
+              onClick={() => {
+                void import(
+                  '../../../features/config-transfer/components/ImportConfigModal'
+                ).then(({ ImportConfigModal }) => {
+                  new ImportConfigModal(app, plugin).open()
+                })
+              }}
+            />
+          </ObsidianSetting>
+
+          <div
+            className={`yolo-settings-field ${yoloBaseDirError ? 'is-invalid' : ''}`}
+          >
+            <ObsidianSetting
+              name={t('settings.etc.yoloBaseDir', 'YOLO 根目录')}
+              desc={t(
+                'settings.etc.yoloBaseDirDesc',
+                '用于存放 YOLO 管理文件的库内相对目录（例如：Config/YOLO）。技能将从 {path} 加载。',
+              ).replace('{path}', `${yoloBaseDir}/skills`)}
+              className="yolo-settings-card"
+            >
+              <ObsidianTextInput
+                value={yoloBaseDirInput}
+                placeholder={t('settings.etc.yoloBaseDirPlaceholder', 'YOLO')}
+                onChange={setYoloBaseDirInput}
+                onBlur={handleYoloBaseDirBlur}
+              />
+            </ObsidianSetting>
+            {yoloBaseDirError && (
+              <div className="yolo-settings-inline-error" role="alert">
+                {yoloBaseDirError}
+              </div>
+            )}
+          </div>
+
+          <ObsidianSetting
+            name={t('settings.etc.captureRawRequestDebug')}
+            desc={t('settings.etc.captureRawRequestDebugDesc')}
+            className="yolo-settings-card"
+          >
+            <ObsidianToggle
+              value={settings.debug?.captureRawRequestDebug ?? false}
+              onChange={handleCaptureRawRequestDebugChange}
+            />
+          </ObsidianSetting>
+
+          <ObsidianSetting
+            name={t('settings.etc.clearChatHistory')}
+            nameExtra={<StorageBadge value={storageUsage.chatHistoryBytes} />}
+            desc={t('settings.etc.clearChatHistoryDesc')}
+            className="yolo-settings-card"
+          >
+            <ObsidianButton
+              text={t('common.clear')}
+              warning
+              onClick={handleClearChatHistory}
+            />
+          </ObsidianSetting>
+
+          <ObsidianSetting
+            name={t('settings.etc.clearChatSnapshots')}
+            nameExtra={<StorageBadge value={storageUsage.chatSnapshotBytes} />}
+            desc={t('settings.etc.clearChatSnapshotsDesc')}
+            className="yolo-settings-card"
+          >
+            <ObsidianButton
+              text={t('common.clear')}
+              warning
+              onClick={handleClearChatSnapshots}
+            />
+          </ObsidianSetting>
+
+          <ObsidianSetting
+            name={t('settings.etc.resetProviders')}
+            desc={t('settings.etc.resetProvidersDesc')}
+            className="yolo-settings-card"
+          >
+            <ObsidianButton
+              text={t('settings.etc.reset')}
+              warning
+              onClick={handleResetProviders}
+            />
+          </ObsidianSetting>
+
+          <ObsidianSetting
+            name={t('settings.etc.resetAgents')}
+            desc={t('settings.etc.resetAgentsDesc')}
+            className="yolo-settings-card"
+          >
+            <ObsidianButton
+              text={t('settings.etc.reset')}
+              warning
+              onClick={handleResetAgents}
+            />
+          </ObsidianSetting>
+
+          <ObsidianSetting
+            name={t('settings.etc.resetSettings')}
+            desc={t('settings.etc.resetSettingsDesc')}
+            className="yolo-settings-card"
+          >
+            <ObsidianButton
+              text={t('settings.etc.reset')}
+              warning
+              onClick={handleResetSettings}
+            />
+          </ObsidianSetting>
+        </div>
+      </section>
+    </div>
+  )
+}

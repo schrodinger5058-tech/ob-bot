@@ -1,0 +1,2331 @@
+import {
+  DndContext,
+  type DragEndEvent,
+  DragOverlay,
+  type DragStartEvent,
+  type DropAnimation,
+  MeasuringStrategy,
+  PointerSensor,
+  closestCenter,
+  defaultDropAnimationSideEffects,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core'
+import {
+  SortableContext,
+  arrayMove,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
+import { useReducedMotion } from 'framer-motion'
+import {
+  Activity,
+  ChevronDown,
+  ChevronRight,
+  Edit,
+  GripVertical,
+  Loader2,
+  Settings,
+  Trash2,
+} from 'lucide-react'
+import { App, Notice, Platform } from 'obsidian'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+
+import { useLanguage } from '../../../contexts/language-context'
+import { useSettings } from '../../../contexts/settings-context'
+import {
+  CopilotOAuthError,
+  type CopilotOAuthStatus,
+} from '../../../core/auth/copilotOAuthService'
+import { getEmbeddingModelClient } from '../../../core/rag/embedding'
+import type YoloPlugin from '../../../main'
+import {
+  MOTION_DURATION_ENTER_S,
+  MOTION_EASE_OUT_CSS,
+} from '../../../styles/tokens/motion'
+import { ChatModel } from '../../../types/chat-model.types'
+import { EmbeddingModel } from '../../../types/embedding-model.types'
+import { LLMProvider } from '../../../types/provider.types'
+import { resolveProviderDisplayBaseUrl } from '../../../utils/llm/provider-base-url'
+import { providerSupportsEmbedding } from '../../../utils/llm/provider-config'
+import { openExternalLink } from '../../../utils/openExternalLink'
+import { ObsidianButton } from '../../common/ObsidianButton'
+import { ObsidianSetting } from '../../common/ObsidianSetting'
+import { ObsidianTextInput } from '../../common/ObsidianTextInput'
+import { ObsidianToggle } from '../../common/ObsidianToggle'
+import { useOptimisticOrder } from '../common/useOptimisticOrder'
+import { useSortableDragSensors } from '../common/useSortableDragSensors'
+import { AddChatModelModal } from '../modals/AddChatModelModal'
+import { AddEmbeddingModelModal } from '../modals/AddEmbeddingModelModal'
+import { ConnectivityTestModal } from '../modals/ConnectivityTestModal'
+import { EditChatModelModal } from '../modals/EditChatModelModal'
+import { EditEmbeddingModelModal } from '../modals/EditEmbeddingModelModal'
+import { EditProviderModal } from '../modals/ProviderFormModal'
+import { ProviderPickerModal } from '../modals/ProviderPickerModal'
+
+// Rows make way for the dragged one on the same curve the sortable card grid
+// uses, so reordering feels the same wherever it appears in settings.
+const SORT_TRANSITION = {
+  duration: MOTION_DURATION_ENTER_S * 1000,
+  easing: MOTION_EASE_OUT_CSS,
+}
+
+// Declared once so `useOptimisticOrder` keeps a stable reference across renders.
+function getEntityId<T extends { id: string }>(entity: T) {
+  return entity.id
+}
+
+type ProvidersAndModelsSectionProps = {
+  app: App
+  plugin: YoloPlugin
+}
+
+type ProviderSectionItemProps = {
+  provider: LLMProvider
+  app: App
+  plugin: YoloPlugin
+  t: Translator
+  isExpanded: boolean
+  toggleProvider: (id: string) => void
+  chatModels: ChatModel[]
+  embeddingModels: EmbeddingModel[]
+  modelSensors: ReturnType<typeof useSensors>
+  isDeleteConfirming: boolean
+  onRequestDeleteProvider: (providerId: string) => void
+  onCancelDeleteProvider: () => void
+  onConfirmDeleteProvider: (provider: LLMProvider) => void
+  handleDeleteChatModel: (modelId: string) => void
+  handleDeleteEmbeddingModel: (modelId: string) => void
+  deletingEmbeddingModelIds: Set<string>
+  handleToggleEnableChatModel: (modelId: string, value: boolean) => void
+  handleChatModelDragEnd: (event: DragEndEvent) => void
+  handleEmbeddingModelDragEnd: (event: DragEndEvent) => void
+}
+
+function getProviderDisplayBaseUrl(provider: LLMProvider): string {
+  const rawBaseUrl = resolveProviderDisplayBaseUrl(provider)
+
+  if (!rawBaseUrl) {
+    return ''
+  }
+
+  return rawBaseUrl.replace(/\/+$/, '').replace(/\/v1$/i, '')
+}
+
+function ChatGPTOAuthPanel({
+  plugin,
+  provider,
+}: {
+  plugin: YoloPlugin
+  provider: LLMProvider
+}) {
+  const { t } = useLanguage()
+  const [loading, setLoading] = useState(true)
+  const [connected, setConnected] = useState(false)
+  const [accountId, setAccountId] = useState<string | null>(null)
+  const [expiresAt, setExpiresAt] = useState<number | null>(null)
+  const [connectingMethod, setConnectingMethod] = useState<
+    'browser' | 'device' | null
+  >(null)
+  const [deviceAuthorization, setDeviceAuthorization] = useState<{
+    userCode: string
+    verificationUri: string
+  } | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const connectionAttemptRef = useRef(0)
+
+  const refreshStatus = useCallback(async () => {
+    setLoading(true)
+    try {
+      const status = await plugin.getChatGPTOAuthStatus(provider.id)
+      setConnected(status.connected)
+      setAccountId(status.accountId ?? null)
+      setExpiresAt(status.expiresAt ?? null)
+    } catch (error) {
+      console.error('[YOLO] Failed to load ChatGPT OAuth status:', error)
+      setConnected(false)
+      setAccountId(null)
+      setExpiresAt(null)
+    } finally {
+      setLoading(false)
+    }
+  }, [plugin, provider.id])
+
+  useEffect(() => {
+    void refreshStatus()
+    return () => {
+      connectionAttemptRef.current += 1
+      abortRef.current?.abort()
+      plugin
+        .getChatGPTOAuthService(provider.id)
+        .cancelPendingBrowserAuthorization()
+    }
+  }, [plugin, provider.id, refreshStatus])
+
+  const handleBrowserConnect = () => {
+    const attemptId = ++connectionAttemptRef.current
+    const execute = async () => {
+      setConnectingMethod('browser')
+      const service = plugin.getChatGPTOAuthService(provider.id)
+      const authorization = await service.beginBrowserAuthorization()
+      setDeviceAuthorization(null)
+      openExternalLink(authorization.authorizationUrl)
+      new Notice(
+        t(
+          'settings.providers.chatgptOAuthBrowserOpened',
+          'ChatGPT login opened in your browser. Complete authorization there.',
+        ),
+        8000,
+      )
+      await authorization.complete
+      new Notice(
+        t(
+          'settings.providers.chatgptOAuthConnectedNotice',
+          'ChatGPT OAuth connected.',
+        ),
+      )
+      await refreshStatus()
+    }
+
+    void execute()
+      .catch((error: unknown) => {
+        if (connectionAttemptRef.current !== attemptId) {
+          return
+        }
+        console.error('[YOLO] Failed to connect ChatGPT OAuth:', error)
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Failed to connect ChatGPT OAuth.'
+        const portFallback = message.includes(
+          'Failed to start local OAuth callback server',
+        )
+          ? `\n${t(
+              'settings.providers.chatgptOAuthPortFallback',
+              'Use device code login instead; it does not require a local port.',
+            )}`
+          : ''
+        new Notice(`${message}${portFallback}`)
+      })
+      .finally(() => {
+        if (connectionAttemptRef.current === attemptId) {
+          setConnectingMethod(null)
+        }
+      })
+  }
+
+  const handleDeviceConnect = () => {
+    const attemptId = ++connectionAttemptRef.current
+    let activeAbortController: AbortController | null = null
+    const execute = async () => {
+      setConnectingMethod('device')
+      const service = plugin.getChatGPTOAuthService(provider.id)
+      const authorization = await service.beginDeviceAuthorization()
+      setDeviceAuthorization({
+        userCode: authorization.userCode,
+        verificationUri: authorization.verificationUri,
+      })
+
+      abortRef.current?.abort()
+      const abortController = new AbortController()
+      activeAbortController = abortController
+      abortRef.current = abortController
+      openExternalLink(authorization.verificationUri)
+      new Notice(
+        t(
+          'settings.providers.chatgptOAuthDeviceOpened',
+          'Enter the displayed device code on the ChatGPT authorization page.',
+        ),
+        10000,
+      )
+
+      await service.pollDeviceAuthorization(
+        authorization,
+        abortController.signal,
+      )
+      setDeviceAuthorization(null)
+      new Notice(
+        t(
+          'settings.providers.chatgptOAuthConnectedNotice',
+          'ChatGPT OAuth connected.',
+        ),
+      )
+      await refreshStatus()
+    }
+
+    void execute()
+      .catch((error: unknown) => {
+        if (connectionAttemptRef.current !== attemptId) {
+          return
+        }
+        if (error instanceof Error && error.name === 'AbortError') {
+          return
+        }
+        console.error(
+          '[YOLO] Failed to connect ChatGPT OAuth with device code:',
+          error,
+        )
+        new Notice(
+          error instanceof Error
+            ? error.message
+            : 'Failed to connect ChatGPT OAuth with device code.',
+        )
+      })
+      .finally(() => {
+        if (abortRef.current === activeAbortController) {
+          abortRef.current = null
+        }
+        if (connectionAttemptRef.current === attemptId) {
+          setDeviceAuthorization(null)
+          setConnectingMethod(null)
+        }
+      })
+  }
+
+  const handleCancelDeviceConnect = () => {
+    connectionAttemptRef.current += 1
+    abortRef.current?.abort()
+    abortRef.current = null
+    setDeviceAuthorization(null)
+    setConnectingMethod(null)
+  }
+
+  const handleCopyDeviceCode = () => {
+    if (!deviceAuthorization) {
+      return
+    }
+
+    void navigator.clipboard
+      .writeText(deviceAuthorization.userCode)
+      .then(() => {
+        new Notice(
+          t('settings.providers.chatgptOAuthCodeCopied', 'Device code copied.'),
+        )
+      })
+      .catch((error: unknown) => {
+        console.error('[YOLO] Failed to copy ChatGPT device code:', error)
+      })
+  }
+
+  const handleDisconnect = () => {
+    const execute = async () => {
+      connectionAttemptRef.current += 1
+      abortRef.current?.abort()
+      abortRef.current = null
+      plugin
+        .getChatGPTOAuthService(provider.id)
+        .cancelPendingBrowserAuthorization()
+      await plugin.disconnectChatGPTOAuthAccount(provider.id)
+      setDeviceAuthorization(null)
+      new Notice(
+        t(
+          'settings.providers.chatgptOAuthDisconnectedNotice',
+          'ChatGPT OAuth disconnected.',
+        ),
+      )
+      await refreshStatus()
+    }
+
+    void execute().catch((error: unknown) => {
+      console.error('[YOLO] Failed to disconnect ChatGPT OAuth:', error)
+      new Notice('Failed to disconnect ChatGPT OAuth.')
+    })
+  }
+
+  return (
+    <div className="yolo-models-subsection">
+      <div className="yolo-models-subsection-header">
+        <span>
+          {t('settings.providers.chatgptOAuthTitle', 'ChatGPT OAuth')}
+        </span>
+        {!connected ? (
+          <div className="yolo-oauth-login-actions">
+            <button
+              type="button"
+              onClick={handleBrowserConnect}
+              className="yolo-add-model-btn"
+              disabled={connectingMethod !== null || !Platform.isDesktop}
+              title={
+                Platform.isDesktop
+                  ? undefined
+                  : t(
+                      'settings.providers.chatgptOAuthBrowserDesktopOnly',
+                      'Browser login is only available on desktop.',
+                    )
+              }
+            >
+              {connectingMethod === 'browser'
+                ? t(
+                    'settings.providers.chatgptOAuthBrowserConnecting',
+                    'Opening browser...',
+                  )
+                : t(
+                    'settings.providers.chatgptOAuthBrowserLogin',
+                    'Browser login',
+                  )}
+            </button>
+            <button
+              type="button"
+              onClick={handleDeviceConnect}
+              className="yolo-add-model-btn yolo-oauth-secondary-btn"
+              disabled={connectingMethod !== null}
+            >
+              {connectingMethod === 'device'
+                ? t(
+                    'settings.providers.chatgptOAuthDeviceConnecting',
+                    'Waiting for authorization...',
+                  )
+                : t(
+                    'settings.providers.chatgptOAuthDeviceLogin',
+                    'Device code login',
+                  )}
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={handleDisconnect}
+            className="yolo-add-model-btn yolo-oauth-disconnect-btn"
+            disabled={connectingMethod !== null}
+          >
+            {t('settings.providers.chatgptOAuthDisconnect', 'Disconnect')}
+          </button>
+        )}
+      </div>
+      <div className="yolo-no-models">
+        {loading
+          ? t(
+              'settings.providers.chatgptOAuthLoadingStatus',
+              'Loading ChatGPT OAuth status...',
+            )
+          : connected
+            ? `${t('settings.providers.chatgptOAuthConnected', 'Connected')}${accountId ? ` · ${accountId}` : ''}${expiresAt ? ` · ${t('settings.providers.chatgptOAuthExpires', 'expires')} ${new Date(expiresAt).toLocaleString()}` : ''}`
+            : t(
+                'settings.providers.chatgptOAuthDisconnectedHelp',
+                'Not connected. Connect to use models from your ChatGPT Plus / Pro account.',
+              )}
+      </div>
+      {deviceAuthorization ? (
+        <div className="yolo-oauth-device-card">
+          <div className="yolo-oauth-device-code-row">
+            <span>
+              {t('settings.providers.chatgptOAuthPendingCode', 'Device code')}
+            </span>
+            <code>{deviceAuthorization.userCode}</code>
+          </div>
+          <div className="yolo-oauth-device-help">
+            {t(
+              'settings.providers.chatgptOAuthDeviceHelp',
+              'Enter this code on the authorization page within 15 minutes. Continue only if you started this login.',
+            )}
+          </div>
+          <div className="yolo-oauth-device-actions">
+            <button
+              type="button"
+              onClick={handleCopyDeviceCode}
+              className="yolo-add-model-btn yolo-oauth-secondary-btn"
+            >
+              {t('settings.providers.chatgptOAuthCopyCode', 'Copy code')}
+            </button>
+            <button
+              type="button"
+              className="yolo-add-model-btn yolo-oauth-secondary-btn"
+              onClick={() =>
+                openExternalLink(deviceAuthorization.verificationUri)
+              }
+            >
+              {t(
+                'settings.providers.chatgptOAuthOpenDevicePage',
+                'Open authorization page',
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={handleCancelDeviceConnect}
+              className="yolo-add-model-btn yolo-oauth-secondary-btn"
+            >
+              {t('settings.providers.chatgptOAuthCancelDevice', 'Cancel')}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function CopilotOAuthPanel({
+  plugin,
+  provider,
+}: {
+  plugin: YoloPlugin
+  provider: LLMProvider
+}) {
+  const { t } = useLanguage()
+  const [status, setStatus] = useState<CopilotOAuthStatus | null>(null)
+  const [isConnecting, setIsConnecting] = useState(false)
+  const [deviceAuthorization, setDeviceAuthorization] = useState<{
+    userCode: string
+    verificationUri: string
+  } | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const connectionAttemptRef = useRef(0)
+
+  const refreshStatus = useCallback(async () => {
+    setStatus(null)
+    const next = await plugin.getCopilotOAuthStatus(provider.id)
+    setStatus(next)
+    return next
+  }, [plugin, provider.id])
+
+  useEffect(() => {
+    void refreshStatus()
+    return () => {
+      connectionAttemptRef.current += 1
+      abortRef.current?.abort()
+    }
+  }, [refreshStatus])
+
+  const describeLoginError = (error: unknown): string => {
+    if (error instanceof CopilotOAuthError) {
+      if (error.code === 'device_code_expired') {
+        return t(
+          'settings.providers.copilotOAuthDeviceExpired',
+          'The code expired before it was approved. Start the login again.',
+        )
+      }
+      if (error.code === 'access_denied') {
+        return t(
+          'settings.providers.copilotOAuthAccessDenied',
+          'Authorization was declined on GitHub.',
+        )
+      }
+    }
+    return error instanceof Error ? error.message : String(error)
+  }
+
+  const handleConnect = () => {
+    const attemptId = ++connectionAttemptRef.current
+    abortRef.current?.abort()
+    const abortController = new AbortController()
+    abortRef.current = abortController
+    const execute = async () => {
+      setIsConnecting(true)
+      const service = plugin.getCopilotOAuthService(provider.id)
+      const authorization = await service.beginDeviceAuthorization()
+      if (abortController.signal.aborted) {
+        return
+      }
+      setDeviceAuthorization({
+        userCode: authorization.userCode,
+        verificationUri: authorization.verificationUri,
+      })
+      openExternalLink(authorization.verificationUri)
+      new Notice(
+        t(
+          'settings.providers.copilotOAuthDeviceOpened',
+          'Enter the displayed code on the GitHub page that just opened.',
+        ),
+        10000,
+      )
+
+      await service.pollDeviceAuthorization(
+        authorization,
+        abortController.signal,
+      )
+      setDeviceAuthorization(null)
+      // Logging in only proves the GitHub account; the status check exchanges
+      // a Copilot token, which is where a missing subscription shows up.
+      const next = await refreshStatus()
+      if (next.state === 'connected') {
+        new Notice(
+          t(
+            'settings.providers.copilotOAuthConnectedNotice',
+            'GitHub Copilot connected.',
+          ),
+        )
+      }
+    }
+
+    void execute()
+      .catch((error: unknown) => {
+        if (connectionAttemptRef.current !== attemptId) {
+          return
+        }
+        if (error instanceof Error && error.name === 'AbortError') {
+          return
+        }
+        console.error('[YOLO] Failed to connect GitHub Copilot:', error)
+        new Notice(describeLoginError(error))
+      })
+      .finally(() => {
+        if (abortRef.current === abortController) {
+          abortRef.current = null
+        }
+        if (connectionAttemptRef.current === attemptId) {
+          setDeviceAuthorization(null)
+          setIsConnecting(false)
+        }
+      })
+  }
+
+  const handleCancel = () => {
+    connectionAttemptRef.current += 1
+    abortRef.current?.abort()
+    abortRef.current = null
+    setDeviceAuthorization(null)
+    setIsConnecting(false)
+  }
+
+  const handleCopyCode = () => {
+    if (!deviceAuthorization) {
+      return
+    }
+    void navigator.clipboard
+      .writeText(deviceAuthorization.userCode)
+      .then(() => {
+        new Notice(
+          t('settings.providers.copilotOAuthCodeCopied', 'Code copied.'),
+        )
+      })
+      .catch((error: unknown) => {
+        console.error('[YOLO] Failed to copy GitHub device code:', error)
+      })
+  }
+
+  const handleDisconnect = () => {
+    const execute = async () => {
+      handleCancel()
+      await plugin.disconnectCopilotOAuthAccount(provider.id)
+      new Notice(
+        t(
+          'settings.providers.copilotOAuthDisconnectedNotice',
+          'GitHub Copilot disconnected.',
+        ),
+      )
+      await refreshStatus()
+    }
+
+    void execute().catch((error: unknown) => {
+      console.error('[YOLO] Failed to disconnect GitHub Copilot:', error)
+      new Notice(
+        t(
+          'settings.providers.copilotOAuthDisconnectFailed',
+          'Failed to disconnect GitHub Copilot.',
+        ),
+      )
+    })
+  }
+
+  const statusText = (() => {
+    switch (status?.state) {
+      case undefined:
+        return t(
+          'settings.providers.copilotOAuthLoadingStatus',
+          'Checking GitHub Copilot login...',
+        )
+      case 'connected':
+        return t('settings.providers.copilotOAuthConnected', 'Connected')
+      case 'disconnected':
+        return t(
+          'settings.providers.copilotOAuthDisconnectedHelp',
+          'Not connected. Log in with GitHub to use the models in your Copilot subscription.',
+        )
+      case 'reauth_required':
+        return t(
+          'settings.providers.copilotOAuthReauthRequired',
+          'GitHub no longer accepts the saved login. Log in again.',
+        )
+      case 'no_subscription':
+        return t(
+          'settings.providers.copilotOAuthNoSubscription',
+          'This GitHub account has no Copilot access, or an organization policy disables it.',
+        )
+      case 'error':
+        return t(
+          'settings.providers.copilotOAuthStatusError',
+          'Could not check the Copilot login: {message}',
+        ).replace('{message}', status.message)
+    }
+  })()
+
+  // A stored GitHub token exists in every state but `disconnected`, so
+  // disconnect stays available even when the login is no longer usable.
+  const hasStoredLogin = status !== null && status.state !== 'disconnected'
+  const canLogin = status !== null && status.state !== 'connected'
+
+  return (
+    <div className="yolo-models-subsection">
+      <div className="yolo-models-subsection-header">
+        <span>
+          {t('settings.providers.copilotOAuthTitle', 'GitHub Copilot')}
+        </span>
+        <div className="yolo-oauth-login-actions">
+          {canLogin ? (
+            <button
+              type="button"
+              onClick={handleConnect}
+              className="yolo-add-model-btn"
+              disabled={isConnecting}
+            >
+              {isConnecting
+                ? t(
+                    'settings.providers.copilotOAuthConnecting',
+                    'Waiting for authorization...',
+                  )
+                : t(
+                    'settings.providers.copilotOAuthLogin',
+                    'Log in with GitHub',
+                  )}
+            </button>
+          ) : null}
+          {hasStoredLogin ? (
+            <button
+              type="button"
+              onClick={handleDisconnect}
+              className="yolo-add-model-btn yolo-oauth-disconnect-btn"
+              disabled={isConnecting}
+            >
+              {t('settings.providers.copilotOAuthDisconnect', 'Disconnect')}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <div className="yolo-no-models">{statusText}</div>
+      {deviceAuthorization ? (
+        <div className="yolo-oauth-device-card">
+          <div className="yolo-oauth-device-code-row">
+            <span>
+              {t('settings.providers.copilotOAuthPendingCode', 'Code')}
+            </span>
+            <code>{deviceAuthorization.userCode}</code>
+          </div>
+          <div className="yolo-oauth-device-help">
+            {t(
+              'settings.providers.copilotOAuthDeviceHelp',
+              'Enter this code at github.com/login/device before it expires. Continue only if you started this login.',
+            )}
+          </div>
+          <div className="yolo-oauth-device-actions">
+            <button
+              type="button"
+              onClick={handleCopyCode}
+              className="yolo-add-model-btn yolo-oauth-secondary-btn"
+            >
+              {t('settings.providers.copilotOAuthCopyCode', 'Copy code')}
+            </button>
+            <button
+              type="button"
+              className="yolo-add-model-btn yolo-oauth-secondary-btn"
+              onClick={() =>
+                openExternalLink(deviceAuthorization.verificationUri)
+              }
+            >
+              {t(
+                'settings.providers.copilotOAuthOpenDevicePage',
+                'Open GitHub',
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="yolo-add-model-btn yolo-oauth-secondary-btn"
+            >
+              {t('settings.providers.copilotOAuthCancel', 'Cancel')}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function GeminiOAuthPanel({
+  plugin,
+  provider,
+}: {
+  plugin: YoloPlugin
+  provider: LLMProvider
+}) {
+  const { t } = useLanguage()
+  const [loading, setLoading] = useState(true)
+  const [connected, setConnected] = useState(false)
+  const [email, setEmail] = useState<string | null>(null)
+  const [projectId, setProjectId] = useState<string | null>(null)
+  const [expiresAt, setExpiresAt] = useState<number | null>(null)
+  const [isConnecting, setIsConnecting] = useState(false)
+
+  const refreshStatus = useCallback(async () => {
+    setLoading(true)
+    try {
+      const status = await plugin.getGeminiOAuthStatus(provider.id)
+      setConnected(status.connected)
+      setEmail(status.email ?? null)
+      setProjectId(status.projectId ?? null)
+      setExpiresAt(status.expiresAt ?? null)
+    } catch (error) {
+      console.error('[YOLO] Failed to load Gemini OAuth status:', error)
+      setConnected(false)
+      setEmail(null)
+      setProjectId(null)
+      setExpiresAt(null)
+    } finally {
+      setLoading(false)
+    }
+  }, [plugin, provider.id])
+
+  useEffect(() => {
+    void refreshStatus()
+  }, [refreshStatus])
+
+  const handleConnect = () => {
+    const execute = async () => {
+      setIsConnecting(true)
+      const service = plugin.getGeminiOAuthService(provider.id)
+      const authorization = await service.beginBrowserAuthorization()
+      window.open(
+        authorization.authorizationUrl,
+        '_blank',
+        'noopener,noreferrer',
+      )
+      new Notice('已打开 Gemini OAuth 登录页面，请在浏览器中完成授权。', 8000)
+      await authorization.complete
+      new Notice('Gemini OAuth 连接成功')
+      await refreshStatus()
+    }
+
+    void execute()
+      .catch((error: unknown) => {
+        console.error('[YOLO] Failed to connect Gemini OAuth:', error)
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Failed to connect Gemini OAuth.'
+        new Notice(message)
+      })
+      .finally(() => {
+        setIsConnecting(false)
+      })
+  }
+
+  const handleDisconnect = () => {
+    const execute = async () => {
+      plugin
+        .getGeminiOAuthService(provider.id)
+        .cancelPendingBrowserAuthorization()
+      await plugin.disconnectGeminiOAuthAccount(provider.id)
+      new Notice('Gemini OAuth 已断开')
+      await refreshStatus()
+    }
+
+    void execute().catch((error: unknown) => {
+      console.error('[YOLO] Failed to disconnect Gemini OAuth:', error)
+      new Notice('Failed to disconnect Gemini OAuth.')
+    })
+  }
+
+  return (
+    <div className="yolo-models-subsection">
+      <div className="yolo-models-subsection-header">
+        <span>{t('settings.providers.geminiOAuthTitle', 'Gemini OAuth')}</span>
+        {!connected ? (
+          <button
+            type="button"
+            onClick={handleConnect}
+            className="yolo-add-model-btn"
+            disabled={isConnecting || !Platform.isDesktop}
+          >
+            {isConnecting
+              ? t('settings.providers.geminiOAuthConnecting', 'Connecting...')
+              : t('settings.providers.geminiOAuthConnect', 'Connect')}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={handleDisconnect}
+            className="yolo-add-model-btn yolo-oauth-disconnect-btn"
+            disabled={isConnecting}
+          >
+            {t('settings.providers.geminiOAuthDisconnect', 'Disconnect')}
+          </button>
+        )}
+      </div>
+      <div className="yolo-no-models">
+        {!Platform.isDesktop && !connected
+          ? t(
+              'settings.providers.oauthDesktopOnly',
+              'OAuth login is only available on desktop. Please connect on desktop first.',
+            )
+          : loading
+            ? t(
+                'settings.providers.geminiOAuthLoadingStatus',
+                'Loading Gemini OAuth status...',
+              )
+            : connected
+              ? `${t('settings.providers.geminiOAuthConnected', 'Connected')}${email ? ` · ${email}` : ''}${projectId ? ` · ${t('settings.providers.geminiOAuthProject', 'project')} ${projectId}` : ''}${expiresAt ? ` · ${t('settings.providers.geminiOAuthExpires', 'expires')} ${new Date(expiresAt).toLocaleString()}` : ''}`
+              : t(
+                  'settings.providers.geminiOAuthDisconnectedHelp',
+                  'Not connected. Connect to use Gemini quota from your Google account.',
+                )}
+      </div>
+    </div>
+  )
+}
+
+function ClaudeOAuthPanel({
+  app,
+  provider,
+}: {
+  app: App
+  provider: LLMProvider
+}) {
+  const { t } = useLanguage()
+  const { updateSettings } = useSettings()
+  const token = provider.apiKey ?? ''
+  const [connecting, setConnecting] = useState(false)
+  const abortRef = useRef<AbortController | null>(null)
+
+  const handleChange = (next: string) => {
+    void updateSettings((current) => ({
+      ...current,
+      providers: current.providers.map((p) =>
+        p.id === provider.id ? { ...p, apiKey: next } : p,
+      ),
+    }))
+  }
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort()
+    }
+  }, [])
+
+  const handleAutoLogin = () => {
+    const execute = async () => {
+      setConnecting(true)
+      const abortController = new AbortController()
+      abortRef.current = abortController
+      const { runClaudeSetupToken } = await import(
+        '../../../core/cli-runtime/claude/setupToken'
+      )
+      const result = await runClaudeSetupToken(app, abortController.signal)
+      handleChange(result.token)
+      new Notice(
+        t(
+          'settings.providers.claudeOauthAutoLoginSuccess',
+          'Claude login connected.',
+        ),
+      )
+    }
+
+    void execute()
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === 'AbortError') {
+          return
+        }
+        console.error('[YOLO] Failed to auto-login Claude OAuth:', error)
+        new Notice(
+          error instanceof Error
+            ? error.message
+            : 'Failed to auto-login Claude OAuth.',
+        )
+      })
+      .finally(() => {
+        abortRef.current = null
+        setConnecting(false)
+      })
+  }
+
+  const handleOpenTerminal = () => {
+    const execute = async () => {
+      const { openClaudeSetupTokenTerminal } = await import(
+        '../../../core/cli-runtime/claude/setupToken'
+      )
+      await openClaudeSetupTokenTerminal(app)
+      new Notice(
+        t(
+          'settings.providers.claudeOauthAutoLoginWindowsNotice',
+          'A terminal window opened to complete login. Paste the printed token into the field below once it finishes.',
+        ),
+        10000,
+      )
+    }
+
+    void execute().catch((error: unknown) => {
+      console.error('[YOLO] Failed to open Claude login terminal:', error)
+      new Notice(
+        error instanceof Error
+          ? error.message
+          : 'Failed to open Claude login terminal.',
+      )
+    })
+  }
+
+  return (
+    <div className="yolo-models-subsection">
+      <div className="yolo-models-subsection-header">
+        <span>{t('settings.providers.claudeOauthTitle', 'Claude OAuth')}</span>
+        <button
+          type="button"
+          onClick={Platform.isWin ? handleOpenTerminal : handleAutoLogin}
+          className="yolo-add-model-btn"
+          disabled={connecting || !Platform.isDesktop}
+          title={
+            Platform.isDesktop
+              ? undefined
+              : t(
+                  'settings.providers.claudeOauthAutoLoginDesktopOnly',
+                  'Automated login is only available on desktop.',
+                )
+          }
+        >
+          {connecting
+            ? t(
+                'settings.providers.claudeOauthAutoLoginConnecting',
+                'Waiting for browser login...',
+              )
+            : t('settings.providers.claudeOauthAutoLogin', 'Auto login')}
+        </button>
+      </div>
+      <ObsidianSetting
+        name={t('settings.providers.claudeOauthTokenName', 'OAuth token')}
+        desc={t(
+          'settings.providers.claudeOauthTokenDesc',
+          'Run "claude setup-token" in a terminal and paste the token here. This quota is only usable through Claude Code chat mode — it will not appear in any model list. Paste a new token once it expires.',
+        )}
+      >
+        <ObsidianTextInput
+          type="password"
+          value={token}
+          placeholder="sk-ant-oat..."
+          onChange={handleChange}
+        />
+        <ObsidianButton
+          text={t('settings.providers.claudeOauthClear', 'Clear')}
+          onClick={() => handleChange('')}
+          disabled={!token}
+        />
+      </ObsidianSetting>
+    </div>
+  )
+}
+
+/**
+ * The collapsed-row summary of a provider.
+ *
+ * Rendered twice while a row is being dragged: once by the row itself, which
+ * stays put as the empty slot, and once inside the drag overlay as the copy
+ * that follows the pointer. The overlay's copy leaves `interactions` out — it
+ * is a picture of the row, not a second set of working controls.
+ */
+type ProviderHeaderProps = {
+  provider: LLMProvider
+  t: Translator
+  isExpanded: boolean
+  chatModelCount: number
+  embeddingModelCount: number
+  interactions?: {
+    dragListeners: ReturnType<typeof useSortable>['listeners']
+    onToggle: () => void
+    onEdit: () => void
+    onRequestDelete: () => void
+  }
+}
+
+function ProviderHeader({
+  provider,
+  t,
+  isExpanded,
+  chatModelCount,
+  embeddingModelCount,
+  interactions,
+}: ProviderHeaderProps) {
+  const displayBaseUrl = getProviderDisplayBaseUrl(provider)
+  const chatModelsLabel = `${chatModelCount} ${t('settings.providers.chatModels').replace(/^个/, '')}`
+  const embeddingModelsLabel = `${embeddingModelCount} ${t('settings.providers.embeddingModels').replace(/^个/, '')}`
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    // Keys pressed on a nested control belong to that control.
+    if (event.target !== event.currentTarget) return
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      interactions?.onToggle()
+    }
+  }
+
+  return (
+    <div
+      className="yolo-provider-header"
+      role={interactions ? 'button' : undefined}
+      tabIndex={interactions ? 0 : undefined}
+      aria-expanded={interactions ? isExpanded : undefined}
+      onClick={interactions?.onToggle}
+      onKeyDown={interactions ? handleKeyDown : undefined}
+      {...interactions?.dragListeners}
+    >
+      {/* The expand arrow, the provider name and the model counts are not
+          controls of their own — pressing any of them means pressing the row.
+          They stay plain elements so the row can own both the click and the
+          drag, the way the sortable cards do. */}
+      <div className="yolo-provider-main-trigger">
+        <div className="yolo-provider-expand-btn">
+          {isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        </div>
+
+        <div className="yolo-provider-info">
+          <span className="yolo-provider-id">{provider.id}</span>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        className="yolo-provider-type yolo-provider-base-url-btn"
+        onClick={
+          interactions
+            ? (e) => {
+                e.stopPropagation()
+                interactions.onEdit()
+              }
+            : undefined
+        }
+      >
+        <span className="yolo-provider-base-url-text">{displayBaseUrl}</span>
+      </button>
+
+      <div className="yolo-provider-secondary-trigger">
+        <span className="yolo-provider-model-counts">
+          {chatModelsLabel} · {embeddingModelsLabel}
+        </span>
+      </div>
+
+      <div className="yolo-provider-actions">
+        <button
+          type="button"
+          onClick={
+            interactions
+              ? (e) => {
+                  e.stopPropagation()
+                  interactions.onEdit()
+                }
+              : undefined
+          }
+          className="clickable-icon"
+        >
+          <Settings />
+        </button>
+        <button
+          type="button"
+          onClick={
+            interactions
+              ? (e) => {
+                  e.stopPropagation()
+                  interactions.onRequestDelete()
+                }
+              : undefined
+          }
+          className="clickable-icon"
+          aria-label={t('settings.providers.requestDelete', '删除提供商')}
+        >
+          <Trash2 />
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ProviderSectionItem({
+  provider,
+  app,
+  plugin,
+  t,
+  isExpanded,
+  toggleProvider,
+  chatModels,
+  embeddingModels,
+  modelSensors,
+  isDeleteConfirming,
+  onRequestDeleteProvider,
+  onCancelDeleteProvider,
+  onConfirmDeleteProvider,
+  handleDeleteChatModel,
+  handleDeleteEmbeddingModel,
+  deletingEmbeddingModelIds,
+  handleToggleEnableChatModel,
+  handleChatModelDragEnd,
+  handleEmbeddingModelDragEnd,
+}: ProviderSectionItemProps) {
+  const isChatGPTOAuth = provider.presetType === 'chatgpt-oauth'
+  const isGeminiOAuth = provider.presetType === 'gemini-oauth'
+  const isClaudeOAuth = provider.presetType === 'claude-oauth'
+  const isCopilotOAuth = provider.presetType === 'github-copilot'
+  // `attributes` is left out: it re-declares role/tabIndex/aria on the row for
+  // keyboard sorting, which this list doesn't offer (no KeyboardSensor), and
+  // it would fight the header's own button semantics.
+  const { listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: provider.id, transition: SORT_TRANSITION })
+
+  const style: React.CSSProperties = {
+    // Translate only: rows differ in height, and letting dnd-kit's scale
+    // through would stretch the row while it stands in as the empty slot.
+    transform: CSS.Translate.toString(transform),
+    transition,
+  }
+
+  // dnd-kit swallows clicks while a drag is active, but it detaches that
+  // listener on teardown, so the click that lands just after the drop gets
+  // through and would toggle the row. Ignore clicks briefly after a drag.
+  const suppressToggleUntilRef = useRef(0)
+  useEffect(() => {
+    if (!isDragging) return
+    return () => {
+      suppressToggleUntilRef.current = Date.now() + 250
+    }
+  }, [isDragging])
+
+  const handleToggle = () => {
+    if (Date.now() < suppressToggleUntilRef.current) return
+    toggleProvider(provider.id)
+  }
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={`yolo-provider-section ${isDragging ? 'yolo-provider-dragging' : ''}`}
+      data-provider-id={provider.id}
+    >
+      <ProviderHeader
+        provider={provider}
+        t={t}
+        isExpanded={isExpanded}
+        chatModelCount={chatModels.length}
+        embeddingModelCount={embeddingModels.length}
+        interactions={{
+          dragListeners: listeners,
+          onToggle: handleToggle,
+          onEdit: () => new EditProviderModal(app, plugin, provider).open(),
+          onRequestDelete: () => onRequestDeleteProvider(provider.id),
+        }}
+      />
+
+      {isDeleteConfirming && (
+        <div
+          className="yolo-provider-delete-confirm"
+          data-provider-delete-confirm-id={provider.id}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div className="yolo-provider-delete-confirm-copy">
+            <span className="yolo-provider-delete-confirm-title">
+              {t(
+                'settings.providers.deleteConfirmTitle',
+                '删除提供商「{provider}」？',
+              ).replace('{provider}', provider.id)}
+            </span>
+            <span className="yolo-provider-delete-confirm-meta">
+              {t(
+                'settings.providers.deleteConfirmImpact',
+                '这会同时删除 {chatCount} 个聊天模型、{embeddingCount} 个嵌入模型，并清理相关向量数据。',
+              )
+                .replace('{chatCount}', String(chatModels.length))
+                .replace('{embeddingCount}', String(embeddingModels.length))}
+            </span>
+          </div>
+          <div className="yolo-provider-delete-confirm-actions">
+            <button
+              type="button"
+              className="yolo-provider-delete-cancel"
+              onClick={() => onCancelDeleteProvider()}
+            >
+              {t('common.cancel', '取消')}
+            </button>
+            <button
+              type="button"
+              className="yolo-provider-delete-confirm-btn"
+              onClick={() => onConfirmDeleteProvider(provider)}
+            >
+              {t('settings.providers.confirmDeleteAction', '确认删除')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {isExpanded && (
+        <div className="yolo-provider-models">
+          {isChatGPTOAuth && (
+            <ChatGPTOAuthPanel
+              plugin={plugin}
+              provider={
+                provider as Extract<LLMProvider, { type: 'chatgpt-oauth' }>
+              }
+            />
+          )}
+          {isGeminiOAuth && (
+            <GeminiOAuthPanel plugin={plugin} provider={provider} />
+          )}
+          {isClaudeOAuth && <ClaudeOAuthPanel app={app} provider={provider} />}
+          {isCopilotOAuth && (
+            <CopilotOAuthPanel plugin={plugin} provider={provider} />
+          )}
+          <ChatModelsTable
+            provider={provider}
+            app={app}
+            plugin={plugin}
+            t={t}
+            models={chatModels}
+            sensors={modelSensors}
+            onDragEnd={handleChatModelDragEnd}
+            onToggle={handleToggleEnableChatModel}
+            onDelete={handleDeleteChatModel}
+          />
+
+          <EmbeddingModelsTable
+            provider={provider}
+            app={app}
+            plugin={plugin}
+            t={t}
+            models={embeddingModels}
+            sensors={modelSensors}
+            onDragEnd={handleEmbeddingModelDragEnd}
+            onDelete={handleDeleteEmbeddingModel}
+            deletingModelIds={deletingEmbeddingModelIds}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+type ChatModelsTableProps = {
+  provider: LLMProvider
+  app: App
+  plugin: YoloPlugin
+  t: Translator
+  models: ChatModel[]
+  sensors: ReturnType<typeof useSensors>
+  onDragEnd: (event: DragEndEvent) => void
+  onToggle: (modelId: string, value: boolean) => void
+  onDelete: (modelId: string) => void
+}
+
+function ChatModelsTable({
+  provider,
+  app,
+  plugin,
+  t,
+  models,
+  sensors,
+  onDragEnd,
+  onToggle,
+  onDelete,
+}: ChatModelsTableProps) {
+  const items = models.map((model) => model.id)
+
+  return (
+    <div className="yolo-models-subsection">
+      <div className="yolo-models-subsection-header">
+        <span>{t('settings.models.chatModels')}</span>
+        <div className="yolo-models-subsection-actions">
+          <button
+            type="button"
+            className="yolo-connectivity-test-btn"
+            onClick={() => {
+              const modal = new ConnectivityTestModal(app, plugin, provider)
+              modal.open()
+            }}
+          >
+            <Activity size={13} />
+            {t('settings.models.connectivityTest.button', '连通性测试')}
+          </button>
+          <button
+            type="button"
+            className="yolo-add-model-btn"
+            onClick={() => {
+              const modal = new AddChatModelModal(app, plugin, provider)
+              modal.open()
+            }}
+          >
+            + {t('settings.models.addChatModel')}
+          </button>
+        </div>
+      </div>
+
+      {models.length > 0 ? (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={onDragEnd}
+        >
+          <SortableContext items={items} strategy={verticalListSortingStrategy}>
+            <table className="yolo-models-table">
+              <colgroup>
+                <col width={16} />
+                <col />
+                <col />
+                <col width={60} />
+                <col width={60} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>{t('settings.models.modelName')}</th>
+                  <th>Model (calling ID)</th>
+                  <th>Enable</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {models.map((model) => (
+                  <ChatModelRow
+                    key={model.id}
+                    provider={provider}
+                    model={model}
+                    app={app}
+                    plugin={plugin}
+                    t={t}
+                    onToggle={onToggle}
+                    onDelete={onDelete}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </SortableContext>
+        </DndContext>
+      ) : (
+        <div className="yolo-no-models">
+          {t('settings.models.noChatModelsConfigured')}
+        </div>
+      )}
+    </div>
+  )
+}
+
+type EmbeddingModelsTableProps = {
+  provider: LLMProvider
+  app: App
+  plugin: YoloPlugin
+  t: Translator
+  models: EmbeddingModel[]
+  sensors: ReturnType<typeof useSensors>
+  onDragEnd: (event: DragEndEvent) => void
+  onDelete: (modelId: string) => void
+  deletingModelIds: Set<string>
+}
+
+function EmbeddingModelsTable({
+  provider,
+  app,
+  plugin,
+  t,
+  models,
+  sensors,
+  onDragEnd,
+  onDelete,
+  deletingModelIds,
+}: EmbeddingModelsTableProps) {
+  const items = models.map((model) => model.id)
+  const embeddingSupported = providerSupportsEmbedding(provider)
+
+  return (
+    <div className="yolo-models-subsection">
+      <div className="yolo-models-subsection-header">
+        <span>{t('settings.models.embeddingModels')}</span>
+        {embeddingSupported && (
+          <button
+            type="button"
+            className="yolo-add-model-btn"
+            onClick={() => {
+              const modal = new AddEmbeddingModelModal(app, plugin, provider)
+              modal.open()
+            }}
+          >
+            + {t('settings.models.addEmbeddingModel')}
+          </button>
+        )}
+      </div>
+
+      {models.length > 0 ? (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={onDragEnd}
+        >
+          <SortableContext items={items} strategy={verticalListSortingStrategy}>
+            <table className="yolo-models-table yolo-embedding-models-table">
+              <colgroup>
+                <col width={16} />
+                <col />
+                <col />
+                <col width={80} />
+                <col width={60} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>{t('settings.models.modelName')}</th>
+                  <th>Model (calling ID)</th>
+                  <th>Dimension</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {models.map((model) => (
+                  <EmbeddingModelRow
+                    key={model.id}
+                    provider={provider}
+                    model={model}
+                    app={app}
+                    plugin={plugin}
+                    t={t}
+                    onDelete={onDelete}
+                    isDeleting={deletingModelIds.has(model.id)}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </SortableContext>
+        </DndContext>
+      ) : (
+        <div className="yolo-no-models">
+          {!embeddingSupported
+            ? `${provider.id} provider does not support embeddings.`
+            : t('settings.models.noEmbeddingModelsConfigured')}
+        </div>
+      )}
+    </div>
+  )
+}
+
+type ChatModelRowProps = {
+  provider: LLMProvider
+  model: ChatModel
+  app: App
+  plugin: YoloPlugin
+  t: Translator
+  onToggle: (modelId: string, value: boolean) => void
+  onDelete: (modelId: string) => void
+}
+
+function ChatModelRow({
+  provider,
+  model,
+  app,
+  plugin,
+  t,
+  onToggle,
+  onDelete,
+}: ChatModelRowProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: model.id, transition: SORT_TRANSITION })
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  }
+
+  return (
+    <tr
+      ref={setNodeRef}
+      style={style}
+      className={isDragging ? 'yolo-row-dragging' : ''}
+      data-model-id={model.id}
+      data-model-key={`${provider.id}:${model.id}`}
+      {...attributes}
+      {...listeners}
+    >
+      <td>
+        <button type="button" className="yolo-drag-handle">
+          <GripVertical />
+          {/* Hidden text rather than aria-label, which Obsidian would render
+              as a hover tooltip on the handle. */}
+          <span className="yolo-sr-only">
+            {t('settings.models.dragHandle', 'Drag to reorder')}
+          </span>
+        </button>
+      </td>
+      <td title={model.id}>{model.name || model.model || model.id}</td>
+      <td>{model.model || model.id}</td>
+      <td onPointerDown={(event) => event.stopPropagation()}>
+        <ObsidianToggle
+          value={model.enable ?? true}
+          onChange={(value) => onToggle(model.id, value)}
+        />
+      </td>
+      <td>
+        <div className="yolo-settings-actions">
+          <button
+            type="button"
+            onClick={() => new EditChatModelModal(app, plugin, model).open()}
+            className="clickable-icon"
+            title="Edit model"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <Edit />
+          </button>
+          <button
+            type="button"
+            onClick={() => onDelete(model.id)}
+            className="clickable-icon"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <Trash2 />
+          </button>
+        </div>
+      </td>
+    </tr>
+  )
+}
+
+type EmbeddingModelRowProps = {
+  provider: LLMProvider
+  model: EmbeddingModel
+  app: App
+  plugin: YoloPlugin
+  t: Translator
+  onDelete: (modelId: string) => void
+  isDeleting: boolean
+}
+
+function EmbeddingModelRow({
+  provider,
+  model,
+  app,
+  plugin,
+  t,
+  onDelete,
+  isDeleting,
+}: EmbeddingModelRowProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: model.id, transition: SORT_TRANSITION })
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  }
+
+  return (
+    <tr
+      ref={setNodeRef}
+      style={style}
+      className={isDragging ? 'yolo-row-dragging' : ''}
+      data-model-id={model.id}
+      data-model-key={`${provider.id}:${model.id}`}
+      {...attributes}
+      {...listeners}
+    >
+      <td>
+        <button type="button" className="yolo-drag-handle">
+          <GripVertical />
+          {/* Hidden text rather than aria-label, which Obsidian would render
+              as a hover tooltip on the handle. */}
+          <span className="yolo-sr-only">
+            {t('settings.models.dragHandle', 'Drag to reorder')}
+          </span>
+        </button>
+      </td>
+      <td title={model.id}>{model.name ?? model.model ?? model.id}</td>
+      <td title={model.model}>{model.model}</td>
+      <td>{model.dimension}</td>
+      <td>
+        <div className="yolo-settings-actions">
+          <button
+            type="button"
+            onClick={() =>
+              new EditEmbeddingModelModal(app, plugin, model).open()
+            }
+            className="clickable-icon"
+            title="Edit model"
+            disabled={isDeleting}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <Edit />
+          </button>
+          <button
+            type="button"
+            onClick={() => onDelete(model.id)}
+            className="clickable-icon"
+            disabled={isDeleting}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            {isDeleting ? <Loader2 className="yolo-spinner" /> : <Trash2 />}
+          </button>
+        </div>
+      </td>
+    </tr>
+  )
+}
+
+type Translator = ReturnType<typeof useLanguage>['t']
+
+export function ProvidersAndModelsSection({
+  app,
+  plugin,
+}: ProvidersAndModelsSectionProps) {
+  const { settings, setSettings } = useSettings()
+  const { t } = useLanguage()
+  const [expandedProviders, setExpandedProviders] = useState<Set<string>>(
+    new Set(),
+  )
+  const [deletingEmbeddingModelIds, setDeletingEmbeddingModelIds] = useState<
+    Set<string>
+  >(new Set())
+  const [pendingDeleteProviderId, setPendingDeleteProviderId] = useState<
+    string | null
+  >(null)
+  const deleteConfirmTimeoutRef = useRef<number | null>(null)
+  // The row itself is the drag source, so it shares the cards' sensors: a
+  // short pointer travel lifts it, while touch asks for a long press so a
+  // swipe still scrolls the settings pane.
+  const providerSensors = useSortableDragSensors()
+  const modelSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 5 },
+    }),
+  )
+  const [activeProviderId, setActiveProviderId] = useState<string | null>(null)
+  // Portals are resolved from the list's own document so the overlay lands in
+  // the right window when settings are open in an Obsidian popout.
+  const [portalBody, setPortalBody] = useState<HTMLElement | null>(null)
+  const providerListRef = useCallback((node: HTMLDivElement | null) => {
+    setPortalBody(node?.ownerDocument.body ?? null)
+  }, [])
+  const reducedMotion = useReducedMotion()
+
+  // Every reorderable list here saves asynchronously, so each one renders the
+  // dropped order locally until its save lands.
+  const {
+    ordered: orderedProviders,
+    applyOrder: applyProviderOrder,
+    revertOrder: revertProviderOrder,
+  } = useOptimisticOrder(settings.providers, getEntityId)
+  const {
+    ordered: orderedChatModels,
+    applyOrder: applyChatModelOrder,
+    revertOrder: revertChatModelOrder,
+  } = useOptimisticOrder(settings.chatModels, getEntityId)
+  const {
+    ordered: orderedEmbeddingModels,
+    applyOrder: applyEmbeddingModelOrder,
+    revertOrder: revertEmbeddingModelOrder,
+  } = useOptimisticOrder(settings.embeddingModels, getEntityId)
+
+  const providerIds = useMemo(
+    () => orderedProviders.map((provider) => provider.id),
+    [orderedProviders],
+  )
+  const activeProvider =
+    activeProviderId === null
+      ? undefined
+      : orderedProviders.find((provider) => provider.id === activeProviderId)
+
+  const providerDropAnimation: DropAnimation | null = reducedMotion
+    ? null
+    : {
+        duration: SORT_TRANSITION.duration,
+        easing: SORT_TRANSITION.easing,
+        sideEffects: defaultDropAnimationSideEffects({
+          className: { dragOverlay: 'is-dropping' },
+          // Keep the empty slot empty until the overlay has landed on it,
+          // otherwise the row appears to settle twice.
+          styles: { active: { opacity: '0' } },
+        }),
+      }
+  const providersCountLabel = t(
+    'settings.providers.providersCount',
+    '已添加 {count} 个提供商',
+  ).replace('{count}', String(settings.providers.length))
+
+  const clearDeleteConfirmTimeout = useCallback(() => {
+    if (deleteConfirmTimeoutRef.current !== null) {
+      window.clearTimeout(deleteConfirmTimeoutRef.current)
+      deleteConfirmTimeoutRef.current = null
+    }
+  }, [])
+
+  const cancelPendingDeleteProvider = useCallback(() => {
+    clearDeleteConfirmTimeout()
+    setPendingDeleteProviderId(null)
+  }, [clearDeleteConfirmTimeout])
+
+  const armDeleteProviderConfirmation = useCallback(
+    (providerId: string) => {
+      clearDeleteConfirmTimeout()
+      setPendingDeleteProviderId(providerId)
+      deleteConfirmTimeoutRef.current = window.setTimeout(() => {
+        setPendingDeleteProviderId((currentId) =>
+          currentId === providerId ? null : currentId,
+        )
+        deleteConfirmTimeoutRef.current = null
+      }, 5000)
+    },
+    [clearDeleteConfirmTimeout],
+  )
+
+  useEffect(() => {
+    return () => {
+      clearDeleteConfirmTimeout()
+    }
+  }, [clearDeleteConfirmTimeout])
+
+  useEffect(() => {
+    if (!pendingDeleteProviderId) {
+      return
+    }
+
+    const escapedProviderId = window.CSS?.escape
+      ? window.CSS.escape(pendingDeleteProviderId)
+      : pendingDeleteProviderId.replace(/"/g, '\\"')
+    const confirmSelector = `[data-provider-delete-confirm-id="${escapedProviderId}"]`
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof Element)) {
+        return
+      }
+
+      if (target.closest(confirmSelector)) {
+        return
+      }
+
+      cancelPendingDeleteProvider()
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        cancelPendingDeleteProvider()
+      }
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [cancelPendingDeleteProvider, pendingDeleteProviderId])
+
+  // Robustly highlight the moved row after DOM re-render
+  const triggerProviderDropSuccess = (providerId: string, movedId: string) => {
+    const key = `${providerId}:${movedId}`
+    const tryFind = (attempt = 0) => {
+      let movedRow = document.querySelector(`tr[data-model-key="${key}"]`)
+      if (!movedRow) {
+        movedRow = document.querySelector(`tr[data-model-id="${movedId}"]`)
+      }
+      if (movedRow) {
+        movedRow.classList.add('yolo-row-drop-success')
+        window.setTimeout(() => {
+          movedRow.classList.remove('yolo-row-drop-success')
+        }, 700)
+      } else if (attempt < 8) {
+        window.setTimeout(() => tryFind(attempt + 1), 50)
+      }
+    }
+    requestAnimationFrame(() => tryFind())
+  }
+
+  // A tall expanded provider is unwieldy to drag, so it collapses — but only
+  // once the drag is real. Collapsing on pointer down would shrink the row
+  // while a plain tap is still undecided, and dnd-kit would be left holding
+  // the geometry the row had before it shrank.
+  const handleProviderDragStart = ({ active }: DragStartEvent) => {
+    const providerId = String(active.id)
+    setActiveProviderId(providerId)
+    setExpandedProviders((prev) => {
+      if (!prev.has(providerId)) return prev
+      const next = new Set(prev)
+      next.delete(providerId)
+      return next
+    })
+  }
+
+  const handleProviderDragEnd = async ({ active, over }: DragEndEvent) => {
+    setActiveProviderId(null)
+    if (!over || active.id === over.id) {
+      return
+    }
+
+    const oldIndex = orderedProviders.findIndex((p) => p.id === active.id)
+    const newIndex = orderedProviders.findIndex((p) => p.id === over.id)
+    if (oldIndex < 0 || newIndex < 0) {
+      return
+    }
+
+    const reorderedProviders = arrayMove(
+      [...orderedProviders],
+      oldIndex,
+      newIndex,
+    )
+    applyProviderOrder(reorderedProviders)
+    try {
+      await setSettings({
+        ...settings,
+        providers: reorderedProviders,
+      })
+      triggerProviderDropSuccessFeedback(String(active.id))
+    } catch (error) {
+      console.error('[YOLO] Failed to reorder providers:', error)
+      revertProviderOrder()
+      new Notice('Failed to reorder providers.')
+    }
+  }
+
+  const handleChatModelDragEnd = async (
+    providerId: string,
+    { active, over }: DragEndEvent,
+  ) => {
+    if (!over || active.id === over.id) {
+      return
+    }
+
+    const providerModels = orderedChatModels.filter(
+      (model) => model.providerId === providerId,
+    )
+    const oldIndex = providerModels.findIndex((model) => model.id === active.id)
+    const newIndex = providerModels.findIndex((model) => model.id === over.id)
+    if (oldIndex < 0 || newIndex < 0) {
+      return
+    }
+
+    const reorderedProviderModels = arrayMove(
+      providerModels,
+      oldIndex,
+      newIndex,
+    )
+    // Models of other providers keep their slots; only this provider's models
+    // are re-dealt into the positions they already occupied.
+    const queue = [...reorderedProviderModels]
+    const updatedChatModels = orderedChatModels.map((model) => {
+      if (model.providerId !== providerId) {
+        return model
+      }
+      return queue.shift() ?? model
+    })
+
+    applyChatModelOrder(updatedChatModels)
+    try {
+      await setSettings({
+        ...settings,
+        chatModels: updatedChatModels,
+      })
+      triggerProviderDropSuccess(providerId, String(active.id))
+    } catch (error) {
+      console.error('[YOLO] Failed to reorder chat models:', error)
+      revertChatModelOrder()
+      new Notice('Failed to reorder chat models.')
+    }
+  }
+
+  const handleEmbeddingModelDragEnd = async (
+    providerId: string,
+    { active, over }: DragEndEvent,
+  ) => {
+    if (!over || active.id === over.id) {
+      return
+    }
+
+    const providerModels = orderedEmbeddingModels.filter(
+      (model) => model.providerId === providerId,
+    )
+    const oldIndex = providerModels.findIndex((model) => model.id === active.id)
+    const newIndex = providerModels.findIndex((model) => model.id === over.id)
+    if (oldIndex < 0 || newIndex < 0) {
+      return
+    }
+
+    const reorderedProviderModels = arrayMove(
+      providerModels,
+      oldIndex,
+      newIndex,
+    )
+    const queue = [...reorderedProviderModels]
+    const updatedEmbeddingModels = orderedEmbeddingModels.map((model) => {
+      if (model.providerId !== providerId) {
+        return model
+      }
+      return queue.shift() ?? model
+    })
+
+    applyEmbeddingModelOrder(updatedEmbeddingModels)
+    try {
+      await setSettings({
+        ...settings,
+        embeddingModels: updatedEmbeddingModels,
+      })
+      triggerProviderDropSuccess(providerId, String(active.id))
+    } catch (error) {
+      console.error('[YOLO] Failed to reorder embedding models:', error)
+      revertEmbeddingModelOrder()
+      new Notice('Failed to reorder embedding models.')
+    }
+  }
+
+  const toggleProvider = (providerId: string) => {
+    const newExpanded = new Set(expandedProviders)
+    if (newExpanded.has(providerId)) {
+      newExpanded.delete(providerId)
+    } else {
+      newExpanded.add(providerId)
+    }
+    setExpandedProviders(newExpanded)
+  }
+
+  const handleDeleteProvider = (provider: LLMProvider) => {
+    void (async () => {
+      const associatedChatModels = settings.chatModels.filter(
+        (m) => m.providerId === provider.id,
+      )
+      const associatedEmbeddingModels = settings.embeddingModels.filter(
+        (m) => m.providerId === provider.id,
+      )
+
+      // Handle default model reassignment before deletion
+      const newSettings = { ...settings }
+
+      // Find alternative chat models from other providers
+      const otherChatModels = settings.chatModels.filter(
+        (m) => m.providerId !== provider.id && (m.enable ?? true),
+      )
+
+      // Find alternative embedding models from other providers
+      const otherEmbeddingModels = settings.embeddingModels.filter(
+        (m) => m.providerId !== provider.id,
+      )
+
+      // Check if current chat model is from this provider and reassign
+      if (associatedChatModels.some((m) => m.id === settings.chatModelId)) {
+        newSettings.chatModelId =
+          otherChatModels.length > 0 ? otherChatModels[0].id : ''
+      }
+
+      // Check if current conversation title model is from this provider and reassign
+      if (
+        associatedChatModels.some((m) => m.id === settings.chatTitleModelId)
+      ) {
+        newSettings.chatTitleModelId =
+          otherChatModels.length > 0 ? otherChatModels[0].id : ''
+      }
+
+      // Check if current embedding model is from this provider and reassign
+      if (
+        associatedEmbeddingModels.some(
+          (m) => m.id === settings.embeddingModelId,
+        )
+      ) {
+        newSettings.embeddingModelId =
+          otherEmbeddingModels.length > 0 ? otherEmbeddingModels[0].id : ''
+      }
+
+      try {
+        if (provider.presetType === 'chatgpt-oauth') {
+          plugin
+            .getChatGPTOAuthService(provider.id)
+            .cancelPendingBrowserAuthorization()
+          await plugin.disconnectChatGPTOAuthAccount(provider.id)
+          plugin.clearChatGPTOAuthRuntime(provider.id)
+        }
+        if (provider.presetType === 'gemini-oauth') {
+          plugin
+            .getGeminiOAuthService(provider.id)
+            .cancelPendingBrowserAuthorization()
+          await plugin.disconnectGeminiOAuthAccount(provider.id)
+          plugin.clearGeminiOAuthRuntime(provider.id)
+        }
+        if (provider.presetType === 'github-copilot') {
+          await plugin.disconnectCopilotOAuthAccount(provider.id)
+          plugin.clearCopilotOAuthRuntime(provider.id)
+        }
+        if (associatedEmbeddingModels.length > 0) {
+          const vectorManagers = await plugin.tryGetVectorManagers()
+
+          if (vectorManagers.length > 0) {
+            const embeddingModelIds = associatedEmbeddingModels.map(
+              (embeddingModel) => embeddingModel.id,
+            )
+            await Promise.all(
+              vectorManagers.map((vm) =>
+                vm.clearVectorsByModelIds(embeddingModelIds),
+              ),
+            )
+          } else {
+            console.warn(
+              '[YOLO] Skip clearing embeddings because no vector managers are available.',
+            )
+          }
+        }
+
+        // Delete provider and associated models
+        await setSettings({
+          ...newSettings,
+          providers: settings.providers.filter((v) => v.id !== provider.id),
+          chatModels: settings.chatModels.filter(
+            (v) => v.providerId !== provider.id,
+          ),
+          embeddingModels: settings.embeddingModels.filter(
+            (v) => v.providerId !== provider.id,
+          ),
+        })
+
+        new Notice(`Provider "${provider.id}" deleted successfully.`)
+      } catch (error) {
+        console.error('[YOLO] Failed to delete provider:', error)
+        new Notice('Failed to delete provider.')
+      }
+    })()
+  }
+
+  const handleConfirmDeleteProvider = (provider: LLMProvider) => {
+    cancelPendingDeleteProvider()
+    handleDeleteProvider(provider)
+  }
+
+  const handleDeleteChatModel = (modelId: string) => {
+    if (
+      modelId === settings.chatModelId ||
+      modelId === settings.chatTitleModelId
+    ) {
+      new Notice(
+        'Cannot remove model that is currently selected as chat model or conversation title model',
+      )
+      return
+    }
+
+    void (async () => {
+      try {
+        await setSettings({
+          ...settings,
+          chatModels: settings.chatModels.filter((v) => v.id !== modelId),
+        })
+      } catch (error: unknown) {
+        console.error('[YOLO] Failed to delete chat model:', error)
+        new Notice('Failed to delete chat model.')
+      }
+    })()
+  }
+
+  const handleDeleteEmbeddingModel = (modelId: string) => {
+    if (modelId === settings.embeddingModelId) {
+      new Notice(
+        'Cannot remove model that is currently selected as embedding model',
+      )
+      return
+    }
+
+    if (deletingEmbeddingModelIds.has(modelId)) {
+      return
+    }
+
+    void (async () => {
+      setDeletingEmbeddingModelIds((prev) => new Set(prev).add(modelId))
+      try {
+        const vectorManagers = await plugin.tryGetVectorManagers()
+        if (vectorManagers.length > 0) {
+          const embeddingModelClient = getEmbeddingModelClient({
+            settings,
+            embeddingModelId: modelId,
+          })
+          await Promise.all(
+            vectorManagers.map((vm) =>
+              vm.clearAllVectors(embeddingModelClient),
+            ),
+          )
+        } else {
+          console.warn(
+            '[YOLO] Skip clearing embeddings because no vector managers are available.',
+          )
+        }
+        await setSettings({
+          ...settings,
+          embeddingModels: settings.embeddingModels.filter(
+            (v) => v.id !== modelId,
+          ),
+        })
+      } catch (error) {
+        console.error('[YOLO] Failed to delete embedding model:', error)
+        new Notice('Failed to delete embedding model.')
+      } finally {
+        setDeletingEmbeddingModelIds((prev) => {
+          const next = new Set(prev)
+          next.delete(modelId)
+          return next
+        })
+      }
+    })()
+  }
+
+  const handleToggleEnableChatModel = (modelId: string, value: boolean) => {
+    void (async () => {
+      try {
+        if (
+          !value &&
+          (modelId === settings.chatModelId ||
+            modelId === settings.chatTitleModelId)
+        ) {
+          new Notice(
+            'Cannot disable model that is currently selected as chat model or conversation title model',
+          )
+          await setSettings({
+            ...settings,
+            chatModels: settings.chatModels.map((v) =>
+              v.id === modelId ? { ...v, enable: true } : v,
+            ),
+          })
+          return
+        }
+
+        await setSettings({
+          ...settings,
+          chatModels: settings.chatModels.map((v) =>
+            v.id === modelId ? { ...v, enable: value } : v,
+          ),
+        })
+      } catch (error: unknown) {
+        console.error('[YOLO] Failed to update chat model state:', error)
+        new Notice('Failed to update chat model.')
+      }
+    })()
+  }
+
+  const triggerProviderDropSuccessFeedback = (movedId: string) => {
+    const tryFind = (attempt = 0) => {
+      const movedSection = document.querySelector(
+        `.yolo-provider-section[data-provider-id="${movedId}"]`,
+      )
+      if (movedSection) {
+        movedSection.classList.add('yolo-provider-drop-success')
+        window.setTimeout(() => {
+          movedSection.classList.remove('yolo-provider-drop-success')
+        }, 700)
+      } else if (attempt < 8) {
+        window.setTimeout(() => tryFind(attempt + 1), 50)
+      }
+    }
+    requestAnimationFrame(() => tryFind())
+  }
+
+  return (
+    <div className="yolo-settings-section">
+      <section className="yolo-models-block yolo-providers-models-block">
+        <div className="yolo-models-block-head yolo-providers-models-block-head">
+          <div className="yolo-models-block-head-title-row">
+            <div className="yolo-settings-sub-header yolo-models-block-title">
+              {t('settings.providers.title')}
+            </div>
+            <div className="yolo-settings-desc yolo-models-block-desc">
+              {providersCountLabel}
+            </div>
+          </div>
+          <div className="yolo-models-block-action yolo-providers-models-block-action">
+            <ObsidianButton
+              text={t('settings.providers.addProvider')}
+              onClick={() => new ProviderPickerModal(app, plugin).open()}
+              cta
+            />
+          </div>
+        </div>
+
+        <div className="yolo-providers-models-container" ref={providerListRef}>
+          <DndContext
+            sensors={providerSensors}
+            collisionDetection={closestCenter}
+            // The dragged provider collapses as it is lifted, so the rows below
+            // move; re-measure throughout instead of trusting the one snapshot
+            // taken when the drag started.
+            measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+            onDragStart={handleProviderDragStart}
+            onDragEnd={(event) => void handleProviderDragEnd(event)}
+            onDragCancel={() => setActiveProviderId(null)}
+          >
+            <SortableContext
+              items={providerIds}
+              strategy={verticalListSortingStrategy}
+            >
+              {orderedProviders.map((provider) => {
+                const isExpanded = expandedProviders.has(provider.id)
+                const chatModels = orderedChatModels.filter(
+                  (m) => m.providerId === provider.id,
+                )
+                const embeddingModels = orderedEmbeddingModels.filter(
+                  (m) => m.providerId === provider.id,
+                )
+
+                return (
+                  <ProviderSectionItem
+                    key={provider.id}
+                    provider={provider}
+                    app={app}
+                    plugin={plugin}
+                    t={t}
+                    isExpanded={isExpanded}
+                    toggleProvider={toggleProvider}
+                    chatModels={chatModels}
+                    embeddingModels={embeddingModels}
+                    modelSensors={modelSensors}
+                    isDeleteConfirming={pendingDeleteProviderId === provider.id}
+                    onRequestDeleteProvider={armDeleteProviderConfirmation}
+                    onCancelDeleteProvider={cancelPendingDeleteProvider}
+                    onConfirmDeleteProvider={handleConfirmDeleteProvider}
+                    handleDeleteChatModel={handleDeleteChatModel}
+                    handleDeleteEmbeddingModel={handleDeleteEmbeddingModel}
+                    deletingEmbeddingModelIds={deletingEmbeddingModelIds}
+                    handleToggleEnableChatModel={handleToggleEnableChatModel}
+                    handleChatModelDragEnd={(event) =>
+                      void handleChatModelDragEnd(provider.id, event)
+                    }
+                    handleEmbeddingModelDragEnd={(event) =>
+                      void handleEmbeddingModelDragEnd(provider.id, event)
+                    }
+                  />
+                )
+              })}
+            </SortableContext>
+            {portalBody &&
+              createPortal(
+                <DragOverlay
+                  dropAnimation={providerDropAnimation}
+                  // The row collapses as it is lifted, but dnd-kit sized this
+                  // wrapper from the rect captured before that. Let the header
+                  // inside decide the height instead.
+                  style={{ height: 'auto' }}
+                >
+                  {activeProvider && (
+                    <div className="yolo-provider-section yolo-provider-lifted">
+                      <ProviderHeader
+                        provider={activeProvider}
+                        t={t}
+                        isExpanded={false}
+                        chatModelCount={
+                          orderedChatModels.filter(
+                            (m) => m.providerId === activeProvider.id,
+                          ).length
+                        }
+                        embeddingModelCount={
+                          orderedEmbeddingModels.filter(
+                            (m) => m.providerId === activeProvider.id,
+                          ).length
+                        }
+                      />
+                    </div>
+                  )}
+                </DragOverlay>,
+                portalBody,
+              )}
+          </DndContext>
+        </div>
+      </section>
+    </div>
+  )
+}

@@ -1,0 +1,1381 @@
+import Anthropic from '@anthropic-ai/sdk'
+import {
+  Tool as AnthropicTool,
+  ToolChoice as AnthropicToolChoice,
+  Base64ImageSource,
+  ContentBlockParam,
+  DocumentBlockParam,
+  ImageBlockParam,
+  MessageCreateParamsNonStreaming,
+  MessageCreateParamsStreaming,
+  MessageParam,
+  MessageStreamEvent,
+  TextBlockParam,
+} from '@anthropic-ai/sdk/resources/messages'
+
+import { ChatModel } from '../../types/chat-model.types'
+import {
+  LLMOptions,
+  LLMRequestNonStreaming,
+  LLMRequestStreaming,
+  RequestMessage,
+  RequestTool,
+  RequestToolChoice,
+} from '../../types/llm/request'
+import {
+  Annotation,
+  AnthropicReplayBlock,
+  HostedWebSearchCall,
+  LLMResponseNonStreaming,
+  LLMResponseStreaming,
+  ProviderMetadata,
+  ResponseUsage,
+  ToolCall,
+} from '../../types/llm/response'
+import { LLMProvider, RequestTransportMode } from '../../types/provider.types'
+import {
+  REASONING_META,
+  resolveRequestReasoningLevel,
+} from '../../types/reasoning'
+import { getToolCallArgumentsObject } from '../../types/tool-call.types'
+import { parseImageDataUrl } from '../../utils/llm/image'
+import { getBuiltinProviderTools } from '../../utils/llm/model-tools'
+import { toProviderHeadersRecord } from '../../utils/llm/provider-headers'
+
+import {
+  applyAnthropicPromptCache,
+  isPromptCachingEnabled,
+} from './anthropicPromptCache'
+import { BaseLLMProvider } from './base'
+import {
+  claudeAcceptsSamplingParams,
+  claudeBindsThinkingToPrefix,
+  isClaudeModelId,
+  resolveClaudeReasoningRequest,
+} from './claudeReasoning'
+import {
+  LLMAPIKeyInvalidException,
+  LLMAPIKeyNotSetException,
+} from './exception'
+import { ModelRequestPolicy, resolveSdkMaxRetries } from './requestPolicy'
+import {
+  AutoPromotedTransportMode,
+  createRequestTransportMemoryKey,
+  resolveRequestTransportMode,
+  runWithRequestTransport,
+  runWithRequestTransportForStream,
+} from './requestTransport'
+import { WrapTransportFetch, createTransportClients } from './transportClients'
+
+/**
+ * Reads the `query` out of a hosted search's streamed arguments. The JSON
+ * arrives in fragments, so a partial-but-usable query is extracted before the
+ * object closes — the card shows what is being searched while it happens.
+ */
+const parseHostedSearchQuery = (partialJson: string): string | undefined => {
+  try {
+    const parsed = JSON.parse(partialJson) as { query?: unknown }
+    if (typeof parsed.query === 'string') {
+      return parsed.query
+    }
+  } catch {
+    // Still mid-stream; fall through to the partial read below.
+  }
+  const match = /"query"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(partialJson)
+  if (!match) {
+    return undefined
+  }
+  try {
+    return JSON.parse(`"${match[1]}"`) as string
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Lets a request say what happens to a thinking block whose prefix changed
+ * (`thinking.block_binding`). The plugin rewrites history on purpose —
+ * pruning tool results, compacting, switching modes — and asks the API to
+ * drop the blocks that no longer match instead of rejecting the request.
+ */
+const THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01'
+
+const SUPPORTED_IMAGE_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+]
+
+function validateImageType(mimeType: string) {
+  if (!SUPPORTED_IMAGE_TYPES.includes(mimeType)) {
+    throw new Error(
+      `Anthropic does not support image type ${mimeType}. Supported types: ${SUPPORTED_IMAGE_TYPES.join(
+        ', ',
+      )}`,
+    )
+  }
+}
+
+/**
+ * A `user` request message's content in Anthropic's own shape.
+ *
+ * Module-level rather than a method because the Claude Agent SDK path
+ * (`core/llm/claude-sdk/`) sends the very same blocks to the very same model
+ * family through a subprocess instead of HTTP — the translation is a property
+ * of Anthropic's wire format, not of this transport.
+ */
+export function parseUserMessageContent(
+  message: Extract<RequestMessage, { role: 'user' }>,
+): string | (TextBlockParam | ImageBlockParam | DocumentBlockParam)[] {
+  if (!Array.isArray(message.content)) {
+    return message.content
+  }
+  return message.content.map(
+    (part): TextBlockParam | ImageBlockParam | DocumentBlockParam => {
+      switch (part.type) {
+        case 'text':
+          return { type: 'text', text: part.text }
+        case 'image_url': {
+          const { mimeType, base64Data } = parseImageDataUrl(part.image_url.url)
+          validateImageType(mimeType)
+          return {
+            type: 'image',
+            source: {
+              data: base64Data,
+              media_type: mimeType as Base64ImageSource['media_type'],
+              type: 'base64',
+            },
+          }
+        }
+        case 'document': {
+          // Native PDF support via Anthropic's document block. The 'pdf'
+          // modality gate upstream guarantees this only reaches models that
+          // advertise native PDF support.
+          return {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: part.mediaType,
+              data: part.data,
+            },
+          }
+        }
+      }
+    },
+  )
+}
+
+export class AnthropicProvider extends BaseLLMProvider<LLMProvider> {
+  private browserClient: Anthropic
+  private obsidianClient: Anthropic
+  private nodeClient: Anthropic
+  private requestTransportMode: RequestTransportMode
+  private requestTransportMemoryKey: string
+  private onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
+  /** An `anthropic-beta` value the user set as a custom header. */
+  private customBetaHeader: string | undefined
+  private readonly thinkingBlockBinding: boolean
+
+  private promoteTransportMode = (mode: AutoPromotedTransportMode) => {
+    if (this.requestTransportMode === mode) {
+      return
+    }
+
+    this.provider.additionalSettings = {
+      ...(this.provider.additionalSettings ?? {}),
+      requestTransportMode: mode,
+    }
+    this.requestTransportMode = mode
+    this.onAutoPromoteTransportMode?.(mode)
+  }
+
+  private isPromptCachingEnabled(): boolean {
+    return isPromptCachingEnabled(this.provider.additionalSettings)
+  }
+
+  private static readonly DEFAULT_MAX_TOKENS = 8192
+
+  /**
+   * `max_tokens` plus the `thinking` / `output_config` fields for `level`.
+   * `max_tokens` must cover thinking too, so the reasoning budget is added
+   * on top of the default reply size. A Claude model gets its generation's
+   * shape (`resolveClaudeReasoningRequest`); a non-Claude model behind an
+   * Anthropic-compatible endpoint keeps the adaptive shape it always had.
+   * `thinkingBlockBinding: false` keeps `block_binding` out of the request
+   * for an endpoint that does not implement it.
+   */
+  private static buildReasoningFields(
+    modelId: string,
+    level: ReturnType<typeof resolveRequestReasoningLevel>,
+    requestedMaxTokens: number | undefined,
+    thinkingBlockBinding = true,
+  ): Record<string, unknown> & { max_tokens: number } {
+    if (level === undefined) {
+      return {
+        max_tokens: requestedMaxTokens ?? AnthropicProvider.DEFAULT_MAX_TOKENS,
+      }
+    }
+
+    const claude = resolveClaudeReasoningRequest(modelId, level)
+    if (claude) {
+      // `budget_tokens` must stay below `max_tokens`, so a budget is always
+      // added on top, even to a caller-chosen reply size.
+      const maxTokens =
+        claude.thinking?.type === 'enabled'
+          ? (requestedMaxTokens ?? AnthropicProvider.DEFAULT_MAX_TOKENS) +
+            claude.thinkingTokens
+          : (requestedMaxTokens ??
+            AnthropicProvider.DEFAULT_MAX_TOKENS + claude.thinkingTokens)
+      const thinking =
+        claude.thinking &&
+        thinkingBlockBinding &&
+        claudeBindsThinkingToPrefix(modelId)
+          ? {
+              ...claude.thinking,
+              block_binding: { prefix_mismatch_behavior: 'drop_block' },
+            }
+          : claude.thinking
+      return {
+        max_tokens: maxTokens,
+        ...(thinking ? { thinking } : {}),
+        ...(claude.effort ? { output_config: { effort: claude.effort } } : {}),
+      }
+    }
+
+    const maxTokens =
+      requestedMaxTokens ??
+      (level !== 'off' && level !== 'auto'
+        ? AnthropicProvider.DEFAULT_MAX_TOKENS + REASONING_META[level].budget
+        : AnthropicProvider.DEFAULT_MAX_TOKENS)
+    if (level === 'off') {
+      return { max_tokens: maxTokens, thinking: { type: 'disabled' } }
+    }
+    return {
+      max_tokens: maxTokens,
+      thinking: { type: 'adaptive', display: 'summarized' },
+      ...(level !== 'auto'
+        ? { output_config: { effort: REASONING_META[level].effort } }
+        : {}),
+    }
+  }
+
+  constructor(
+    provider: LLMProvider,
+    options?: {
+      onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
+      requestPolicy?: ModelRequestPolicy
+      wrapFetch?: WrapTransportFetch
+      /**
+       * Whether the endpoint understands `thinking.block_binding` (and the
+       * beta header it requires). Defaults to true; a gateway that does not
+       * implement Anthropic betas, such as GitHub Copilot, turns it off.
+       */
+      thinkingBlockBinding?: boolean
+    },
+  ) {
+    super(provider)
+    this.onAutoPromoteTransportMode = options?.onAutoPromoteTransportMode
+    this.thinkingBlockBinding = options?.thinkingBlockBinding ?? true
+    const defaultHeaders = toProviderHeadersRecord(provider.customHeaders)
+    this.customBetaHeader = Object.entries(defaultHeaders ?? {}).find(
+      ([name]) => name.toLowerCase() === 'anthropic-beta',
+    )?.[1]
+    this.requestTransportMemoryKey = createRequestTransportMemoryKey({
+      providerType: provider.presetType,
+      providerId: provider.id,
+      baseUrl: provider.baseUrl,
+    })
+    this.requestTransportMode = resolveRequestTransportMode({
+      additionalSettings: provider.additionalSettings,
+      hasCustomBaseUrl: !!provider.baseUrl,
+      memoryKey: this.requestTransportMemoryKey,
+    })
+    const clientOptions = {
+      apiKey: provider.apiKey,
+      baseURL: provider.baseUrl
+        ? provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')
+        : undefined, // use default
+      dangerouslyAllowBrowser: true,
+      maxRetries: resolveSdkMaxRetries({
+        requestPolicy: options?.requestPolicy,
+        requestTransportMode: this.requestTransportMode,
+      }),
+      timeout: options?.requestPolicy?.timeoutMs,
+      ...(defaultHeaders ? { defaultHeaders } : {}),
+    }
+    const clients = createTransportClients(
+      (transportFetch) =>
+        new Anthropic({
+          ...clientOptions,
+          fetch: options?.wrapFetch?.(transportFetch) ?? transportFetch,
+        }),
+      { providerId: provider.id, protocol: 'passthrough' },
+    )
+    this.browserClient = clients.browserClient
+    this.obsidianClient = clients.obsidianClient
+    this.nodeClient = clients.nodeClient
+  }
+
+  /**
+   * Serializes function tools plus any hosted (server-side) tool the model has
+   * enabled. The hosted tool's name is fixed to `web_search` by the protocol,
+   * and Anthropic requires globally unique tool names — which is exactly the
+   * name our own web search reaches the model under. The two therefore cannot
+   * both be offered, and `selectAllowedTools` is where that is settled: when
+   * the provider runs search itself, ours is dropped from the request before
+   * it ever gets here.
+   */
+  private buildTools(
+    model: ChatModel,
+    request: LLMRequestNonStreaming | LLMRequestStreaming,
+  ): MessageCreateParamsNonStreaming['tools'] {
+    const functionTools = request.tools?.map((tool) =>
+      AnthropicProvider.parseRequestTool(tool),
+    )
+
+    const hasHostedWebSearch = getBuiltinProviderTools(model).some(
+      (tool) => tool.type === 'deepseek:web_search',
+    )
+    if (!hasHostedWebSearch) {
+      return functionTools
+    }
+
+    // SDK v0.39 predates the server-tool union, so the entry is cast.
+    const hostedWebSearch = {
+      type: 'web_search_20250305',
+      name: 'web_search',
+    } as unknown as AnthropicTool
+
+    return [...(functionTools ?? []), hostedWebSearch]
+  }
+
+  /** Per-request headers: the beta that `thinking.block_binding` needs. */
+  private buildRequestHeaders(
+    payload: Record<string, unknown>,
+  ): Record<string, string> | undefined {
+    const thinking = payload.thinking as { block_binding?: unknown } | undefined
+    if (!thinking?.block_binding) {
+      return undefined
+    }
+    return {
+      'anthropic-beta': [this.customBetaHeader, THINKING_BINDING_BETA]
+        .filter(Boolean)
+        .join(','),
+    }
+  }
+
+  async generateResponse(
+    model: ChatModel,
+    request: LLMRequestNonStreaming,
+    options?: LLMOptions,
+  ): Promise<LLMResponseNonStreaming> {
+    if (!this.provider.apiKey) {
+      throw new LLMAPIKeyNotSetException(
+        `Provider ${this.provider.id} API key is missing. Please set it in settings menu.`,
+      )
+    }
+
+    const systemMessage = AnthropicProvider.validateSystemMessages(
+      request.messages,
+    )
+
+    try {
+      const level = resolveRequestReasoningLevel(model, request.reasoningLevel)
+      const payloadBase: MessageCreateParamsNonStreaming &
+        Record<string, unknown> = {
+        model: request.model,
+        messages: AnthropicProvider.mergeAdjacentUserMessages(
+          request.messages
+            .map((m) => this.parseRequestMessage(m))
+            .filter((m): m is MessageParam => m !== null),
+        ),
+        system: systemMessage,
+        tools: this.buildTools(model, request),
+        tool_choice: request.tool_choice
+          ? AnthropicProvider.parseRequestToolChoice(request.tool_choice)
+          : undefined,
+        ...AnthropicProvider.buildReasoningFields(
+          request.model,
+          level,
+          request.max_tokens,
+          this.thinkingBlockBinding,
+        ),
+        ...(claudeAcceptsSamplingParams(request.model)
+          ? { temperature: request.temperature, top_p: request.top_p }
+          : {}),
+      }
+
+      const payload = this.applyCustomModelParameters<
+        MessageCreateParamsNonStreaming & Record<string, unknown>
+      >(model, {
+        ...(this.isPromptCachingEnabled()
+          ? applyAnthropicPromptCache(payloadBase)
+          : payloadBase),
+      })
+
+      const headers = this.buildRequestHeaders(payload)
+      const response = await runWithRequestTransport({
+        mode: this.requestTransportMode,
+        memoryKey: this.requestTransportMemoryKey,
+        onAutoPromoteTransportMode: this.promoteTransportMode,
+        runBrowser: () =>
+          this.browserClient.messages.create(payload, {
+            signal: options?.signal,
+            headers,
+          }),
+        runObsidian: () =>
+          this.obsidianClient.messages.create(payload, {
+            signal: options?.signal,
+            headers,
+          }),
+        runNode: () =>
+          this.nodeClient.messages.create(payload, {
+            signal: options?.signal,
+            headers,
+          }),
+      })
+
+      return AnthropicProvider.parseNonStreamingResponse(
+        response,
+        request.model,
+      )
+    } catch (error) {
+      if (error instanceof Anthropic.AuthenticationError) {
+        // Anthropic's CORS Policy Change (March 2025)
+        // Issue: https://github.com/glowingjade/obsidian-smart-composer/issues/286
+        //
+        // Anthropic recently changed their CORS policy for new individual accounts:
+        // - New individual accounts now have CORS restrictions by default
+        // - The error occurs even with valid API keys and anthropic-dangerous-direct-browser-access: true
+        // - The error message contains "CORS requests are not allowed for this Organization"
+        //
+        // Solution: Users need to create an organization in their Anthropic account
+        if (
+          error.message.includes(
+            'CORS requests are not allowed for this Organization',
+          )
+        ) {
+          throw new LLMAPIKeyInvalidException(
+            `Provider ${this.provider.id} is experiencing a CORS issue. This is a known issue with new individual Anthropic accounts.
+
+To resolve this issue:
+
+1. Go to https://console.anthropic.com/settings/organization
+2. Create a new organization
+3. Your API key should work properly after creating an organization
+
+For more information, please refer to the following issue:
+https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
+            error,
+          )
+        }
+        throw new LLMAPIKeyInvalidException(
+          `Provider ${this.provider.id} API key is invalid. Please update it in settings menu.`,
+          error,
+        )
+      }
+
+      throw error
+    }
+  }
+
+  async streamResponse(
+    model: ChatModel,
+    request: LLMRequestStreaming,
+    options?: LLMOptions,
+  ): Promise<AsyncIterable<LLMResponseStreaming>> {
+    if (!this.provider.apiKey) {
+      throw new LLMAPIKeyNotSetException(
+        `Provider ${this.provider.id} API key is missing. Please set it in settings menu.`,
+      )
+    }
+
+    const systemMessage = AnthropicProvider.validateSystemMessages(
+      request.messages,
+    )
+
+    try {
+      const level = resolveRequestReasoningLevel(model, request.reasoningLevel)
+      const payloadBase: MessageCreateParamsStreaming &
+        Record<string, unknown> = {
+        model: request.model,
+        messages: AnthropicProvider.mergeAdjacentUserMessages(
+          request.messages
+            .map((m) => this.parseRequestMessage(m))
+            .filter((m): m is MessageParam => m !== null),
+        ),
+        system: systemMessage,
+        tools: this.buildTools(model, request),
+        tool_choice: request.tool_choice
+          ? AnthropicProvider.parseRequestToolChoice(request.tool_choice)
+          : undefined,
+        ...AnthropicProvider.buildReasoningFields(
+          request.model,
+          level,
+          request.max_tokens,
+          this.thinkingBlockBinding,
+        ),
+        ...(claudeAcceptsSamplingParams(request.model)
+          ? { temperature: request.temperature, top_p: request.top_p }
+          : {}),
+        stream: true,
+      }
+
+      const payload = this.applyCustomModelParameters<
+        MessageCreateParamsStreaming & Record<string, unknown>
+      >(model, {
+        ...(this.isPromptCachingEnabled()
+          ? applyAnthropicPromptCache(payloadBase)
+          : payloadBase),
+      })
+
+      const headers = this.buildRequestHeaders(payload)
+      const stream = (await runWithRequestTransportForStream({
+        mode: this.requestTransportMode,
+        memoryKey: this.requestTransportMemoryKey,
+        onAutoPromoteTransportMode: this.promoteTransportMode,
+        signal: options?.signal,
+        createBrowserStream: (signal) =>
+          this.browserClient.messages.create(payload, {
+            signal: signal ?? options?.signal,
+            stream: true,
+            headers,
+          }),
+        createObsidianStream: (signal) =>
+          this.obsidianClient.messages.create(payload, {
+            signal: signal ?? options?.signal,
+            stream: true,
+            headers,
+          }),
+        createNodeStream: (signal) =>
+          this.nodeClient.messages.create(payload, {
+            signal: signal ?? options?.signal,
+            stream: true,
+            headers,
+          }),
+      })) as unknown as AsyncIterable<MessageStreamEvent>
+
+      return this.streamResponseGenerator(stream, request.model)
+    } catch (error) {
+      if (error instanceof Anthropic.AuthenticationError) {
+        // Anthropic's CORS Policy Change (March 2025)
+        // Issue: https://github.com/glowingjade/obsidian-smart-composer/issues/286
+        //
+        // Anthropic recently changed their CORS policy for new individual accounts:
+        // - New individual accounts now have CORS restrictions by default
+        // - The error occurs even with valid API keys and anthropic-dangerous-direct-browser-access: true
+        // - The error message contains "CORS requests are not allowed for this Organization"
+        //
+        // Solution: Users need to create an organization in their Anthropic account
+        if (
+          error.message.includes(
+            'CORS requests are not allowed for this Organization',
+          )
+        ) {
+          throw new LLMAPIKeyInvalidException(
+            `Provider ${this.provider.id} is experiencing a CORS issue. This is a known issue with new individual Anthropic accounts.
+
+To resolve this issue:
+
+1. Go to https://console.anthropic.com/settings/organization
+2. Create a new organization
+3. Your API key should work properly after creating an organization
+
+For more information, please refer to the following issue:
+https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
+            error,
+          )
+        }
+        throw new LLMAPIKeyInvalidException(
+          `Provider ${this.provider.id} API key is invalid. Please update it in settings menu.`,
+          error,
+        )
+      }
+
+      throw error
+    }
+  }
+
+  private async *streamResponseGenerator(
+    stream: AsyncIterable<MessageStreamEvent>,
+    requestModel: string,
+  ): AsyncIterable<LLMResponseStreaming> {
+    let messageId = ''
+    let model = ''
+    let usage: ResponseUsage = {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    }
+    // Hosted tools stream a `server_tool_use` block whose arguments arrive as
+    // `input_json_delta` — the same delta type function tool calls use. Those
+    // deltas must not reach the tool-call accumulator: the provider already ran
+    // the tool, and there is no matching tool call for the agent to execute.
+    // They are collected here instead, so the query can be paired with the
+    // results that arrive later in a separate `web_search_tool_result` block.
+    const serverToolBlockIndices = new Set<number>()
+    const hostedSearchByToolUseId = new Map<string, HostedWebSearchCall>()
+    const hostedSearchIdByBlockIndex = new Map<number, string>()
+    const hostedSearchArgsByBlockIndex = new Map<number, string>()
+    const emitHostedSearch = (): LLMResponseStreaming => ({
+      id: messageId,
+      choices: [
+        {
+          finish_reason: null,
+          delta: {
+            providerMetadata: {
+              hostedWebSearch: [...hostedSearchByToolUseId.values()],
+            },
+          },
+        },
+      ],
+      object: 'chat.completion.chunk',
+      model,
+    })
+
+    // The reply block by block, assembled from its deltas, so a Claude reply
+    // can be sent back exactly as it was generated.
+    const replayBlocks = new Map<number, AnthropicReplayBlock>()
+    const replayInputJson = new Map<number, string>()
+    let completed = false
+
+    for await (const chunk of stream) {
+      AnthropicProvider.accumulateReplayBlock(
+        chunk,
+        replayBlocks,
+        replayInputJson,
+      )
+      if (chunk.type === 'message_stop') {
+        completed = true
+      }
+      if (chunk.type === 'message_start') {
+        messageId = chunk.message.id
+        model = chunk.message.model
+        const cacheRead =
+          chunk.message.usage.cache_read_input_tokens ?? undefined
+        const cacheCreation =
+          chunk.message.usage.cache_creation_input_tokens ?? undefined
+        const billedInputTokens =
+          chunk.message.usage.input_tokens +
+          (cacheRead ?? 0) +
+          (cacheCreation ?? 0)
+        usage = {
+          prompt_tokens: billedInputTokens,
+          completion_tokens: chunk.message.usage.output_tokens,
+          total_tokens: billedInputTokens + chunk.message.usage.output_tokens,
+          ...(cacheRead !== undefined
+            ? { cache_read_input_tokens: cacheRead }
+            : {}),
+          ...(cacheCreation !== undefined
+            ? { cache_creation_input_tokens: cacheCreation }
+            : {}),
+        }
+      } else if (
+        chunk.type === 'content_block_start' ||
+        chunk.type === 'content_block_delta'
+      ) {
+        if (
+          chunk.type === 'content_block_start' &&
+          chunk.content_block.type === ('server_tool_use' as string)
+        ) {
+          serverToolBlockIndices.add(chunk.index)
+          const block = chunk.content_block as unknown as {
+            id?: string
+            name?: string
+          }
+          if (block.name === 'web_search' && block.id) {
+            hostedSearchIdByBlockIndex.set(chunk.index, block.id)
+            hostedSearchArgsByBlockIndex.set(chunk.index, '')
+            hostedSearchByToolUseId.set(block.id, { id: block.id, results: [] })
+            yield emitHostedSearch()
+          }
+          continue
+        }
+        if (
+          chunk.type === 'content_block_delta' &&
+          serverToolBlockIndices.has(chunk.index)
+        ) {
+          const toolUseId = hostedSearchIdByBlockIndex.get(chunk.index)
+          if (toolUseId && chunk.delta.type === 'input_json_delta') {
+            const args =
+              (hostedSearchArgsByBlockIndex.get(chunk.index) ?? '') +
+              chunk.delta.partial_json
+            hostedSearchArgsByBlockIndex.set(chunk.index, args)
+            const query = parseHostedSearchQuery(args)
+            const call = hostedSearchByToolUseId.get(toolUseId)
+            if (query && call && call.query !== query) {
+              hostedSearchByToolUseId.set(toolUseId, { ...call, query })
+              yield emitHostedSearch()
+            }
+          }
+          continue
+        }
+        if (
+          chunk.type === 'content_block_start' &&
+          chunk.content_block.type === ('web_search_tool_result' as string)
+        ) {
+          const toolUseId = (
+            chunk.content_block as unknown as { tool_use_id?: string }
+          ).tool_use_id
+          const call = toolUseId
+            ? hostedSearchByToolUseId.get(toolUseId)
+            : undefined
+          if (toolUseId && call) {
+            hostedSearchByToolUseId.set(toolUseId, {
+              ...call,
+              results: AnthropicProvider.parseWebSearchResults(
+                chunk.content_block,
+              ),
+            })
+            yield emitHostedSearch()
+          }
+        }
+        const parsedChunk = AnthropicProvider.parseStreamingResponseChunk(
+          chunk,
+          messageId,
+          model,
+        )
+        if (parsedChunk !== null) {
+          yield parsedChunk
+        }
+      } else if (chunk.type === 'message_delta') {
+        // Anthropic streams `message_delta.usage.output_tokens` as the current
+        // cumulative output token count, not an incremental delta.
+        //
+        // Newer Anthropic API revisions (and most third-party proxies) finalize
+        // cache accounting in `message_delta.usage` rather than `message_start`,
+        // and also re-send `input_tokens` there. SDK v0.39's MessageDeltaUsage
+        // type only declares `output_tokens`, so we reach through at runtime.
+        const rawUsage = chunk.usage as unknown as {
+          input_tokens?: number | null
+          output_tokens: number
+          cache_read_input_tokens?: number | null
+          cache_creation_input_tokens?: number | null
+        }
+        const cacheRead =
+          rawUsage.cache_read_input_tokens ?? usage.cache_read_input_tokens
+        const cacheCreation =
+          rawUsage.cache_creation_input_tokens ??
+          usage.cache_creation_input_tokens
+        const freshInputTokens =
+          rawUsage.input_tokens ??
+          usage.prompt_tokens -
+            (usage.cache_read_input_tokens ?? 0) -
+            (usage.cache_creation_input_tokens ?? 0)
+        const billedInputTokens =
+          freshInputTokens + (cacheRead ?? 0) + (cacheCreation ?? 0)
+        usage = {
+          prompt_tokens: billedInputTokens,
+          completion_tokens: rawUsage.output_tokens,
+          total_tokens: billedInputTokens + rawUsage.output_tokens,
+          ...(cacheRead !== undefined && cacheRead !== null
+            ? { cache_read_input_tokens: cacheRead }
+            : {}),
+          ...(cacheCreation !== undefined && cacheCreation !== null
+            ? { cache_creation_input_tokens: cacheCreation }
+            : {}),
+        }
+      }
+    }
+
+    // `providerMetadata` is replaced whole by each chunk that carries it, so
+    // the replay goes out once, complete, together with the search receipts.
+    const replayContent =
+      completed && isClaudeModelId(requestModel)
+        ? AnthropicProvider.toReplayBlocks(
+            [...replayBlocks.entries()]
+              .sort(([a], [b]) => a - b)
+              .map(([, block]) => block),
+          )
+        : null
+    if (replayContent) {
+      yield {
+        id: messageId,
+        choices: [
+          {
+            finish_reason: null,
+            delta: {
+              providerMetadata: {
+                anthropic: { content: replayContent },
+                ...(hostedSearchByToolUseId.size > 0
+                  ? { hostedWebSearch: [...hostedSearchByToolUseId.values()] }
+                  : {}),
+              },
+            },
+          },
+        ],
+        object: 'chat.completion.chunk',
+        model,
+      }
+    }
+
+    // After the stream is complete, yield the final usage
+    yield {
+      id: messageId,
+      choices: [],
+      object: 'chat.completion.chunk',
+      model: model,
+      usage: usage,
+    }
+  }
+
+  private static accumulateReplayBlock(
+    chunk: MessageStreamEvent,
+    blocks: Map<number, AnthropicReplayBlock>,
+    inputJson: Map<number, string>,
+  ): void {
+    if (chunk.type === 'content_block_start') {
+      blocks.set(chunk.index, {
+        ...(chunk.content_block as unknown as AnthropicReplayBlock),
+      })
+      return
+    }
+    if (chunk.type === 'content_block_delta') {
+      const block = blocks.get(chunk.index)
+      if (!block) return
+      const delta = chunk.delta as {
+        type: string
+        text?: string
+        thinking?: string
+        signature?: string
+        partial_json?: string
+      }
+      switch (delta.type) {
+        case 'text_delta':
+          block.text = `${(block.text as string | undefined) ?? ''}${delta.text ?? ''}`
+          break
+        case 'thinking_delta':
+          block.thinking = `${(block.thinking as string | undefined) ?? ''}${delta.thinking ?? ''}`
+          break
+        case 'signature_delta':
+          block.signature = delta.signature
+          break
+        case 'input_json_delta':
+          inputJson.set(
+            chunk.index,
+            `${inputJson.get(chunk.index) ?? ''}${delta.partial_json ?? ''}`,
+          )
+          break
+      }
+      return
+    }
+    if (chunk.type === 'content_block_stop') {
+      const block = blocks.get(chunk.index)
+      const json = inputJson.get(chunk.index)
+      if (!block || json === undefined || json === '') return
+      try {
+        block.input = JSON.parse(json) as unknown
+      } catch {
+        block.input = undefined
+      }
+    }
+  }
+
+  /**
+   * A Claude reply's content in the shape the API takes back. Null when a
+   * tool call's input never finished (a reply cut off at `max_tokens`): such
+   * a reply cannot be sent back as it was, and is rebuilt instead.
+   */
+  private static toReplayBlocks(
+    content: readonly unknown[],
+  ): AnthropicReplayBlock[] | null {
+    const blocks: AnthropicReplayBlock[] = []
+    for (const raw of content) {
+      const block = raw as AnthropicReplayBlock
+      switch (block.type) {
+        case 'text':
+          if (typeof block.text === 'string' && block.text !== '') {
+            blocks.push({ type: 'text', text: block.text })
+          }
+          break
+        case 'thinking':
+          blocks.push({
+            type: 'thinking',
+            thinking: block.thinking,
+            signature: block.signature,
+          })
+          break
+        case 'redacted_thinking':
+          blocks.push({ type: 'redacted_thinking', data: block.data })
+          break
+        case 'tool_use':
+        case 'server_tool_use':
+          if (typeof block.input !== 'object' || block.input === null) {
+            return null
+          }
+          blocks.push({
+            type: block.type,
+            id: block.id,
+            name: block.name,
+            input: block.input,
+          })
+          break
+        default:
+          blocks.push(block)
+      }
+    }
+    return blocks
+  }
+
+  // Anthropic 协议要求 role 严格交替（user / assistant）。当 assistant 一次返回
+  // 多个 tool_use 时，下一轮的多条 tool 结果必须打包到同一条 user message 的
+  // content[] 里；否则上游会以
+  // "`tool_use` ids were found without `tool_result` blocks immediately after"
+  // 报 400。这里把映射后相邻的 user 消息合并。
+  protected static mergeAdjacentUserMessages(
+    messages: MessageParam[],
+  ): MessageParam[] {
+    const merged: MessageParam[] = []
+    for (const message of messages) {
+      const prev = merged[merged.length - 1]
+      if (prev && prev.role === 'user' && message.role === 'user') {
+        const prevContent = Array.isArray(prev.content)
+          ? prev.content
+          : [{ type: 'text' as const, text: prev.content }]
+        const nextContent = Array.isArray(message.content)
+          ? message.content
+          : [{ type: 'text' as const, text: message.content }]
+        merged[merged.length - 1] = {
+          role: 'user',
+          content: [...prevContent, ...nextContent],
+        }
+      } else {
+        merged.push(message)
+      }
+    }
+    return merged
+  }
+
+  protected parseRequestMessage(message: RequestMessage): MessageParam | null {
+    switch (message.role) {
+      case 'user': {
+        return { role: 'user', content: parseUserMessageContent(message) }
+      }
+      case 'assistant': {
+        const replay = AnthropicProvider.parseReplayedAssistantMessage(message)
+        if (replay) {
+          return replay
+        }
+        const anthropicToolCalls = message.tool_calls?.map(
+          (toolCall): ContentBlockParam => {
+            return {
+              type: 'tool_use' as const,
+              id: toolCall.id,
+              name: toolCall.name,
+              input: getToolCallArgumentsObject(toolCall.arguments) ?? {},
+            }
+          },
+        )
+
+        const messageContent = [
+          ...(message.content.trim() === ''
+            ? []
+            : [
+                {
+                  type: 'text' as const,
+                  text: message.content,
+                },
+              ]),
+          ...(anthropicToolCalls ? anthropicToolCalls : []),
+        ]
+
+        if (messageContent.length === 0) {
+          // No content or tool calls, skip the message
+          return null
+        }
+
+        return { role: 'assistant', content: messageContent }
+      }
+      case 'system': {
+        // System messages should be extracted and handled separately
+        return null
+      }
+      case 'tool': {
+        return {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: message.tool_call.id,
+              content: message.content,
+            },
+          ],
+        }
+      }
+    }
+  }
+
+  /**
+   * The Claude reply exactly as generated, when the message carries it. Tool
+   * calls the request no longer answers are left out, since a `tool_use`
+   * without its `tool_result` is rejected; every other block, thinking and
+   * its signature included, goes back untouched.
+   */
+  private static parseReplayedAssistantMessage(
+    message: Extract<RequestMessage, { role: 'assistant' }>,
+  ): MessageParam | null {
+    const native = message.providerMetadata?.anthropic?.content
+    if (!native) {
+      return null
+    }
+    const toolCallIds = new Set(message.tool_calls?.map((call) => call.id))
+    const content = native.filter(
+      (block) =>
+        block.type !== 'tool_use' || toolCallIds.has(block.id as string),
+    )
+    return content.length > 0
+      ? {
+          role: 'assistant',
+          content: content as unknown as ContentBlockParam[],
+        }
+      : null
+  }
+
+  /**
+   * Converts a hosted-search receipt (`web_search_tool_result`) into the
+   * `url_citation` annotations the assistant message already renders as
+   * "View Sources". The provider ran the search itself, so this block is the
+   * only record of which pages the answer is based on. SDK v0.39 predates the
+   * server-tool content blocks, so the shape is read structurally.
+   *
+   * Returns an empty array for the error variant (`web_search_tool_result` may
+   * carry `{type:'web_search_tool_result_error'}` instead of a result list).
+   */
+  private static parseWebSearchToolResult(block: unknown): Annotation[] {
+    return AnthropicProvider.parseWebSearchResults(block).map((result) => ({
+      type: 'url_citation',
+      url_citation: {
+        url: result.url,
+        ...(result.title ? { title: result.title } : {}),
+      },
+    }))
+  }
+
+  private static parseWebSearchResults(
+    block: unknown,
+  ): HostedWebSearchCall['results'] {
+    const content = (block as { content?: unknown }).content
+    if (!Array.isArray(content)) {
+      return []
+    }
+    return content.flatMap((entry) => {
+      const result = entry as { type?: string; url?: string; title?: string }
+      if (result.type !== 'web_search_result' || !result.url) {
+        return []
+      }
+      return [
+        { url: result.url, ...(result.title ? { title: result.title } : {}) },
+      ]
+    })
+  }
+
+  /**
+   * Pairs each `server_tool_use` with the `web_search_tool_result` that carries
+   * its `tool_use_id`, producing one receipt per search the provider ran.
+   */
+  private static parseHostedWebSearchCalls(
+    content: readonly unknown[],
+  ): HostedWebSearchCall[] {
+    const resultsByToolUseId = new Map<string, HostedWebSearchCall['results']>()
+    for (const block of content) {
+      const typed = block as { type?: string; tool_use_id?: string }
+      if (typed.type === 'web_search_tool_result' && typed.tool_use_id) {
+        resultsByToolUseId.set(
+          typed.tool_use_id,
+          AnthropicProvider.parseWebSearchResults(block),
+        )
+      }
+    }
+
+    return content.flatMap((block): HostedWebSearchCall[] => {
+      const typed = block as {
+        type?: string
+        id?: string
+        name?: string
+        input?: { query?: unknown }
+      }
+      if (typed.type !== 'server_tool_use' || typed.name !== 'web_search') {
+        return []
+      }
+      const id = typed.id ?? ''
+      const query =
+        typeof typed.input?.query === 'string' ? typed.input.query : undefined
+      return [
+        {
+          id,
+          ...(query ? { query } : {}),
+          results: resultsByToolUseId.get(id) ?? [],
+        },
+      ]
+    })
+  }
+
+  static parseNonStreamingResponse(
+    response: Anthropic.Message,
+    requestModel: string,
+  ): LLMResponseNonStreaming {
+    const textContent = response.content
+      .filter((c) => c.type === 'text')
+      .map((c) => c.text)
+      .join('')
+
+    const reasoningContent =
+      response.content
+        .filter((c) => c.type === 'thinking')
+        .map((c) => c.thinking)
+        .join('') || undefined
+
+    const toolCalls: ToolCall[] = response.content
+      .filter((c) => c.type === 'tool_use')
+      .map((c): ToolCall => {
+        return {
+          id: c.id,
+          type: 'function',
+          function: {
+            name: c.name,
+            arguments: JSON.stringify(c.input),
+          },
+        }
+      })
+
+    const annotations = response.content.flatMap((c) =>
+      c.type === ('web_search_tool_result' as string)
+        ? AnthropicProvider.parseWebSearchToolResult(c)
+        : [],
+    )
+    const hostedWebSearch = AnthropicProvider.parseHostedWebSearchCalls(
+      response.content,
+    )
+
+    const replayContent = isClaudeModelId(requestModel)
+      ? AnthropicProvider.toReplayBlocks(response.content)
+      : null
+    const providerMetadata: ProviderMetadata = {
+      ...(replayContent ? { anthropic: { content: replayContent } } : {}),
+      ...(hostedWebSearch.length > 0 ? { hostedWebSearch } : {}),
+    }
+
+    const cacheRead = response.usage.cache_read_input_tokens ?? undefined
+    const cacheCreation =
+      response.usage.cache_creation_input_tokens ?? undefined
+    const billedInputTokens =
+      response.usage.input_tokens + (cacheRead ?? 0) + (cacheCreation ?? 0)
+
+    return {
+      id: response.id,
+      choices: [
+        {
+          finish_reason: response.stop_reason,
+          message: {
+            content: textContent,
+            reasoning: reasoningContent,
+            tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+            ...(annotations.length > 0 ? { annotations } : {}),
+            ...(Object.keys(providerMetadata).length > 0
+              ? { providerMetadata }
+              : {}),
+            role: response.role,
+          },
+        },
+      ],
+      model: response.model,
+      object: 'chat.completion',
+      usage: {
+        prompt_tokens: billedInputTokens,
+        completion_tokens: response.usage.output_tokens,
+        total_tokens: billedInputTokens + response.usage.output_tokens,
+        ...(cacheRead !== undefined
+          ? { cache_read_input_tokens: cacheRead }
+          : {}),
+        ...(cacheCreation !== undefined
+          ? { cache_creation_input_tokens: cacheCreation }
+          : {}),
+      },
+    }
+  }
+
+  static parseStreamingResponseChunk(
+    chunk: MessageStreamEvent,
+    messageId: string,
+    model: string,
+  ): LLMResponseStreaming | null {
+    if (
+      chunk.type !== 'content_block_start' &&
+      chunk.type !== 'content_block_delta'
+    ) {
+      throw new Error('Unsupported chunk type')
+    }
+
+    if (chunk.type === 'content_block_start') {
+      // Hosted-search receipt. It arrives complete in `content_block_start`
+      // (no deltas follow), so the annotations are emitted in one chunk.
+      if (chunk.content_block.type === ('web_search_tool_result' as string)) {
+        const annotations = AnthropicProvider.parseWebSearchToolResult(
+          chunk.content_block,
+        )
+        if (annotations.length === 0) {
+          return null
+        }
+        return {
+          id: messageId,
+          choices: [
+            {
+              finish_reason: null,
+              delta: { annotations },
+            },
+          ],
+          object: 'chat.completion.chunk',
+          model: model,
+        }
+      }
+
+      if (chunk.content_block.type === 'tool_use') {
+        return {
+          id: messageId,
+          choices: [
+            {
+              finish_reason: null,
+              delta: {
+                tool_calls: [
+                  {
+                    index: chunk.index,
+                    id: chunk.content_block.id,
+                    type: 'function',
+                    function: {
+                      name: chunk.content_block.name,
+                      // arguments are not provided in the start event
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          object: 'chat.completion.chunk',
+          model: model,
+        }
+      }
+    }
+
+    if (chunk.type === 'content_block_delta') {
+      if (chunk.delta.type === 'text_delta') {
+        return {
+          id: messageId,
+          choices: [
+            {
+              finish_reason: null,
+              delta: {
+                content: chunk.delta.text,
+              },
+            },
+          ],
+          object: 'chat.completion.chunk',
+          model: model,
+        }
+      } else if (chunk.delta.type === 'thinking_delta') {
+        return {
+          id: messageId,
+          choices: [
+            {
+              finish_reason: null,
+              delta: {
+                reasoning: chunk.delta.thinking,
+              },
+            },
+          ],
+          object: 'chat.completion.chunk',
+          model: model,
+        }
+      } else if (chunk.delta.type === 'input_json_delta') {
+        return {
+          id: messageId,
+          choices: [
+            {
+              finish_reason: null,
+              delta: {
+                tool_calls: [
+                  {
+                    index: chunk.index,
+                    function: {
+                      arguments: chunk.delta.partial_json,
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          object: 'chat.completion.chunk',
+          model: model,
+        }
+      }
+    }
+    return null
+  }
+
+  private static validateSystemMessages(
+    messages: RequestMessage[],
+  ): string | undefined {
+    const systemMessages = messages.filter((m) => m.role === 'system')
+    if (systemMessages.length > 1) {
+      throw new Error(`Anthropic does not support more than one system message`)
+    }
+    const systemMessage =
+      systemMessages.length > 0 ? systemMessages[0].content : undefined
+    if (systemMessage && typeof systemMessage !== 'string') {
+      throw new Error(
+        `Anthropic only supports string content for system messages`,
+      )
+    }
+    return systemMessage
+  }
+
+  private static parseRequestTool(tool: RequestTool): AnthropicTool {
+    return {
+      name: tool.function.name,
+      input_schema: {
+        ...tool.function.parameters,
+        type: 'object',
+      },
+      description: tool.function.description,
+    }
+  }
+
+  private static parseRequestToolChoice(
+    toolChoice: RequestToolChoice,
+  ): AnthropicToolChoice {
+    if (toolChoice === 'none') {
+      return {
+        type: 'none',
+      }
+    }
+    if (toolChoice === 'auto') {
+      return {
+        type: 'auto',
+      }
+    }
+    if (toolChoice === 'required') {
+      return {
+        type: 'any',
+      }
+    }
+    if (typeof toolChoice === 'object' && toolChoice.type === 'function') {
+      return {
+        type: 'tool',
+        name: toolChoice.function.name,
+      }
+    }
+    throw new Error(`Unsupported tool choice: ${JSON.stringify(toolChoice)}`)
+  }
+
+  getEmbedding(
+    _model: string,
+    _text: string,
+    _options?: { dimensions?: number },
+  ): Promise<number[]> {
+    return Promise.reject(
+      new Error(
+        `Provider ${this.provider.id} does not support embeddings. Please use a different provider.`,
+      ),
+    )
+  }
+}

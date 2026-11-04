@@ -1,0 +1,1693 @@
+import { Ban, Check, ChevronRight, CircleAlert, Loader2 } from 'lucide-react'
+import type { ReactNode } from 'react'
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+
+import { useApp } from '../../contexts/app-context'
+import { useLanguage } from '../../contexts/language-context'
+import { useSettings } from '../../contexts/settings-context'
+import type { AgentConversationRunSummary } from '../../core/agent/service'
+import { resolveToolSetLabel } from '../../core/agent/tool-catalog'
+import { isCliToolCallCapability } from '../../core/cli-runtime/tool-call'
+import { InvalidToolNameException } from '../../core/mcp/exception'
+import { getLocalFileToolServerName } from '../../core/mcp/localFileTools'
+import { parseToolName } from '../../core/mcp/tool-name-utils'
+import { getToolDefinition } from '../../core/tools/registry'
+import type { ToolSummaryAction } from '../../core/tools/types'
+import { readEditReviewSnapshots } from '../../database/edit-review/editReviewSnapshotStore'
+import {
+  AssistantToolMessageGroup,
+  ChatAssistantMessage,
+  ChatMessage,
+  ChatSubagentResultMessage,
+  ChatTerminalCommandResultMessage,
+  ChatToolMessage,
+} from '../../types/chat'
+import type { MentionableAssistantQuote } from '../../types/mentionable'
+import type { ToolEditOperation } from '../../types/tool-call.types'
+import { ToolCallResponseStatus } from '../../types/tool-call.types'
+import {
+  hasMatchingToolMessageForRequests,
+  shouldRenderAssistantToolPreview,
+} from '../../utils/chat/assistantToolPreview'
+import type {
+  FileChangeStats,
+  GroupEditSummary,
+} from '../../utils/chat/editSummary'
+import {
+  collectGroupEditSummary,
+  countFileChangeStats,
+} from '../../utils/chat/editSummary'
+
+import AssistantEditSummary, { renderDeltaPair } from './AssistantEditSummary'
+import AssistantErrorCard from './AssistantErrorCard'
+import AssistantGroupEditor from './AssistantGroupEditor'
+import AssistantMessageAnnotations from './AssistantMessageAnnotations'
+import AssistantMessageContent from './AssistantMessageContent'
+import AssistantMessageReasoning from './AssistantMessageReasoning'
+import AssistantMessageSources from './AssistantMessageSources'
+import AssistantToolMessageGroupActions from './AssistantToolMessageGroupActions'
+import LLMResponseInlineInfo from './LLMResponseInlineInfo'
+import { isReasoningActivityActive } from './reasoningActivity'
+import { buildSynthToolMessageFromResult } from './tool-cards/externalAgentResultAdapter'
+import { buildHostedWebSearchToolMessage } from './tool-cards/hostedWebSearchAdapter'
+import ToolMessage from './ToolMessage'
+
+// user message 之后的首条 thinking 用多行预览面板；工具轮之间的保持单行。
+const LEAD_REASONING_PREVIEW_LINES = 5
+
+const getBranchStateLabel = (
+  state: 'streaming' | 'waiting-approval' | 'completed' | 'aborted' | 'error',
+  t: (keyPath: string, fallback?: string) => string,
+) => {
+  if (state === 'streaming') {
+    return t('chat.toolCall.status.running', '生成中')
+  }
+  if (state === 'waiting-approval') {
+    return t('common.agentStatusWaitingApproval', '待审批')
+  }
+  if (state === 'error') {
+    return t('chat.toolCall.status.failed', '失败')
+  }
+  if (state === 'aborted') {
+    return t('chat.toolCall.status.aborted', '已中止')
+  }
+  return t('chat.toolCall.status.completed', '已完成')
+}
+
+const BranchStateIcon = ({
+  state,
+}: {
+  state: 'streaming' | 'waiting-approval' | 'completed' | 'aborted' | 'error'
+}) => {
+  if (state === 'streaming') {
+    return (
+      <Loader2
+        size={12}
+        className="yolo-multi-model-tab__status-icon is-spinning"
+      />
+    )
+  }
+  if (state === 'waiting-approval') {
+    return (
+      <CircleAlert size={12} className="yolo-multi-model-tab__status-icon" />
+    )
+  }
+  if (state === 'error') {
+    return (
+      <CircleAlert size={12} className="yolo-multi-model-tab__status-icon" />
+    )
+  }
+  if (state === 'aborted') {
+    return <Ban size={12} className="yolo-multi-model-tab__status-icon" />
+  }
+  return <Check size={12} className="yolo-multi-model-tab__status-icon" />
+}
+
+const getBranchTabState = (
+  messages: AssistantToolMessageGroup,
+): 'streaming' | 'waiting-approval' | 'completed' | 'aborted' | 'error' => {
+  const latestMessage = messages.at(-1)
+  const latestMetadata =
+    latestMessage?.role !== 'external_agent_result' &&
+    latestMessage?.role !== 'subagent_result' &&
+    latestMessage?.role !== 'terminal_command_result'
+      ? latestMessage?.metadata
+      : undefined
+
+  if (latestMetadata?.branchWaitingApproval) {
+    return 'waiting-approval'
+  }
+
+  switch (latestMetadata?.branchRunStatus) {
+    case 'running':
+      return 'streaming'
+    case 'completed':
+      return 'completed'
+    case 'aborted':
+      return 'aborted'
+    case 'error':
+      return 'error'
+  }
+
+  const assistantMessage = messages.find(
+    (message): message is ChatAssistantMessage => message.role === 'assistant',
+  )
+  return assistantMessage?.metadata?.generationState ?? 'completed'
+}
+
+const isBranchCompleted = (messages: AssistantToolMessageGroup): boolean => {
+  return getBranchTabState(messages) === 'completed'
+}
+
+const getMessageGroupRunState = ({
+  messages,
+  conversationRunSummary,
+}: {
+  messages: AssistantToolMessageGroup
+  conversationRunSummary?: AgentConversationRunSummary
+}): 'streaming' | 'waiting-approval' | 'completed' | 'aborted' | 'error' => {
+  const latestMessage = messages.at(-1)
+  const latestMetadata =
+    latestMessage?.role !== 'external_agent_result' &&
+    latestMessage?.role !== 'subagent_result' &&
+    latestMessage?.role !== 'terminal_command_result'
+      ? latestMessage?.metadata
+      : undefined
+
+  if (latestMetadata?.branchWaitingApproval) {
+    return 'waiting-approval'
+  }
+
+  switch (latestMetadata?.branchRunStatus) {
+    case 'running':
+      return 'streaming'
+    case 'completed':
+      return 'completed'
+    case 'aborted':
+      return 'aborted'
+    case 'error':
+      return 'error'
+  }
+
+  if (conversationRunSummary?.isWaitingApproval) {
+    return 'waiting-approval'
+  }
+
+  if (conversationRunSummary?.isActive) {
+    return 'streaming'
+  }
+
+  switch (conversationRunSummary?.status) {
+    case 'running':
+      return 'streaming'
+    case 'completed':
+      return 'completed'
+    case 'aborted':
+      return 'aborted'
+    case 'error':
+      return 'error'
+  }
+
+  const assistantMessage = messages.find(
+    (message): message is ChatAssistantMessage => message.role === 'assistant',
+  )
+  return assistantMessage?.metadata?.generationState ?? 'completed'
+}
+
+type AssistantMessageRenderPlan = {
+  hostedWebSearchMessage: ChatToolMessage | null
+  shouldShowAssistantToolPreview: boolean
+  hasToolResponseForThis: boolean
+  hidden: boolean
+  visible: boolean
+  rendersOnlyRunAffordances: boolean
+}
+
+// Single source of truth for "does this assistant message render anything",
+// shared by the render loop and the tool-run collapsing segmentation below so
+// the two can never drift apart.
+const getAssistantMessageRenderPlan = ({
+  message,
+  nextMessage,
+  groupMessages,
+  hidePendingAssistantPlaceholders,
+}: {
+  message: ChatAssistantMessage
+  nextMessage: AssistantToolMessageGroup[number] | undefined
+  groupMessages: AssistantToolMessageGroup
+  hidePendingAssistantPlaceholders: boolean
+}): AssistantMessageRenderPlan => {
+  const hasVisibleContent = message.content.trim().length > 0
+  const hasVisibleReasoning = (message.reasoning ?? '').trim().length > 0
+  const hasVisibleAnnotations = Boolean(message.annotations)
+  const hasToolResponseForThis =
+    nextMessage?.role === 'tool' ||
+    hasMatchingToolMessageForRequests(
+      message.toolCallRequests?.map((request) => request.id) ?? [],
+      groupMessages,
+    )
+  const shouldShowAssistantToolPreview = shouldRenderAssistantToolPreview({
+    generationState: message.metadata?.generationState,
+    toolCallRequestCount: message.toolCallRequests?.length ?? 0,
+    hasToolMessages: hasToolResponseForThis,
+  })
+  // A search the provider ran on its own servers. It produced no tool call,
+  // so it is rebuilt here purely for display.
+  const hostedWebSearchMessage = buildHostedWebSearchToolMessage(message)
+
+  const hidden =
+    (hasToolResponseForThis || hidePendingAssistantPlaceholders) &&
+    !hasVisibleContent &&
+    !hasVisibleReasoning &&
+    !hasVisibleAnnotations &&
+    !hostedWebSearchMessage &&
+    !shouldShowAssistantToolPreview
+
+  const visible =
+    !hidden &&
+    Boolean(
+      message.reasoning ||
+        message.annotations ||
+        message.content ||
+        hostedWebSearchMessage ||
+        (message.metadata?.generationState === 'error' &&
+          Boolean(message.metadata?.errorMessage)) ||
+        (message.metadata?.generationState === 'streaming' &&
+          !message.content &&
+          !message.reasoning) ||
+        shouldShowAssistantToolPreview,
+    )
+
+  // Renders nothing but the run's own affordances: a thinking block, the
+  // in-flight tool-call preview, or the empty shell a turn opens with before
+  // the provider has sent anything. None of that is narrative — it all
+  // describes the tool run this message sits inside — so it folds into that
+  // run's summary line instead of ending the run. Only narrative output
+  // (an answer, annotations, a provider-side search, an error card) ends it.
+  const rendersOnlyRunAffordances =
+    visible &&
+    !hasVisibleContent &&
+    !hasVisibleAnnotations &&
+    !hostedWebSearchMessage &&
+    !(
+      message.metadata?.generationState === 'error' &&
+      Boolean(message.metadata?.errorMessage)
+    )
+
+  return {
+    hostedWebSearchMessage,
+    shouldShowAssistantToolPreview,
+    hasToolResponseForThis,
+    hidden,
+    visible,
+    rendersOnlyRunAffordances,
+  }
+}
+
+const TOOL_RUN_SUMMARY_BUCKET_ORDER = [
+  'read',
+  'search',
+  'web',
+  'edit',
+  'virtualTerminal',
+  'terminal',
+  'command',
+  'analysis',
+  'other',
+] as const
+
+type ToolRunSummaryBucket = (typeof TOOL_RUN_SUMMARY_BUCKET_ORDER)[number]
+
+/**
+ * Every bucket except `command` and `other` is a {@link ToolSummaryAction} a
+ * built-in tool declares on itself; those two exist only here, for the CLI
+ * table below and for calls nothing recognizes.
+ *
+ * `agentInternal` tools (todo list, context compaction, delegation, asking the
+ * user) fold into `other` on purpose — see that value's doc comment in
+ * `core/tools/types.ts`.
+ */
+const toolSummaryActionBucket = (
+  action: ToolSummaryAction,
+): ToolRunSummaryBucket => (action === 'agentInternal' ? 'other' : action)
+
+const CLI_TOOL_RUN_SUMMARY_BUCKET_BY_NAME: Record<
+  string,
+  ToolRunSummaryBucket
+> = {
+  bash: 'command',
+  exec: 'command',
+  exec_command: 'command',
+  shell: 'command',
+  terminal: 'command',
+  terminal_command: 'command',
+  read: 'read',
+  glob: 'search',
+  grep: 'search',
+  search: 'search',
+  find: 'search',
+  edit: 'edit',
+  write: 'edit',
+  apply_patch: 'edit',
+  websearch: 'web',
+  web_search: 'web',
+  fetch: 'web',
+  scrape: 'web',
+}
+
+type ToolCallRequestLike = ChatToolMessage['toolCalls'][number]['request']
+
+/**
+ * How one call is counted in a collapsed run summary.
+ *
+ * Host built-ins get a verb, because their set is closed and we define the
+ * semantics. MCP and module tools get no verb — `read_wiki_structure` looks
+ * like a read and `search_my_robots` looks like a search, but that is guessing
+ * from a name, and a wrong guess reads worse than no guess. What they do have
+ * is the tool set they belong to, which is both honest and the identity the
+ * model itself sees in `<tool_catalog>`.
+ */
+type ToolRunSummaryKey =
+  | { kind: 'builtin'; bucket: ToolRunSummaryBucket }
+  | { kind: 'toolSet'; setId: string; toolName: string }
+
+const getToolRunSummaryKey = (
+  request: ToolCallRequestLike,
+): ToolRunSummaryKey => {
+  const cliToolCall = request.metadata?.cliToolCall
+  if (cliToolCall) {
+    if (isCliToolCallCapability(request, 'file_change')) {
+      return { kind: 'builtin', bucket: 'edit' }
+    }
+    if (isCliToolCallCapability(request, 'command_execution')) {
+      return { kind: 'builtin', bucket: 'command' }
+    }
+    const cliBucket =
+      CLI_TOOL_RUN_SUMMARY_BUCKET_BY_NAME[cliToolCall.name.toLowerCase()]
+    return { kind: 'builtin', bucket: cliBucket ?? 'other' }
+  }
+
+  let parsed: { serverName: string; toolName: string } | null = null
+  try {
+    parsed = parseToolName(request.name)
+  } catch (error) {
+    if (!(error instanceof InvalidToolNameException)) {
+      throw error
+    }
+  }
+  if (!parsed) {
+    return { kind: 'builtin', bucket: 'other' }
+  }
+
+  // Scoped to the host server: an MCP tool that happens to be called `fs_read`
+  // is not a host file read. Retired built-in names (`fs_create_file` and the
+  // like) no longer resolve to a definition and fall to `other` — a historical
+  // conversation loses one verb, which is not worth a name table.
+  if (parsed.serverName === getLocalFileToolServerName()) {
+    const definition = getToolDefinition(parsed.toolName)
+    return {
+      kind: 'builtin',
+      bucket: definition
+        ? toolSummaryActionBucket(definition.summaryAction)
+        : 'other',
+    }
+  }
+
+  return {
+    kind: 'toolSet',
+    setId: parsed.serverName,
+    toolName: parsed.toolName,
+  }
+}
+
+const TOOL_RUN_SUMMARY_LABELS: Record<
+  ToolRunSummaryBucket,
+  { key: string; fallback: string }
+> = {
+  read: { key: 'chat.toolRunSummary.read', fallback: 'Read {count} file(s)' },
+  search: {
+    key: 'chat.toolRunSummary.search',
+    fallback: 'Searched {count} time(s)',
+  },
+  web: { key: 'chat.toolRunSummary.web', fallback: '{count} web lookup(s)' },
+  edit: { key: 'chat.toolRunSummary.edit', fallback: 'Edited {count} file(s)' },
+  virtualTerminal: {
+    key: 'chat.toolRunSummary.virtualTerminal',
+    fallback: 'Virtual terminal {count} time(s)',
+  },
+  terminal: {
+    key: 'chat.toolRunSummary.terminal',
+    fallback: 'Terminal {count} time(s)',
+  },
+  command: {
+    key: 'chat.toolRunSummary.command',
+    fallback: 'Ran {count} command(s)',
+  },
+  analysis: {
+    key: 'chat.toolRunSummary.analysis',
+    fallback: '{count} sandbox run(s)',
+  },
+  other: {
+    key: 'chat.toolRunSummary.other',
+    fallback: '{count} other action(s)',
+  },
+}
+
+const TOOL_SET_SUMMARY_LABEL = {
+  key: 'chat.toolRunSummary.toolSet',
+  fallback: '{name} {count} time(s)',
+}
+
+/**
+ * A single call names the tool instead of counting to one: "deepwiki 1 time"
+ * says nothing the reader could act on, and the point of the collapsed line is
+ * to be readable without expanding. Mirrors what the built-in buckets already
+ * do for a lone file edit.
+ */
+const TOOL_SET_SUMMARY_SINGLE_LABEL = {
+  key: 'chat.toolRunSummary.toolSetSingle',
+  fallback: '{name} · {tool}',
+}
+
+/**
+ * Non-builtin calls in a run, tallied per tool set. Kept separate from
+ * `bucketCounts` because tool sets are an open set — they cannot live in that
+ * record's fixed key space.
+ */
+type ToolSetTally = {
+  setId: string
+  label: string
+  count: number
+  /** Set only when `count` is 1, for the named-tool form. */
+  soleToolName: string | null
+}
+
+type ToolRunSegment = {
+  key: string
+  startIndex: number
+  endIndex: number
+  /**
+   * Index of the visible assistant message that settled this run. Its
+   * thinking block belongs to the run narratively, so it collapses and
+   * expands together with the run.
+   */
+  boundaryIndex: number | null
+  bucketCounts: Partial<Record<ToolRunSummaryBucket, number>>
+  /** Per-tool-set tallies, already sorted and labelled for display. */
+  toolSetTallies: ToolSetTally[]
+  /**
+   * 本段里已成功完成的文件编辑聚合（复用 footer 用的同一套按路径去重 + 净差异
+   * 逻辑）。为 null 表示本段没有任何编辑调用已经成功返回——可能是纯只读段，
+   * 也可能是编辑还在跑/失败了，这两种情况都退回普通的分桶计数文案。
+   */
+  editSummary: GroupEditSummary | null
+  requiresUserAction: boolean
+  /**
+   * 本段此刻还有事情没做完：有请求还没建出工具消息、有调用还没落定，或者成员
+   * 助手消息仍在流式生成。折叠行不会因此多出或少掉任何一个字——它只用来给整
+   * 行文字挂上光流动画，所以这个状态的开关是零布局代价的。
+   */
+  isActive: boolean
+}
+
+const isSettledToolCallStatus = (status: ToolCallResponseStatus): boolean =>
+  status !== ToolCallResponseStatus.Running &&
+  status !== ToolCallResponseStatus.PendingApproval &&
+  status !== ToolCallResponseStatus.AwaitingUserInput
+
+const getFileBaseName = (path: string): string => {
+  const segments = path.split('/')
+  return segments[segments.length - 1] || path
+}
+
+const EDIT_FILE_SUMMARY_LABELS: Record<
+  ToolEditOperation,
+  { key: string; fallback: string }
+> = {
+  edit: { key: 'chat.toolRunSummary.editedFile', fallback: 'Edited {name}' },
+  create: {
+    key: 'chat.toolRunSummary.createdFile',
+    fallback: 'Created {name}',
+  },
+  delete: {
+    key: 'chat.toolRunSummary.deletedFile',
+    fallback: 'Deleted {name}',
+  },
+}
+
+/**
+ * 摘要行的文案分两部分：`clauses`（纯文本短语，逗号/·拼接）和 `stats`
+ * （行尾带色的 +N/-M，渲染成 JSX 而不是字符串)。是否点名文件、要不要带数字，
+ * 完全由 `editSummary` 是否存在、`totalFiles`、`totalLineStatsAvailable` 决定：
+ * - 没有已完成的编辑 → 跟以前完全一样的分桶计数，`·` 拼接。
+ * - 恰好 1 个文件 → 点名该文件（按 create/edit/delete 换动词），逗号拼接。
+ * - ≥2 个文件 → 不点名，只报数量，逗号拼接。
+ * - 数字是否可信只看 `totalLineStatsAvailable`（footer 已验证过这个字段在
+ *   「CLI 只按 turn 报总量」的场景下依然准确，不能逐文件判断）。
+ */
+const buildToolRunSummaryDisplay = (
+  segment: ToolRunSegment,
+  t: (keyPath: string, fallback?: string) => string,
+): {
+  clauses: { key: string; node: ReactNode }[]
+  separator: string
+  stats: [number, number] | null
+} => {
+  const { editSummary } = segment
+  const clauses: { key: string; node: ReactNode }[] = []
+
+  // 按 {count} 拆模板而不是直接插值：数字必须单独成节点，才能在它变化时靠换
+  // key 重挂来重播入场动画。拆而不是插值的理由和下面 {tool} 那处一样——数字
+  // 在句子里的位置由各语言的模板决定，这里不能假设它在末尾。
+  const renderCountLabel = (
+    template: string,
+    count: number,
+    replacements: Record<string, string> = {},
+  ): ReactNode => {
+    const fill = (text: string) =>
+      Object.entries(replacements).reduce(
+        (filled, [token, value]) => filled.replace(`{${token}}`, value),
+        text,
+      )
+    const [before, after = ''] = template.split('{count}')
+    return (
+      <>
+        {fill(before)}
+        <span key={count} className="yolo-tool-run-summary__count">
+          {count}
+        </span>
+        {fill(after)}
+      </>
+    )
+  }
+
+  if (editSummary && editSummary.totalFiles === 1) {
+    const file = editSummary.files[0]
+    const label = EDIT_FILE_SUMMARY_LABELS[file.operation]
+    clauses.push({
+      key: 'edit-file',
+      node: t(label.key, label.fallback).replace(
+        '{name}',
+        getFileBaseName(file.path),
+      ),
+    })
+  } else if (editSummary && editSummary.totalFiles >= 2) {
+    const label = TOOL_RUN_SUMMARY_LABELS.edit
+    clauses.push({
+      key: 'edit',
+      node: renderCountLabel(
+        t(label.key, label.fallback),
+        editSummary.totalFiles,
+      ),
+    })
+  }
+
+  const pushBucketClause = (bucket: ToolRunSummaryBucket) => {
+    const count = segment.bucketCounts[bucket]
+    if (!count) {
+      return
+    }
+    const label = TOOL_RUN_SUMMARY_LABELS[bucket]
+    clauses.push({
+      key: bucket,
+      node: renderCountLabel(t(label.key, label.fallback), count),
+    })
+  }
+
+  // `other` is appended after the tool sets rather than in bucket order: it is
+  // the residue of everything we could not name, so it belongs at the tail.
+  TOOL_RUN_SUMMARY_BUCKET_ORDER.forEach((bucket) => {
+    if (bucket === 'other' || (bucket === 'edit' && editSummary)) {
+      return
+    }
+    pushBucketClause(bucket)
+  })
+
+  for (const tally of segment.toolSetTallies) {
+    if (!tally.soleToolName) {
+      clauses.push({
+        key: `set:${tally.setId}`,
+        node: renderCountLabel(
+          t(TOOL_SET_SUMMARY_LABEL.key, TOOL_SET_SUMMARY_LABEL.fallback),
+          tally.count,
+          { name: tally.label },
+        ),
+      })
+      continue
+    }
+    // The tool name sits a layer below the set name, so it gets its own span.
+    // Split the template on `{tool}` rather than interpolating and slicing the
+    // result: a locale is free to put the tool first, and only the template
+    // knows the order.
+    const [before, after] = t(
+      TOOL_SET_SUMMARY_SINGLE_LABEL.key,
+      TOOL_SET_SUMMARY_SINGLE_LABEL.fallback,
+    ).split('{tool}')
+    clauses.push({
+      key: `set:${tally.setId}`,
+      node: (
+        <>
+          {before.replace('{name}', tally.label)}
+          <span className="yolo-tool-run-summary__tool">
+            {tally.soleToolName}
+          </span>
+          {(after ?? '').replace('{name}', tally.label)}
+        </>
+      ),
+    })
+  }
+
+  pushBucketClause('other')
+
+  return {
+    clauses,
+    separator: editSummary ? ', ' : ' · ',
+    // 折叠状态下成员一律不渲染，所以还没回来的那次调用只能由这行说出来。它是
+    // 纯追加的行尾标记：出现和消失都不碰前面任何一个字，也不改变它们的位置。
+    stats:
+      editSummary && editSummary.totalLineStatsAvailable
+        ? [editSummary.totalAddedLines, editSummary.totalRemovedLines]
+        : null,
+  }
+}
+
+export type AssistantToolMessageGroupItemProps = {
+  messages: AssistantToolMessageGroup
+  inlineInfoMessages?: AssistantToolMessageGroup
+  conversationId: string
+  conversationRunSummary?: AgentConversationRunSummary
+  activeBranchKey?: string | null
+  sourceUserMessageId?: string | null
+  suppressFooter?: boolean
+  showInlineInfo?: boolean
+  showRetryAction?: boolean
+  showInsertAction?: boolean
+  showCopyAction?: boolean
+  showBranchAction?: boolean
+  showEditAction?: boolean
+  showDeleteAction?: boolean
+  showQuoteAction?: boolean
+  isApplying: boolean // TODO: isApplying should be a boolean for each assistant message
+  activeApplyRequestKey: string | null
+  onApply: (
+    blockToApply: string,
+    applyRequestKey: string,
+    targetFilePath?: string,
+  ) => void
+  onToolMessageUpdate: (message: ChatToolMessage) => void
+  onToolCallResponseUpdate?: (
+    toolMessageId: string,
+    toolCallId: string,
+    response: ChatToolMessage['toolCalls'][number]['response'],
+  ) => void
+  terminalCommandResultsByToolCallId?: ReadonlyMap<
+    string,
+    ChatTerminalCommandResultMessage
+  >
+  subagentResultsByToolCallId?: ReadonlyMap<string, ChatSubagentResultMessage>
+  onRecoverToolCall?: (payload: {
+    conversationId: string
+    toolMessageId: string
+    request: ChatToolMessage['toolCalls'][number]['request']
+    allowForConversation?: boolean
+  }) => Promise<boolean>
+  onRecoverAnswerUserQuestion?: (payload: {
+    resolvedMessages: ChatMessage[]
+    toolCallId: string
+  }) => void
+  editingAssistantMessageId?: string | null
+  onEditStart: (messageId: string) => void
+  onEditCancel: () => void
+  onEditSave: (messageId: string, replacementMessages: ChatMessage[]) => void
+  onDeleteGroup: (messageIds: string[]) => void
+  onRetryGroup: (messageIds: string[]) => void
+  continuableErrorMessageIds?: ReadonlySet<string>
+  onContinueError?: (assistantMessageId: string) => void
+  onBranchGroup: (messageIds: string[]) => void
+  onActiveBranchChange?: (
+    sourceUserMessageId: string,
+    branchKey: string | null,
+  ) => void
+  onQuoteAssistantSelection: (payload: {
+    id?: string
+    annotationNumber?: number
+    messageId: string
+    conversationId: string
+    content: string
+    comment?: string
+    selector?: MentionableAssistantQuote['selector']
+  }) => void
+  assistantQuotes?: readonly MentionableAssistantQuote[]
+  onDeleteAssistantQuote?: (id: string) => void
+  onOpenEditSummaryFile: (file: GroupEditSummary['files'][number]) => void
+  onUndoEditSummary?: (summary: GroupEditSummary) => void
+  undoingEditSummaryTarget?: string | null
+  hidePendingAssistantPlaceholders?: boolean
+  showRunningToolFooter?: boolean
+}
+
+function AssistantToolMessageGroupItem({
+  messages,
+  inlineInfoMessages,
+  conversationId,
+  conversationRunSummary,
+  activeBranchKey: controlledActiveBranchKey,
+  sourceUserMessageId,
+  suppressFooter = false,
+  showInlineInfo = true,
+  showRetryAction = false,
+  showInsertAction = true,
+  showCopyAction = true,
+  showBranchAction = true,
+  showEditAction = true,
+  showDeleteAction = true,
+  showQuoteAction = true,
+  isApplying,
+  activeApplyRequestKey,
+  onApply,
+  onToolMessageUpdate,
+  onToolCallResponseUpdate,
+  terminalCommandResultsByToolCallId,
+  subagentResultsByToolCallId,
+  onRecoverToolCall,
+  onRecoverAnswerUserQuestion,
+  editingAssistantMessageId,
+  onEditStart,
+  onEditCancel,
+  onEditSave,
+  onDeleteGroup,
+  onRetryGroup,
+  continuableErrorMessageIds,
+  onContinueError,
+  onBranchGroup,
+  onActiveBranchChange,
+  onQuoteAssistantSelection,
+  assistantQuotes,
+  onDeleteAssistantQuote,
+  onOpenEditSummaryFile,
+  onUndoEditSummary,
+  undoingEditSummaryTarget,
+  hidePendingAssistantPlaceholders = false,
+  showRunningToolFooter = true,
+}: AssistantToolMessageGroupItemProps) {
+  const app = useApp()
+  const { t } = useLanguage()
+  const { settings } = useSettings()
+  const discoveredCatalogs = settings.mcp.discoveredCatalogs ?? {}
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const pendingScrollRestoreRef = useRef<{
+    scrollContainer: HTMLElement
+    scrollTop: number
+  } | null>(null)
+  const pendingEditLayoutAnchorRef = useRef<{
+    scrollContainer: HTMLElement
+    bottom: number
+  } | null>(null)
+  const branchGroups = useMemo(() => {
+    const groups = new Map<
+      string,
+      {
+        key: string
+        label: string
+        conversationId: string
+        messages: AssistantToolMessageGroup
+      }
+    >()
+    messages.forEach((message) => {
+      const branchId = message.metadata?.branchId
+      if (!branchId) {
+        return
+      }
+      const branchLabel =
+        message.role !== 'external_agent_result' &&
+        message.role !== 'subagent_result' &&
+        message.role !== 'terminal_command_result'
+          ? message.metadata?.branchLabel
+          : undefined
+      const branchConversationId = message.metadata?.branchConversationId
+      const existing = groups.get(branchId)
+      if (existing) {
+        existing.messages.push(message)
+        return
+      }
+      groups.set(branchId, {
+        key: branchId,
+        label: branchLabel ?? branchId,
+        conversationId: branchConversationId ?? conversationId,
+        messages: [message],
+      })
+    })
+    return Array.from(groups.values())
+  }, [conversationId, messages])
+  const hasMultipleBranches = branchGroups.length > 1
+  const [uncontrolledActiveBranchKey, setUncontrolledActiveBranchKey] =
+    useState<string | null>(null)
+  const activeBranchKey =
+    controlledActiveBranchKey ?? uncontrolledActiveBranchKey
+  const resolvedActiveBranchKey =
+    activeBranchKey ?? branchGroups[0]?.key ?? null
+  const emitActiveBranchChange = useCallback(
+    (branchKey: string | null) => {
+      if (!sourceUserMessageId) {
+        return
+      }
+      onActiveBranchChange?.(sourceUserMessageId, branchKey)
+    },
+    [onActiveBranchChange, sourceUserMessageId],
+  )
+
+  const handleBranchSwitch = useCallback(
+    (branchKey: string) => {
+      if (branchKey === resolvedActiveBranchKey) {
+        return
+      }
+
+      const scrollContainer = containerRef.current?.closest<HTMLElement>(
+        '.yolo-chat-messages',
+      )
+      if (scrollContainer) {
+        pendingScrollRestoreRef.current = {
+          scrollContainer,
+          scrollTop: scrollContainer.scrollTop,
+        }
+      }
+      setUncontrolledActiveBranchKey(branchKey)
+      emitActiveBranchChange(branchKey)
+    },
+    [emitActiveBranchChange, resolvedActiveBranchKey],
+  )
+
+  useEffect(() => {
+    if (!hasMultipleBranches) {
+      setUncontrolledActiveBranchKey(null)
+      emitActiveBranchChange(null)
+      return
+    }
+    if (
+      activeBranchKey &&
+      branchGroups.some((group) => group.key === activeBranchKey)
+    ) {
+      return
+    }
+    const firstCompletedBranch = branchGroups.find((group) =>
+      isBranchCompleted(group.messages),
+    )
+    const nextActiveBranchKey =
+      firstCompletedBranch?.key ?? branchGroups[0]?.key ?? null
+    setUncontrolledActiveBranchKey(nextActiveBranchKey)
+    emitActiveBranchChange(nextActiveBranchKey)
+  }, [
+    activeBranchKey,
+    branchGroups,
+    emitActiveBranchChange,
+    hasMultipleBranches,
+  ])
+
+  const displayedMessages = useMemo(() => {
+    const selectedMessages = !hasMultipleBranches
+      ? messages
+      : (branchGroups.find((group) => group.key === resolvedActiveBranchKey)
+          ?.messages ??
+        branchGroups[0]?.messages ??
+        messages)
+    return selectedMessages
+  }, [branchGroups, hasMultipleBranches, messages, resolvedActiveBranchKey])
+  // The footer's usage may span several groups (a background-task bridge), but
+  // within this group it must count only the branch on display: each branch is
+  // its own conversation with its own context.
+  const footerUsageMessages = useMemo(() => {
+    const source = inlineInfoMessages ?? displayedMessages
+    if (!hasMultipleBranches) {
+      return source
+    }
+    const displayedBranchId = displayedMessages[0]?.metadata?.branchId
+    return source.filter((message) => {
+      const branchId = message.metadata?.branchId
+      return !branchId || branchId === displayedBranchId
+    })
+  }, [displayedMessages, hasMultipleBranches, inlineInfoMessages])
+  const effectiveConversationId = useMemo(() => {
+    if (!hasMultipleBranches) {
+      return conversationId
+    }
+    return (
+      branchGroups.find((group) => group.key === resolvedActiveBranchKey)
+        ?.conversationId ??
+      branchGroups[0]?.conversationId ??
+      conversationId
+    )
+  }, [
+    branchGroups,
+    conversationId,
+    hasMultipleBranches,
+    resolvedActiveBranchKey,
+  ])
+  useLayoutEffect(() => {
+    if (activeBranchKey === null) {
+      return
+    }
+
+    const pendingRestore = pendingScrollRestoreRef.current
+    if (!pendingRestore) {
+      return
+    }
+
+    pendingScrollRestoreRef.current = null
+    pendingRestore.scrollContainer.scrollTop = pendingRestore.scrollTop
+  }, [activeBranchKey])
+  const assistantMessages = displayedMessages.filter(
+    (message): message is ChatAssistantMessage => message.role === 'assistant',
+  )
+  const groupAnchorMessageId = displayedMessages[0]?.id ?? null
+  const isEditingGroup = displayedMessages.some(
+    (message) => message.id === editingAssistantMessageId,
+  )
+  const groupRunState = getMessageGroupRunState({
+    messages: displayedMessages,
+    conversationRunSummary,
+  })
+  const isRunActive =
+    groupRunState === 'streaming' || groupRunState === 'waiting-approval'
+
+  const messageRenderPlans = useMemo(
+    () =>
+      displayedMessages.map((message, index) =>
+        message.role === 'assistant'
+          ? getAssistantMessageRenderPlan({
+              message,
+              nextMessage: displayedMessages[index + 1],
+              groupMessages: displayedMessages,
+              hidePendingAssistantPlaceholders,
+            })
+          : null,
+      ),
+    [displayedMessages, hidePendingAssistantPlaceholders],
+  )
+
+  // A run of two or more tool calls — plus the assistant messages that only
+  // narrate it (thinking blocks, the in-flight tool preview, the empty shell a
+  // turn opens with) — gets a stable summary as soon as it is observed.
+  // Details stay collapsed by default; only a run requiring user action
+  // expands automatically so approval and answer controls remain immediately
+  // available.
+  const toolRunSegments = useMemo(() => {
+    const segments: ToolRunSegment[] = []
+    let firstMemberIndex = -1
+    let lastMemberIndex = -1
+    let toolMessages: ChatToolMessage[] = []
+    let pendingRequestCount = 0
+    let hasStreamingMember = false
+
+    const addMember = (index: number) => {
+      if (firstMemberIndex === -1) {
+        firstMemberIndex = index
+      }
+      lastMemberIndex = index
+    }
+
+    const close = (boundaryIndex: number | null) => {
+      if (toolMessages.length > 0) {
+        const toolCalls = toolMessages.flatMap((message) => message.toolCalls)
+        // A request the model has emitted but whose tool message does not exist
+        // yet counts toward the threshold. Without it the summary line would
+        // only materialize one beat later, when that tool message lands, and
+        // everything below it would shift by a row in the meantime.
+        if (toolCalls.length + pendingRequestCount >= 2) {
+          const bucketCounts: ToolRunSegment['bucketCounts'] = {}
+          const bySet = new Map<
+            string,
+            { count: number; toolNames: string[] }
+          >()
+          for (const call of toolCalls) {
+            const key = getToolRunSummaryKey(call.request)
+            if (key.kind === 'builtin') {
+              bucketCounts[key.bucket] = (bucketCounts[key.bucket] ?? 0) + 1
+              continue
+            }
+            const tally = bySet.get(key.setId) ?? { count: 0, toolNames: [] }
+            tally.count += 1
+            tally.toolNames.push(key.toolName)
+            bySet.set(key.setId, tally)
+          }
+          const toolSetTallies = [...bySet.entries()]
+            .map(([setId, tally]) => ({
+              setId,
+              label: resolveToolSetLabel(
+                setId,
+                discoveredCatalogs[setId]?.serverInfo,
+              ),
+              count: tally.count,
+              soleToolName: tally.count === 1 ? tally.toolNames[0] : null,
+            }))
+            .sort((a, b) => a.label.localeCompare(b.label))
+          segments.push({
+            key: toolMessages[0].id,
+            startIndex: firstMemberIndex,
+            endIndex: lastMemberIndex,
+            boundaryIndex,
+            bucketCounts,
+            toolSetTallies,
+            editSummary: collectGroupEditSummary(toolMessages),
+            requiresUserAction: toolCalls.some(
+              (call) =>
+                call.response.status ===
+                  ToolCallResponseStatus.PendingApproval ||
+                call.response.status ===
+                  ToolCallResponseStatus.AwaitingUserInput,
+            ),
+            isActive:
+              pendingRequestCount > 0 ||
+              hasStreamingMember ||
+              toolCalls.some(
+                (call) => !isSettledToolCallStatus(call.response.status),
+              ),
+          })
+        }
+      }
+      firstMemberIndex = -1
+      lastMemberIndex = -1
+      toolMessages = []
+      pendingRequestCount = 0
+      hasStreamingMember = false
+    }
+
+    displayedMessages.forEach((message, index) => {
+      if (message.role === 'tool') {
+        addMember(index)
+        toolMessages.push(message)
+        return
+      }
+      const plan =
+        message.role === 'assistant' ? messageRenderPlans[index] : null
+      if (message.role === 'assistant' && plan?.rendersOnlyRunAffordances) {
+        addMember(index)
+        if (plan.shouldShowAssistantToolPreview) {
+          // Only an unanswered request belongs here. A thinking-only message
+          // whose requests already have a tool message would double-count.
+          pendingRequestCount += message.toolCallRequests?.length ?? 0
+        }
+        if (message.metadata?.generationState === 'streaming') {
+          hasStreamingMember = true
+        }
+        return
+      }
+      const rendersNothing =
+        message.role === 'subagent_result' ||
+        message.role === 'terminal_command_result' ||
+        (message.role === 'assistant' && !plan?.visible)
+      if (rendersNothing) {
+        return
+      }
+      close(index)
+    })
+    close(null)
+
+    return segments
+  }, [displayedMessages, messageRenderPlans, discoveredCatalogs])
+
+  const toolRunSegmentByIndex = useMemo(() => {
+    const byIndex = new Map<number, ToolRunSegment>()
+    for (const segment of toolRunSegments) {
+      for (let index = segment.startIndex; index <= segment.endIndex; index++) {
+        byIndex.set(index, segment)
+      }
+    }
+    return byIndex
+  }, [toolRunSegments])
+
+  const toolRunBoundaryByIndex = useMemo(() => {
+    const byIndex = new Map<number, ToolRunSegment>()
+    for (const segment of toolRunSegments) {
+      if (segment.boundaryIndex !== null) {
+        byIndex.set(segment.boundaryIndex, segment)
+      }
+    }
+    return byIndex
+  }, [toolRunSegments])
+
+  const [expandedToolRunKeys, setExpandedToolRunKeys] = useState<
+    ReadonlySet<string>
+  >(() => new Set())
+  const toggleToolRunSegment = useCallback((key: string) => {
+    setExpandedToolRunKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) {
+        next.delete(key)
+      } else {
+        next.add(key)
+      }
+      return next
+    })
+  }, [])
+
+  // Keep the action area stationary while the rendered group and its capped
+  // editor exchange heights, without preserving the full message height.
+  const captureEditLayoutAnchor = useCallback(() => {
+    const container = containerRef.current
+    const scrollContainer = container?.closest<HTMLElement>(
+      '.yolo-chat-messages',
+    )
+    if (!container || !scrollContainer) {
+      pendingEditLayoutAnchorRef.current = null
+      return
+    }
+
+    pendingEditLayoutAnchorRef.current = {
+      scrollContainer,
+      bottom: container.getBoundingClientRect().bottom,
+    }
+  }, [])
+
+  const handleEditStart = useCallback(() => {
+    if (!groupAnchorMessageId || isRunActive) {
+      return
+    }
+
+    captureEditLayoutAnchor()
+    onEditStart(groupAnchorMessageId)
+  }, [captureEditLayoutAnchor, groupAnchorMessageId, isRunActive, onEditStart])
+
+  useLayoutEffect(() => {
+    const pendingAnchor = pendingEditLayoutAnchorRef.current
+    if (!pendingAnchor) {
+      return
+    }
+
+    pendingEditLayoutAnchorRef.current = null
+    const container = containerRef.current
+    if (!container || !pendingAnchor.scrollContainer.contains(container)) {
+      return
+    }
+
+    const nextBottom = container.getBoundingClientRect().bottom
+    pendingAnchor.scrollContainer.scrollTop += nextBottom - pendingAnchor.bottom
+  }, [isEditingGroup])
+  const hasPendingAssistantShell = assistantMessages.some(
+    (message) =>
+      message.metadata?.generationState === 'streaming' &&
+      !message.content &&
+      !message.reasoning &&
+      !message.annotations &&
+      !message.toolCallRequests?.length,
+  )
+  const baseGroupEditSummary = useMemo(
+    () => collectGroupEditSummary(displayedMessages),
+    [displayedMessages],
+  )
+
+  // Stable key identifying the set of files × rounds that need snapshot reads.
+  // Changes only when a file is added / removed / gets a new round, so the
+  // snapshot-fetch effect below doesn't re-run on every streaming frame —
+  // previously this re-ran ~60Hz and re-parsed the full snapshot JSON on each
+  // frame, producing GB-scale transient allocations on long conversations.
+  const snapshotFetchKey = useMemo(() => {
+    if (!baseGroupEditSummary || baseGroupEditSummary.files.length === 0) {
+      return null
+    }
+    return baseGroupEditSummary.files
+      .map(
+        (file) => `${file.path}::${file.firstRoundId}::${file.latestRoundId}`,
+      )
+      .join('|')
+  }, [baseGroupEditSummary])
+
+  // Cached per-file stats derived from the cumulative first→latest snapshot
+  // diff. Keyed by snapshotFetchKey entries so it survives re-renders of
+  // baseGroupEditSummary that don't touch the file set (e.g. tool-call entries
+  // appended during the same round). Carries `lineStatsAvailable` along with
+  // the numbers: the recomputation can come back unavailable (oversized file
+  // or diff timeout), and applying its 0/0 while leaving the original
+  // availability flag alone would render a confident, wrong "0".
+  const [enrichedFileCounts, setEnrichedFileCounts] = useState<
+    Record<string, FileChangeStats>
+  >({})
+
+  useEffect(() => {
+    if (!snapshotFetchKey || !baseGroupEditSummary) {
+      return
+    }
+
+    let cancelled = false
+    const files = baseGroupEditSummary.files
+
+    void (async () => {
+      // 一次读盘取出所有需要的快照。逐个 readEditReviewSnapshot 会把整个会话
+      // 的快照库（含每个文件的前后全文）读盘并 JSON.parse 2×N 遍，全在主线程。
+      const snapshots = await readEditReviewSnapshots({
+        app,
+        conversationId,
+        keys: files.flatMap((file) => [
+          { roundId: file.firstRoundId, filePath: file.path },
+          { roundId: file.latestRoundId, filePath: file.path },
+        ]),
+      })
+
+      if (cancelled) {
+        return
+      }
+
+      const entries = files.map((file, index) => {
+        const firstSnapshot = snapshots[index * 2]
+        const latestSnapshot = snapshots[index * 2 + 1]
+
+        // 内容超上限的快照只记了行数，没留正文（见
+        // `MAX_SNAPSHOT_CONTENT_CHARS`）——拿空串去 diff 会算出一个自信的错
+        // 数字，不如沿用逐次统计。
+        if (
+          !firstSnapshot ||
+          !latestSnapshot ||
+          !firstSnapshot.contentAvailable ||
+          !latestSnapshot.contentAvailable
+        ) {
+          return null
+        }
+
+        const counts = countFileChangeStats({
+          beforeContent: firstSnapshot.beforeContent,
+          afterContent: latestSnapshot.afterContent,
+          beforeExists: firstSnapshot.beforeExists,
+          afterExists: latestSnapshot.afterExists,
+        })
+
+        const key = `${file.path}::${file.firstRoundId}::${file.latestRoundId}`
+        return [key, counts] as const
+      })
+
+      const next: Record<string, FileChangeStats> = {}
+      for (const entry of entries) {
+        if (entry) {
+          next[entry[0]] = entry[1]
+        }
+      }
+      setEnrichedFileCounts(next)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+    // snapshotFetchKey encodes the files × rounds identity we read here;
+    // baseGroupEditSummary changes every streaming frame and MUST NOT be a
+    // dep — it would retrigger this effect at ~60Hz and re-parse the full
+    // snapshot JSON on every frame.
+  }, [snapshotFetchKey, app, conversationId])
+
+  const groupEditSummary = useMemo<GroupEditSummary | null>(() => {
+    if (!baseGroupEditSummary) {
+      return null
+    }
+    const files = baseGroupEditSummary.files.map((file) => {
+      const key = `${file.path}::${file.firstRoundId}::${file.latestRoundId}`
+      const enriched = enrichedFileCounts[key]
+      if (!enriched) {
+        return file
+      }
+      return {
+        ...file,
+        addedLines: enriched.addedLines,
+        removedLines: enriched.removedLines,
+        lineStatsAvailable: enriched.lineStatsAvailable,
+      }
+    })
+    return {
+      ...baseGroupEditSummary,
+      files,
+      totalAddedLines: files.reduce((sum, file) => sum + file.addedLines, 0),
+      totalRemovedLines: files.reduce(
+        (sum, file) => sum + file.removedLines,
+        0,
+      ),
+      // 合计跟着补齐后的逐文件数字一起重算，所以补齐结果算不出行数时合计也就
+      // 残缺了。只看「被补齐覆盖过的」文件：没被覆盖的文件其可用性已经体现在
+      // baseGroupEditSummary.totalLineStatsAvailable 里，而用 files.every()
+      // 会误伤只报告整轮增删的 provider（Claude CLI 把每个文件都标成不可用，
+      // 合计却是准确的）。
+      totalLineStatsAvailable:
+        baseGroupEditSummary.totalLineStatsAvailable &&
+        baseGroupEditSummary.files.every((file) => {
+          const enriched =
+            enrichedFileCounts[
+              `${file.path}::${file.firstRoundId}::${file.latestRoundId}`
+            ]
+          return !enriched || enriched.lineStatsAvailable
+        }),
+    }
+  }, [baseGroupEditSummary, enrichedFileCounts])
+
+  const groupEditSummaryKey = useMemo(
+    () =>
+      groupEditSummary
+        ? groupEditSummary.entries.map((entry) => entry.toolCallId).join(':')
+        : null,
+    [groupEditSummary],
+  )
+  const effectiveGroupEditSummaryKey = groupEditSummaryKey ?? ''
+
+  return (
+    <div className="yolo-assistant-tool-message-group" ref={containerRef}>
+      {hasMultipleBranches && (
+        <div className="yolo-multi-model-tabs" role="tablist">
+          {branchGroups.map((group) => {
+            const isActive = group.key === resolvedActiveBranchKey
+            const state = getBranchTabState(group.messages)
+            const stateLabel = getBranchStateLabel(state, t)
+            return (
+              <button
+                key={group.key}
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                className={`yolo-multi-model-tab yolo-multi-model-tab--${state}${isActive ? ' is-active' : ''}`}
+                onClick={() => handleBranchSwitch(group.key)}
+                title={`${group.label} · ${stateLabel}`}
+              >
+                <span className="yolo-multi-model-tab__label">
+                  {group.label}
+                </span>
+                <span
+                  className={`yolo-multi-model-tab__status${state === 'completed' ? ' is-icon-only' : ''}`}
+                  title={stateLabel}
+                >
+                  <BranchStateIcon state={state} />
+                  {state !== 'completed' && (
+                    <span className="yolo-multi-model-tab__status-text">
+                      {stateLabel}
+                    </span>
+                  )}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+      <div className="yolo-assistant-group-body">
+        {isEditingGroup ? (
+          <AssistantGroupEditor
+            messages={displayedMessages}
+            onCancel={() => {
+              captureEditLayoutAnchor()
+              onEditCancel()
+            }}
+            onSave={(replacementMessages) => {
+              if (!groupAnchorMessageId) return
+              captureEditLayoutAnchor()
+              onEditSave(groupAnchorMessageId, replacementMessages)
+            }}
+          />
+        ) : (
+          displayedMessages.map((message, messageIndex) => {
+            const renderPlan =
+              message.role === 'assistant'
+                ? messageRenderPlans[messageIndex]
+                : null
+            const isReasoningActive = isReasoningActivityActive({
+              messages: displayedMessages,
+              messageIndex,
+              isRunActive,
+            })
+            const reasoningGenerationState =
+              message.role === 'assistant' && message.reasoning
+                ? isReasoningActive
+                  ? 'streaming'
+                  : message.metadata?.generationState === 'aborted' ||
+                      message.metadata?.generationState === 'error'
+                    ? message.metadata.generationState
+                    : 'completed'
+                : message.role === 'assistant'
+                  ? message.metadata?.generationState
+                  : undefined
+            const shouldShowAssistantToolPreview =
+              renderPlan?.shouldShowAssistantToolPreview ?? false
+            const hostedWebSearchMessage =
+              renderPlan?.hostedWebSearchMessage ?? null
+
+            if (renderPlan?.hidden) {
+              return null
+            }
+
+            // The thinking block right before the answer belongs to the
+            // preceding tool run — fold and unfold it with that run.
+            const boundaryToolRunSegment =
+              toolRunBoundaryByIndex.get(messageIndex)
+            const isReasoningFoldedIntoRun =
+              boundaryToolRunSegment !== undefined &&
+              !expandedToolRunKeys.has(boundaryToolRunSegment.key)
+
+            const renderedMessage =
+              message.role === 'assistant' ? (
+                renderPlan?.visible ? (
+                  <div
+                    key={message.id}
+                    className={`yolo-chat-messages-assistant${
+                      message.content.trim().length > 0
+                        ? ' yolo-assistant-answer-item'
+                        : ''
+                    }${
+                      !isReasoningFoldedIntoRun &&
+                      (message.reasoning ?? '').trim().length > 0
+                        ? ' has-visible-reasoning'
+                        : ''
+                    }`}
+                  >
+                    {!isReasoningFoldedIntoRun &&
+                      (message.reasoning ||
+                        (message.metadata?.generationState === 'streaming' &&
+                          !message.content &&
+                          !message.annotations &&
+                          !message.toolCallRequests?.length)) && (
+                        <AssistantMessageReasoning
+                          reasoning={message.reasoning ?? ''}
+                          conversationId={effectiveConversationId}
+                          messageId={message.id}
+                          isGenerating={
+                            message.metadata?.generationState === 'streaming'
+                          }
+                          hasAnswerContent={message.content.trim().length > 0}
+                          generationState={reasoningGenerationState}
+                          reasoningDurationMs={
+                            message.metadata?.reasoningDurationMs
+                          }
+                          previewLines={
+                            messageIndex === 0
+                              ? LEAD_REASONING_PREVIEW_LINES
+                              : undefined
+                          }
+                        />
+                      )}
+                    {hostedWebSearchMessage && (
+                      <ToolMessage
+                        message={hostedWebSearchMessage}
+                        conversationId={effectiveConversationId}
+                        showRunningFooter={false}
+                        onMessageUpdate={() => {
+                          // 服务端已执行完毕的只读卡片，没有可更新的状态。
+                        }}
+                        onRecoverAnswerUserQuestion={
+                          onRecoverAnswerUserQuestion
+                        }
+                      />
+                    )}
+                    {/* 生成中的正文走 assistant render stream，快照里只有
+                        最近一次结构折回值。因此只要这条消息还在生成就必须挂着
+                        内容叶子——否则第一段流没有订阅者，正文要等到下一个语义
+                        事件才会出现。 */}
+                    {(message.metadata?.generationState === 'streaming' ||
+                      message.content.trim().length > 0 ||
+                      shouldShowAssistantToolPreview) && (
+                      <AssistantMessageContent
+                        messageId={message.id}
+                        conversationId={effectiveConversationId}
+                        content={message.content}
+                        annotations={message.annotations}
+                        sources={message.metadata?.sources}
+                        handleApply={onApply}
+                        isApplying={isApplying}
+                        activeApplyRequestKey={activeApplyRequestKey}
+                        generationState={message.metadata?.generationState}
+                        reasoningDurationMs={
+                          message.metadata?.reasoningDurationMs
+                        }
+                        toolCallRequests={message.toolCallRequests}
+                        showToolCallPreview={shouldShowAssistantToolPreview}
+                        onQuote={onQuoteAssistantSelection}
+                        assistantQuotes={assistantQuotes}
+                        onDeleteQuote={onDeleteAssistantQuote}
+                        enableSelectionQuote={showQuoteAction}
+                      />
+                    )}
+                    {message.annotations && (
+                      <AssistantMessageAnnotations
+                        annotations={message.annotations}
+                      />
+                    )}
+                    {message.metadata?.sources &&
+                      message.metadata.sources.length > 0 && (
+                        <AssistantMessageSources
+                          sources={message.metadata.sources}
+                        />
+                      )}
+                    {message.metadata?.generationState === 'error' &&
+                      message.metadata.errorMessage && (
+                        <AssistantErrorCard
+                          errorMessage={message.metadata.errorMessage}
+                          errorDetail={message.metadata.errorDetail}
+                          onContinue={
+                            continuableErrorMessageIds?.has(message.id) &&
+                            onContinueError &&
+                            !isRunActive
+                              ? () => onContinueError(message.id)
+                              : undefined
+                          }
+                        />
+                      )}
+                  </div>
+                ) : null
+              ) : message.role === 'external_agent_result' ? (
+                <div key={message.id}>
+                  <ToolMessage
+                    message={buildSynthToolMessageFromResult(message)}
+                    conversationId={effectiveConversationId}
+                    showRunningFooter={false}
+                    onMessageUpdate={() => {
+                      // 异步派遣结果是终态消息，UI 内部不会触发 update；
+                      // 万一调到这里也不持久化（result message 有自己的存储路径）。
+                    }}
+                    onRecoverAnswerUserQuestion={onRecoverAnswerUserQuestion}
+                  />
+                </div>
+              ) : message.role === 'subagent_result' ||
+                message.role === 'terminal_command_result' ? null : (
+                <div key={message.id}>
+                  <ToolMessage
+                    message={message}
+                    conversationId={effectiveConversationId}
+                    showRunningFooter={showRunningToolFooter}
+                    terminalCommandResultsByToolCallId={
+                      terminalCommandResultsByToolCallId
+                    }
+                    subagentResultsByToolCallId={subagentResultsByToolCallId}
+                    onMessageUpdate={onToolMessageUpdate}
+                    onToolCallResponseUpdate={onToolCallResponseUpdate}
+                    onRecoverToolCall={onRecoverToolCall}
+                    onRecoverAnswerUserQuestion={onRecoverAnswerUserQuestion}
+                  />
+                </div>
+              )
+
+            const toolRunSegment = toolRunSegmentByIndex.get(messageIndex)
+            if (!toolRunSegment) {
+              return renderedMessage
+            }
+            const isSegmentExpanded =
+              expandedToolRunKeys.has(toolRunSegment.key) ||
+              toolRunSegment.requiresUserAction
+            if (messageIndex !== toolRunSegment.startIndex) {
+              return isSegmentExpanded ? renderedMessage : null
+            }
+            const summaryDisplay = buildToolRunSummaryDisplay(toolRunSegment, t)
+            return (
+              <Fragment key={`tool-run-${toolRunSegment.key}`}>
+                <button
+                  type="button"
+                  className={`yolo-tool-run-summary${
+                    isSegmentExpanded ? ' is-expanded' : ''
+                  }${toolRunSegment.isActive ? ' is-active' : ''}`}
+                  aria-expanded={isSegmentExpanded}
+                  onClick={() => toggleToolRunSegment(toolRunSegment.key)}
+                >
+                  <span className="yolo-tool-run-summary__text">
+                    {summaryDisplay.clauses.map((clause, clauseIndex) => (
+                      <Fragment key={clause.key}>
+                        {clauseIndex > 0 ? summaryDisplay.separator : null}
+                        {clause.node}
+                      </Fragment>
+                    ))}
+                  </span>
+                  {summaryDisplay.stats && (
+                    <span className="yolo-tool-run-summary__stats">
+                      {renderDeltaPair(...summaryDisplay.stats)}
+                    </span>
+                  )}
+                  <ChevronRight
+                    size={14}
+                    className="yolo-tool-run-summary__chevron"
+                  />
+                </button>
+                {isSegmentExpanded ? renderedMessage : null}
+              </Fragment>
+            )
+          })
+        )}
+      </div>
+      {groupEditSummary &&
+        !suppressFooter &&
+        !hasPendingAssistantShell &&
+        !isRunActive && (
+          <AssistantEditSummary
+            summary={groupEditSummary}
+            showUndo={onUndoEditSummary !== undefined}
+            undoingTargetKey={
+              undoingEditSummaryTarget?.startsWith(
+                `${effectiveGroupEditSummaryKey}::`,
+              )
+                ? undoingEditSummaryTarget.slice(
+                    effectiveGroupEditSummaryKey.length + 2,
+                  )
+                : null
+            }
+            onUndo={() => onUndoEditSummary?.(groupEditSummary)}
+            onOpenFile={onOpenEditSummaryFile}
+            onUndoFile={(path) =>
+              onUndoEditSummary?.({
+                ...groupEditSummary,
+                files: groupEditSummary.files.filter(
+                  (file) => file.path === path,
+                ),
+              })
+            }
+          />
+        )}
+      {displayedMessages.length > 0 &&
+        !hasPendingAssistantShell &&
+        !isRunActive &&
+        !suppressFooter && (
+          <div className="yolo-assistant-message-footer">
+            {showInlineInfo && (
+              <LLMResponseInlineInfo messages={footerUsageMessages} />
+            )}
+            <AssistantToolMessageGroupActions
+              messages={displayedMessages}
+              showRetry={showRetryAction}
+              showInsert={showInsertAction}
+              showCopy={showCopyAction}
+              showBranch={showBranchAction}
+              showEdit={showEditAction}
+              showDelete={showDeleteAction}
+              onRetry={
+                !isRunActive && !isEditingGroup
+                  ? () => {
+                      onRetryGroup(
+                        displayedMessages.map((message) => message.id),
+                      )
+                    }
+                  : undefined
+              }
+              onBranch={
+                !isRunActive
+                  ? () => {
+                      onBranchGroup(messages.map((message) => message.id))
+                    }
+                  : undefined
+              }
+              onEdit={
+                groupAnchorMessageId && !isRunActive
+                  ? handleEditStart
+                  : undefined
+              }
+              onDelete={
+                !isRunActive
+                  ? () => {
+                      onDeleteGroup(
+                        displayedMessages.map((message) => message.id),
+                      )
+                    }
+                  : undefined
+              }
+              isEditing={isEditingGroup}
+              isDisabled={isRunActive}
+            />
+          </div>
+        )}
+    </div>
+  )
+}
+
+export default memo(AssistantToolMessageGroupItem)

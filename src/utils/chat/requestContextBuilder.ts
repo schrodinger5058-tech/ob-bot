@@ -1,0 +1,2745 @@
+import type { App, TFile, TFolder } from 'obsidian'
+import { normalizePath } from 'obsidian'
+
+import { editorStateToPlainText } from '../../components/chat-view/chat-input/utils/editor-state-to-plain-text'
+import type { QueryProgressState } from '../../components/chat-view/QueryProgress'
+import type { ChatContextPolicy } from '../../core/agent/chat-runtime-profiles'
+import {
+  buildCompactionResumeMessage,
+  buildCompactionSummaryMessage,
+} from '../../core/agent/compaction'
+import type {
+  SystemPromptSnapshot,
+  SystemPromptSnapshotStore,
+} from '../../core/agent/systemPromptSnapshotStore'
+import { toModelToolName } from '../../core/mcp/localFileTools'
+import {
+  readMemoryIndexes,
+  resolveMemoryDirPaths,
+  resolveMemoryIndexPaths,
+} from '../../core/memory/memoryStore'
+import { MODULE_RENDERED_FILE_SOURCE_MAX_BYTES } from '../../core/modules/moduleFileTextRendererRegistry'
+import type { YoloModuleFileTextRendererV1 } from '../../core/modules/types'
+import {
+  getProjectInstructionsSection,
+  resolveProjectInstructionFilePaths,
+} from '../../core/project-instructions'
+import {
+  type LiteSkillScope,
+  getLiteSkillDocument,
+  listLiteSkillEntries,
+} from '../../core/skills/liteSkills'
+import {
+  isSkillEnabledForAssistant,
+  resolveAssistantSkillPolicy,
+} from '../../core/skills/skillPolicy'
+import { readPromptSnapshotEntries } from '../../database/json/chat/promptSnapshotStore'
+import type { YoloSettings } from '../../settings/schema/setting.types'
+import type { AssistantWorkspaceScope } from '../../types/assistant.types'
+import type {
+  ChatAssistantMessage,
+  ChatConversationCompactionLike,
+  ChatExternalAgentResultMessage,
+  ChatMessage,
+  ChatSelectedSkill,
+  ChatSubagentResultMessage,
+  ChatTerminalCommandResultMessage,
+  ChatToolMessage,
+  ChatUserMessage,
+} from '../../types/chat'
+import {
+  getCompactionRetainedStartIndex,
+  getLatestChatConversationCompaction,
+} from '../../types/chat'
+import type { ChatModel } from '../../types/chat-model.types'
+import type { ContentPart, RequestMessage } from '../../types/llm/request'
+import type {
+  Mentionable,
+  MentionableAssistantQuote,
+  MentionableBlock,
+  MentionableFile,
+  MentionableFolder,
+  MentionableImage,
+  MentionableLocalFolder,
+  MentionableOffice,
+  MentionablePDF,
+  MentionableTextAttachment,
+  MentionableWebSelection,
+} from '../../types/mentionable'
+import type { ToolCallRequest } from '../../types/tool-call.types'
+import {
+  createCompleteToolCallArguments,
+  getToolCallArgumentsObject,
+} from '../../types/tool-call.types'
+import { ToolCallResponseStatus } from '../../types/tool-call.types'
+import { stableStringify } from '../json/stableStringify'
+import { collectWikilinkPaths } from '../llm/annotate-wikilinks'
+import { expandPromptEmbeds } from '../llm/expand-prompt-embeds'
+import { isImageTFile, tFileToImageDataUrl } from '../llm/image'
+import {
+  chatModelSupportsPdf,
+  chatModelSupportsVision,
+} from '../llm/model-modalities'
+import { getNestedFiles, readTFileContent } from '../obsidian'
+import {
+  PDF_READ_MAX_BYTES,
+  PDF_READ_MAX_PAGES,
+  extractPdfText,
+  extractPdfTextFromBase64,
+} from '../pdf/extractPdfText'
+import { prefixTimeContext } from '../prompt/timeContext'
+
+import { renderInjectedContext } from './contextual-injections'
+import { serializeExternalAgentResultToUserMessage } from './externalAgentResultSerializer'
+import { serializeSubagentResultToUserMessage } from './subagentResultSerializer'
+import { serializeTerminalCommandResultToUserMessage } from './terminalCommandResultSerializer'
+import {
+  filterEmptyAssistantMessages,
+  filterRequestMessagesByToolBoundary,
+} from './tool-boundary'
+import {
+  PRUNED_TOOL_RESULT_PLACEHOLDER,
+  collectContextPrunedToolCallIds,
+  isContextPrunedToolCall,
+} from './tool-context-pruning'
+
+/** Regex matching the `<user_selected_skills>...</user_selected_skills>` block
+ * produced by `buildSelectedSkillsPrompt`. Used by the breakdown estimator to
+ * avoid double-counting selected-skill text in the conversation bucket. */
+const USER_SELECTED_SKILLS_BLOCK_RE =
+  /<user_selected_skills>[\s\S]*?<\/user_selected_skills>\n?/g
+
+const stripUserSelectedSkillsFromString = (text: string): string =>
+  text.replace(USER_SELECTED_SKILLS_BLOCK_RE, '')
+
+const escapeXmlAttr = (raw: string): string =>
+  raw
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+
+const escapeXmlText = (raw: string): string =>
+  raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+/** Stable signature for the `<previously-loaded-tools>` compaction disclosure
+ * message. The disclosure is built by `buildCompactionDisclosureInjection` and
+ * always starts with this exact tag — used by section assembly to attribute it
+ * to the Tools bucket without depending on object identity (which can be
+ * broken by downstream message-transforming passes). */
+const COMPACTION_DISCLOSURE_PREFIX = '<previously-loaded-tools>'
+
+const messageStartsWith = (
+  message: RequestMessage,
+  prefix: string,
+): boolean => {
+  if (typeof message.content === 'string') {
+    return message.content.startsWith(prefix)
+  }
+  if (Array.isArray(message.content) && message.content.length > 0) {
+    const head = message.content[0]
+    if (head.type === 'text') return head.text.startsWith(prefix)
+  }
+  return false
+}
+
+/** Pull every `<user_selected_skills>...</user_selected_skills>` block out of a
+ * RequestMessage. Returns the extracted block texts (joined with `\n\n` is
+ * exactly what they contributed to the original message). The regex is global
+ * so multiple blocks in one message are all captured. */
+const extractUserSelectedSkillsFromMessage = (
+  message: RequestMessage,
+): string[] => {
+  const matches: string[] = []
+  const collectFromText = (text: string): void => {
+    const re = new RegExp(USER_SELECTED_SKILLS_BLOCK_RE.source, 'g')
+    let m: RegExpExecArray | null
+    while ((m = re.exec(text)) !== null) {
+      // Trim trailing newline that the regex captures so each extracted block
+      // is the bare XML — token count parity comes from emitting them in a
+      // dedicated section, not from preserving the separator.
+      matches.push(m[0].replace(/\n$/, ''))
+    }
+  }
+  if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (part.type === 'text') collectFromText(part.text)
+    }
+  } else if (typeof message.content === 'string') {
+    collectFromText(message.content)
+  }
+  return matches
+}
+
+/**
+ * Return a structurally-cloned `RequestMessage` with any
+ * `<user_selected_skills>` blocks removed from its text content. Used only by
+ * the breakdown estimator — the LLM request still carries the original block.
+ */
+const stripUserSelectedSkillsFromMessage = (
+  message: RequestMessage,
+): RequestMessage => {
+  // Only user messages can carry `ContentPart[]`; other roles are string-only.
+  if (message.role === 'user' && Array.isArray(message.content)) {
+    let mutated = false
+    const nextParts: ContentPart[] = message.content.map((part) => {
+      if (part.type === 'text') {
+        const next = stripUserSelectedSkillsFromString(part.text)
+        if (next !== part.text) {
+          mutated = true
+          return { ...part, text: next }
+        }
+      }
+      return part
+    })
+    if (!mutated) return message
+    return { ...message, content: nextParts }
+  }
+  if (typeof message.content === 'string') {
+    const next = stripUserSelectedSkillsFromString(message.content)
+    if (next === message.content) return message
+    return { ...message, content: next }
+  }
+  return message
+}
+
+type RequestContextBuilderOptions = {
+  includeSkills?: boolean
+  /**
+   * Optional per-conversation system-prompt snapshot store. When omitted the
+   * builder degrades to computing the system prompt fresh on every call
+   * (current behavior), which keeps tests and non-injected callers unaffected.
+   */
+  systemPromptSnapshotStore?: SystemPromptSnapshotStore
+  getPromptSourceRevision?: () => number
+  promptSourcePathsCallback?: (paths: Set<string>) => void
+  /**
+   * Looks up the module that owns a file extension's model-facing text form
+   * (`ModuleFileTextRendererRegistry.resolve`, forwarded here the same way
+   * `fs_read` receives it via `ToolContext`). Used by the @mention `full`
+   * mode's file inlining (`buildFullMentionedFilesPrompt`) so a claimed
+   * extension like `.yoloboard` renders to its summary instead of dumping raw
+   * bytes into the prompt. Omitted in tests and other callers that don't wire up modules —
+   * behaves exactly like "nothing claimed this extension".
+   */
+  resolveModuleFileTextRenderer?: (
+    extension: string,
+  ) => YoloModuleFileTextRendererV1 | null
+}
+
+/**
+ * Snapshot lookup mode, set explicitly by each caller (never inferred from the
+ * method name — `generateRequestMessages` serves both real requests and
+ * compaction estimates):
+ * - `create`: real request path. A miss builds and writes the snapshot; later
+ *   iterations / turns reuse it via fingerprint hit.
+ * - `reuse`: estimate / breakdown path. A hit is reused; a miss is computed
+ *   fresh and NOT written, so estimates never freeze the real-request prompt.
+ */
+export type SystemPromptSnapshotMode = 'create' | 'reuse'
+
+/**
+ * A semantic slice of the upcoming LLM request. Used by the UI to break down
+ * prompt-token usage by bucket without leaking string-concat order from the
+ * builder. The conversation/system content reaching the model is always
+ * derived from these sections, so any new prompt piece is automatically
+ * reflected in the breakdown.
+ */
+export type PromptSectionBucket =
+  | 'system'
+  | 'tools'
+  | 'rules'
+  | 'skills'
+  | 'memory'
+  | 'conversation'
+  | 'reasoning'
+
+export type PromptSection = {
+  bucket: PromptSectionBucket
+  id: string
+  /** String for system-prompt fragments / tool entries; structured value for
+   * request messages so token estimation sees the same JSON the LLM will. */
+  content: unknown
+}
+
+/** Ordered system-prompt-side sections produced by the builder.
+ * Their string content joined with `\n\n` is the system message content.
+ * Exported so the per-conversation snapshot store can type its payload
+ * against the same shape without duplicating the definition. */
+export type SystemPromptSections = PromptSection[]
+
+type MarkdownAtxHeading = {
+  level: number
+  line: number
+  text: string
+}
+
+type MentionedFileProperty = {
+  key: string
+  value: string
+}
+
+type MentionedFileContextEntry = {
+  file: TFile
+  source: 'file' | 'folder'
+}
+
+const MAX_MENTIONED_FILE_OUTLINES = 10
+
+/**
+ * Strip image_url content parts from messages when the target model does not
+ * support vision input. Each removed image part is replaced with a placeholder
+ * text part so message structure remains valid. String-content messages are
+ * left untouched.
+ */
+export function stripUnsupportedImages(
+  messages: RequestMessage[],
+  chatModel: ChatModel | null | undefined,
+): RequestMessage[] {
+  if (chatModelSupportsVision(chatModel)) {
+    return messages
+  }
+
+  return messages.map((message) => {
+    // Only user messages can carry ContentPart[] content — other roles use string.
+    if (message.role !== 'user' || !Array.isArray(message.content)) {
+      return message
+    }
+
+    const stripped: ContentPart[] = message.content.flatMap((part) => {
+      if (part.type === 'image_url') {
+        return [{ type: 'text' as const, text: '[图片已省略：模型不支持视觉]' }]
+      }
+      return [part]
+    })
+
+    return { ...message, content: stripped }
+  })
+}
+
+/**
+ * Render the canonical `<document>` block for an attached document mentionable
+ * (PDF text fallback or Office docs). Native PDF modality goes through the
+ * `document` content part path and skips this helper. All attached documents
+ * are tagged `source="user-attachment"` so the model knows the content is
+ * user-uploaded and is not addressable by `fs_read`.
+ */
+function renderAttachedDocumentBlock({
+  name,
+  kind,
+  text,
+  pageCount,
+  truncated,
+}: {
+  name: string
+  kind:
+    | 'pdf'
+    | 'docx'
+    | 'pptx'
+    | 'xlsx'
+    | 'txt'
+    | 'md'
+    | 'csv'
+    | 'tsv'
+    | 'json'
+    | 'yaml'
+    | 'yml'
+    | 'xml'
+    | 'log'
+  text: string
+  pageCount?: number
+  /** Set when the fallback extractor itself had to truncate (FALLBACK_MAX_PAGES). */
+  truncated?: boolean
+}): string {
+  const attrs = [
+    `name="${escapeXmlAttr(name)}"`,
+    `type="${kind}"`,
+    'source="user-attachment"',
+  ]
+  if (pageCount !== undefined) attrs.push(`pages="${pageCount}"`)
+  if (truncated) attrs.push('truncated="true"')
+  return `<document ${attrs.join(' ')}>\n${text}\n</document>\n\n`
+}
+
+/**
+ * A tool-result image still pointing at `cache://` after history hydration had
+ * no cached copy on this device — evicted, cleared, or never cached here
+ * (history syncs, the local cache does not). It is not an image a provider can
+ * fetch, so the model is told instead. The conversation itself keeps the ref:
+ * another device may still resolve it.
+ */
+const UNRESOLVED_CACHED_IMAGE_TEXT =
+  '[Image unavailable: its cached copy is not on this device.]'
+
+const replaceUnresolvedCachedImage = (part: ContentPart): ContentPart =>
+  part.type === 'image_url' && part.image_url.url.startsWith('cache://')
+    ? { type: 'text', text: UNRESOLVED_CACHED_IMAGE_TEXT }
+    : part
+
+/**
+ * Convert `document` content parts to plain text for models that don't
+ * advertise the `pdf` modality. Native-PDF-capable models leave document parts
+ * untouched. This is the modality gate — adapters never have to handle a
+ * document part for a non-pdf model.
+ *
+ * Text extraction goes through the local PDF text cache keyed by content
+ * hash: the upload site already wrote pages there during `fileToMentionablePDF`,
+ * so the common case is a pure cache hit (no pdfjs invocation per turn). Cache
+ * miss (e.g. legacy mentionable, or upload-time write failure) falls back to a
+ * fresh extraction and writes the result for next time.
+ */
+export async function prepareDocumentsForModel(
+  messages: RequestMessage[],
+  chatModel: ChatModel | null | undefined,
+  context: { app: App; settings: YoloSettings },
+): Promise<RequestMessage[]> {
+  if (chatModelSupportsPdf(chatModel)) {
+    return messages
+  }
+
+  const next: RequestMessage[] = []
+  for (const message of messages) {
+    if (message.role !== 'user' || !Array.isArray(message.content)) {
+      next.push(message)
+      continue
+    }
+
+    const transformed: ContentPart[] = []
+    for (const part of message.content) {
+      if (part.type !== 'document') {
+        transformed.push(part)
+        continue
+      }
+      try {
+        const { pages } = await extractPdfTextFromBase64(
+          context.app,
+          part.data,
+          {
+            useCache: true,
+            sourceLabel: `upload:${part.name}`,
+          },
+        )
+        const text = pages
+          .map(({ page, text }) => `--- Page ${page} ---\n${text}`)
+          .join('\n\n')
+        transformed.push({
+          type: 'text',
+          text: renderAttachedDocumentBlock({
+            name: part.name,
+            kind: 'pdf',
+            text,
+            pageCount: part.pageCount ?? pages.length,
+          }),
+        })
+      } catch (error) {
+        console.warn(
+          '[YOLO] Failed to extract PDF text for non-native model, dropping document part',
+          part.name,
+          error,
+        )
+        transformed.push({
+          type: 'text',
+          text: `[PDF "${part.name}" 无法解析为文本，已忽略]`,
+        })
+      }
+    }
+
+    next.push({ ...message, content: transformed })
+  }
+
+  return next
+}
+
+type MentionContextMode = 'light' | 'full'
+
+export function extractMarkdownAtxHeadings(
+  content: string,
+): MarkdownAtxHeading[] {
+  const headings: MarkdownAtxHeading[] = []
+  const lines = content.split('\n')
+  let activeFenceMarker: '```' | '~~~' | null = null
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? ''
+    const trimmedLine = line.trim()
+
+    if (activeFenceMarker) {
+      if (trimmedLine.startsWith(activeFenceMarker)) {
+        activeFenceMarker = null
+      }
+      continue
+    }
+
+    if (trimmedLine.startsWith('```')) {
+      activeFenceMarker = '```'
+      continue
+    }
+
+    if (trimmedLine.startsWith('~~~')) {
+      activeFenceMarker = '~~~'
+      continue
+    }
+
+    const match = /^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/.exec(trimmedLine)
+    if (!match) {
+      continue
+    }
+
+    const marker = match[1]
+    const text = match[2]?.trim()
+    if (!marker || !text) {
+      continue
+    }
+
+    headings.push({
+      level: marker.length,
+      line: index + 1,
+      text,
+    })
+  }
+
+  return headings
+}
+
+function formatMentionedFilePropertyValue(value: unknown): string | null {
+  if (value === null) {
+    return 'null'
+  }
+
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint'
+  ) {
+    return String(value)
+  }
+
+  if (Array.isArray(value) || typeof value === 'object') {
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return null
+    }
+  }
+
+  return null
+}
+
+function getMentionedFileProperties(
+  frontmatter: Record<string, unknown> | null | undefined,
+): MentionedFileProperty[] {
+  if (!frontmatter) {
+    return []
+  }
+
+  return Object.entries(frontmatter)
+    .filter(([key]) => key !== 'position')
+    .map(([key, value]) => {
+      const formattedValue = formatMentionedFilePropertyValue(value)
+      if (!formattedValue) {
+        return null
+      }
+
+      return {
+        key,
+        value: formattedValue,
+      }
+    })
+    .filter((property): property is MentionedFileProperty => property !== null)
+}
+
+export class RequestContextBuilder {
+  private app: App
+  private settings: YoloSettings
+  private includeSkills: boolean
+  private systemPromptSnapshotStore?: SystemPromptSnapshotStore
+  private getPromptSourceRevision?: () => number
+  private promptSourcePathsCallback?: (paths: Set<string>) => void
+  private resolveModuleFileTextRenderer?: (
+    extension: string,
+  ) => YoloModuleFileTextRendererV1 | null
+
+  constructor(
+    app: App,
+    settings: YoloSettings,
+    options?: RequestContextBuilderOptions,
+  ) {
+    this.app = app
+    this.settings = settings
+    this.includeSkills = options?.includeSkills ?? true
+    this.systemPromptSnapshotStore = options?.systemPromptSnapshotStore
+    this.getPromptSourceRevision = options?.getPromptSourceRevision
+    this.promptSourcePathsCallback = options?.promptSourcePathsCallback
+    this.resolveModuleFileTextRenderer = options?.resolveModuleFileTextRenderer
+  }
+
+  private getMentionContextMode(): MentionContextMode {
+    return this.settings.chatOptions?.mentionContextMode ?? 'light'
+  }
+
+  /**
+   * Resolve the assistant referenced by `settings.currentAssistantId`.
+   * Returns null when no assistant is selected or the selected id is not found,
+   * so callers can treat both cases as "no assistant".
+   */
+  private getCurrentAssistant() {
+    const currentAssistantId = this.settings.currentAssistantId
+    if (!currentAssistantId) return null
+    const assistants = this.settings.assistants ?? []
+    return assistants.find((a) => a.id === currentAssistantId) ?? null
+  }
+
+  public async generateRequestMessages(args: {
+    messages: ChatMessage[]
+    hasTools?: boolean
+    hasOnDemandTools?: boolean
+    deferredToolCatalogText?: string
+    model: ChatModel
+    conversationId: string
+    compaction?: ChatConversationCompactionLike | null
+    runtimeModePrompt?: string
+    /** Max's environment section — see `ChatModeRuntime.modeEnvironmentPrompt`. */
+    modeEnvironmentPrompt?: string
+    /** Module chat mode persona — see `ChatContextPolicy`. */
+    modePersonaPrompt?: string
+    modePersonaModuleId?: string
+    /** Full running mode id — scopes skill resolution to the mode's own
+     * declared skills. See `ChatModeRuntime.moduleChatModeId`. */
+    moduleChatModeId?: string
+    contextPolicy?: ChatContextPolicy
+    systemPromptOverride?: string
+    systemPromptSnapshotMode: SystemPromptSnapshotMode
+  }): Promise<RequestMessage[]> {
+    const { requestMessages } = await this.assembleRequest(args)
+    return requestMessages
+  }
+
+  /**
+   * Shared pipeline for `generateRequestMessages` and
+   * `generateRequestSections`. Compiles the user message, reads snapshots,
+   * builds the system prompt, and strips/preps
+   * documents for the target model — all in one pass so the two public APIs
+   * never duplicate I/O (memory files / project instructions / skill docs).
+   */
+  private async assembleRequest({
+    messages,
+    hasTools = false,
+    hasOnDemandTools = false,
+    deferredToolCatalogText,
+    model: _model,
+    conversationId,
+    compaction,
+    runtimeModePrompt,
+    modeEnvironmentPrompt,
+    modePersonaPrompt,
+    modePersonaModuleId,
+    moduleChatModeId,
+    contextPolicy,
+    systemPromptOverride,
+    systemPromptSnapshotMode,
+  }: {
+    messages: ChatMessage[]
+    hasTools?: boolean
+    hasOnDemandTools?: boolean
+    deferredToolCatalogText?: string
+    model: ChatModel
+    conversationId: string
+    compaction?: ChatConversationCompactionLike | null
+    runtimeModePrompt?: string
+    modeEnvironmentPrompt?: string
+    modePersonaPrompt?: string
+    modePersonaModuleId?: string
+    /** Full running mode id — scopes skill resolution to the mode's own
+     * declared skills. See `ChatModeRuntime.moduleChatModeId`. */
+    moduleChatModeId?: string
+    contextPolicy?: ChatContextPolicy
+    systemPromptOverride?: string
+    systemPromptSnapshotMode: SystemPromptSnapshotMode
+  }): Promise<{
+    requestMessages: RequestMessage[]
+    systemSections: SystemPromptSections
+  }> {
+    if (messages.length === 0) {
+      throw new Error('No messages provided')
+    }
+
+    const skillScope: LiteSkillScope | undefined = moduleChatModeId
+      ? { moduleChatModeId }
+      : undefined
+
+    const compiledMessages = [...messages]
+
+    // Only compile the latest user message when needed.
+    // Historical messages without promptContent should be replayed from
+    // lightweight snapshots/fallbacks to avoid expensive full-history rebuilds.
+    let lastUserMessageIndex = -1
+    for (let i = compiledMessages.length - 1; i >= 0; --i) {
+      if (compiledMessages[i].role === 'user') {
+        lastUserMessageIndex = i
+        break
+      }
+    }
+    if (lastUserMessageIndex === -1) {
+      throw new Error('No user messages found')
+    }
+
+    const lastUserMessage = compiledMessages[
+      lastUserMessageIndex
+    ] as ChatUserMessage
+    if (!lastUserMessage.promptContent) {
+      const { promptContent } = await this.compileUserMessagePrompt({
+        message: lastUserMessage,
+        scope: skillScope,
+      })
+      compiledMessages[lastUserMessageIndex] = {
+        ...lastUserMessage,
+        promptContent,
+      }
+    }
+
+    const snapshotEntries = await readPromptSnapshotEntries({
+      app: this.app,
+      conversationId,
+      settings: this.settings,
+    })
+
+    for (let i = 0; i < compiledMessages.length; i += 1) {
+      if (i === lastUserMessageIndex) {
+        continue
+      }
+
+      const message = compiledMessages[i]
+      if (message?.role !== 'user' || message.promptContent) {
+        continue
+      }
+
+      const snapshotHash = message.snapshotRef?.hash
+      if (snapshotHash && snapshotEntries[snapshotHash]) {
+        continue
+      }
+
+      if (!this.requiresSnapshotRebuild(message)) {
+        continue
+      }
+
+      const { promptContent } = await this.compileUserMessagePrompt({
+        message,
+        scope: skillScope,
+      })
+      compiledMessages[i] = {
+        ...message,
+        promptContent,
+        snapshotRef: undefined,
+      }
+    }
+
+    const override = systemPromptOverride?.trim()
+    const { systemSections, systemContent } = override
+      ? {
+          systemSections: [
+            {
+              bucket: 'system' as const,
+              id: 'system.subagent-override',
+              content: override,
+            },
+          ],
+          systemContent: override,
+        }
+      : await this.resolveSystemPromptSnapshot({
+          conversationId,
+          hasTools,
+          hasOnDemandTools,
+          deferredToolCatalogText,
+          compaction,
+          runtimeModePrompt,
+          modeEnvironmentPrompt,
+          modePersonaPrompt,
+          modePersonaModuleId,
+          moduleChatModeId,
+          contextPolicy,
+          mode: systemPromptSnapshotMode,
+        })
+    const systemMessage: RequestMessage = {
+      role: 'system',
+      content: systemContent,
+    }
+
+    const compactionDisclosureMessage =
+      this.buildCompactionDisclosureInjection(compaction)
+
+    const baseRequestMessages: RequestMessage[] = [
+      systemMessage,
+      ...(compactionDisclosureMessage ? [compactionDisclosureMessage] : []),
+      ...(await this.getChatHistoryMessages({
+        messages: compiledMessages,
+        snapshotEntries,
+        compaction,
+        scope: skillScope,
+        modelId: _model.id,
+      })),
+    ]
+
+    const requestMessages = await prepareDocumentsForModel(
+      stripUnsupportedImages(baseRequestMessages, _model),
+      _model,
+      { app: this.app, settings: this.settings },
+    )
+
+    return {
+      requestMessages,
+      systemSections,
+    }
+  }
+
+  /**
+   * Generate the breakdown of the upcoming LLM request into typed sections.
+   * Shares the full assembly pipeline with `generateRequestMessages` — there
+   * is no redundant memory / project-instructions / skill I/O.
+   *
+   * `requestTools` should be the same value that will be sent in the request
+   * (post `selectAllowedTools` filtering); each entry becomes a `tools`
+   * section so the UI can attribute its tokens correctly.
+   */
+  public async generateRequestSections(args: {
+    messages: ChatMessage[]
+    hasTools?: boolean
+    hasOnDemandTools?: boolean
+    deferredToolCatalogText?: string
+    model: ChatModel
+    conversationId: string
+    compaction?: ChatConversationCompactionLike | null
+    runtimeModePrompt?: string
+    modeEnvironmentPrompt?: string
+    modePersonaPrompt?: string
+    modePersonaModuleId?: string
+    /** Full running mode id — scopes skill resolution to the mode's own
+     * declared skills. See `ChatModeRuntime.moduleChatModeId`. */
+    moduleChatModeId?: string
+    contextPolicy?: ChatContextPolicy
+    requestTools?: unknown[] | undefined
+    systemPromptSnapshotMode: SystemPromptSnapshotMode
+  }): Promise<PromptSection[]> {
+    const { requestMessages, systemSections } = await this.assembleRequest(args)
+
+    const sections: PromptSection[] = []
+    sections.push(...systemSections)
+
+    // Tools — emit one section per tool so the UI can sum them and the cache
+    // key reflects each tool individually (toggling one tool changes hash).
+    if (args.requestTools && args.requestTools.length > 0) {
+      for (let i = 0; i < args.requestTools.length; i += 1) {
+        const tool = args.requestTools[i]
+        const toolName =
+          tool &&
+          typeof tool === 'object' &&
+          'function' in tool &&
+          tool.function &&
+          typeof tool.function === 'object' &&
+          'name' in tool.function &&
+          typeof (tool.function as { name?: unknown }).name === 'string'
+            ? (tool.function as { name: string }).name
+            : `tool-${i}`
+        sections.push({
+          bucket: 'tools',
+          id: `tools.${toolName}`,
+          content: tool,
+        })
+      }
+    }
+
+    // Walk request messages. Three carve-outs:
+    //   1. Skip the system message (already emitted via systemSections).
+    //   2. Detect the `<previously-loaded-tools>` compaction disclosure by
+    //      content prefix (not identity — downstream passes may rebuild
+    //      the message object) and emit it under the Tools bucket.
+    //   3. Pull every `<user_selected_skills>` block out via regex and emit
+    //      each one as a separate Skills section; strip them from the message
+    //      so the same text isn't double-counted under Conversation. Extracting
+    //      from the actually-built messages covers historical user messages
+    //      too and avoids a redundant `buildSelectedSkillsPrompt` call.
+    for (let i = 0; i < requestMessages.length; i += 1) {
+      const msg = requestMessages[i]
+      if (msg.role === 'system') continue
+
+      if (messageStartsWith(msg, COMPACTION_DISCLOSURE_PREFIX)) {
+        sections.push({
+          bucket: 'tools',
+          id: 'tools.compaction-disclosure',
+          content: msg,
+        })
+        continue
+      }
+
+      // Only user messages can carry a `<user_selected_skills>` block — the
+      // generator (`buildSelectedSkillsPrompt`) only emits it into user
+      // content. Skipping other roles prevents assistant / tool messages that
+      // happen to mention the tag literally from being mis-attributed.
+      const skillsBlocks =
+        msg.role === 'user' ? extractUserSelectedSkillsFromMessage(msg) : []
+      for (let s = 0; s < skillsBlocks.length; s += 1) {
+        sections.push({
+          bucket: 'skills',
+          id: `skills.user-selected.${i}.${s}`,
+          content: skillsBlocks[s],
+        })
+      }
+
+      const stripped =
+        skillsBlocks.length > 0 ? stripUserSelectedSkillsFromMessage(msg) : msg
+
+      // Carve out assistant reasoning (chain-of-thought) into its own bucket so
+      // the popover can show how much of the context is spent on prior-turn
+      // thinking. Reasoning is already a separate field on RequestMessage, so
+      // stripping it from the conversation section preserves the total token
+      // count (split ≈ original).
+      let conversationContent: RequestMessage = stripped
+      if (
+        stripped.role === 'assistant' &&
+        typeof stripped.reasoning === 'string' &&
+        stripped.reasoning.length > 0
+      ) {
+        sections.push({
+          bucket: 'reasoning',
+          id: `reasoning.${i}`,
+          content: { reasoning: stripped.reasoning },
+        })
+        const { reasoning: _reasoning, ...rest } = stripped
+        conversationContent = rest
+      }
+
+      sections.push({
+        bucket: 'conversation',
+        id: `conversation.${i}.${msg.role}`,
+        content: conversationContent,
+      })
+    }
+
+    return sections
+  }
+
+  /**
+   * Convert a slice of newly-produced turn messages (assistant + tool, e.g.
+   * the `context_compact` call and its result) into provider-ready
+   * `RequestMessage[]`, reusing the exact same parsing + tool-boundary
+   * filtering as the main request pipeline. Synchronous: turn messages never
+   * contain user content that requires snapshot/I-O resolution.
+   *
+   * Used by the compaction bypass to append the in-flight turn onto the
+   * cache-warm prefix without re-running `generateRequestMessages`.
+   */
+  public parseTurnMessagesToRequestMessages(
+    messages: ChatMessage[],
+    modelId: string,
+  ): RequestMessage[] {
+    const requestMessages: RequestMessage[] = []
+    for (const message of messages) {
+      if (message.role === 'assistant') {
+        requestMessages.push(
+          ...this.parseAssistantMessage({ message, modelId }),
+        )
+        continue
+      }
+      if (message.role === 'tool') {
+        requestMessages.push(...this.parseToolMessage({ message }))
+      }
+    }
+    return filterRequestMessagesByToolBoundary(
+      filterEmptyAssistantMessages(requestMessages),
+    )
+  }
+
+  private async getChatHistoryMessages({
+    messages,
+    snapshotEntries,
+    compaction,
+    scope,
+    modelId,
+  }: {
+    messages: ChatMessage[]
+    snapshotEntries: Record<string, string | ContentPart[]>
+    compaction?: ChatConversationCompactionLike | null
+    scope?: LiteSkillScope
+    /** The model this request goes to — see `parseAssistantMessage`. */
+    modelId: string
+  }): Promise<RequestMessage[]> {
+    const requestMessages: RequestMessage[] = []
+    const prunedToolCallIds = collectContextPrunedToolCallIds(messages)
+
+    const latestCompaction = getLatestChatConversationCompaction(compaction)
+
+    if (latestCompaction) {
+      const retainedStartIndex = getCompactionRetainedStartIndex(
+        messages,
+        latestCompaction,
+      )
+
+      if (retainedStartIndex !== null) {
+        requestMessages.push(buildCompactionSummaryMessage(latestCompaction))
+        const compactContextMessages = messages.slice(retainedStartIndex)
+
+        for (const message of compactContextMessages) {
+          if (message.role === 'user') {
+            requestMessages.push({
+              role: 'user',
+              content: await this.getUserMessageContent({
+                message,
+                snapshotEntries,
+                scope,
+              }),
+            })
+            continue
+          }
+
+          if (message.role === 'assistant') {
+            requestMessages.push(
+              ...this.parseAssistantMessage({ message, modelId }),
+            )
+            continue
+          }
+
+          if (message.role === 'external_agent_result') {
+            requestMessages.push(this.parseExternalAgentResultMessage(message))
+            continue
+          }
+
+          if (message.role === 'subagent_result') {
+            requestMessages.push(this.parseSubagentResultMessage(message))
+            continue
+          }
+
+          if (message.role === 'terminal_command_result') {
+            requestMessages.push(
+              this.parseTerminalCommandResultMessage(message),
+            )
+            continue
+          }
+
+          requestMessages.push(
+            ...this.parseToolMessage({ message, prunedToolCallIds }),
+          )
+        }
+
+        if (
+          !compactContextMessages.some((message) => message.role === 'user')
+        ) {
+          requestMessages.push(buildCompactionResumeMessage())
+        }
+
+        return filterRequestMessagesByToolBoundary(
+          filterEmptyAssistantMessages(requestMessages),
+        )
+      }
+    }
+
+    for (const message of messages) {
+      if (message.role === 'user') {
+        requestMessages.push({
+          role: 'user',
+          content: await this.getUserMessageContent({
+            message,
+            snapshotEntries,
+            scope,
+          }),
+        })
+        continue
+      }
+
+      if (message.role === 'assistant') {
+        requestMessages.push(
+          ...this.parseAssistantMessage({ message, modelId }),
+        )
+        continue
+      }
+
+      if (message.role === 'external_agent_result') {
+        requestMessages.push(this.parseExternalAgentResultMessage(message))
+        continue
+      }
+
+      if (message.role === 'subagent_result') {
+        requestMessages.push(this.parseSubagentResultMessage(message))
+        continue
+      }
+
+      if (message.role === 'terminal_command_result') {
+        requestMessages.push(this.parseTerminalCommandResultMessage(message))
+        continue
+      }
+
+      requestMessages.push(
+        ...this.parseToolMessage({ message, prunedToolCallIds }),
+      )
+    }
+
+    return filterRequestMessagesByToolBoundary(
+      filterEmptyAssistantMessages(requestMessages),
+    )
+  }
+
+  /** The message body followed by the context stamped on it. */
+  private async getUserMessageContent(args: {
+    message: ChatUserMessage
+    snapshotEntries: Record<string, string | ContentPart[]>
+    scope?: LiteSkillScope
+  }): Promise<string | ContentPart[]> {
+    const body = await this.getUserMessageBody(args)
+    const context = args.message.injectedContext
+    if (!context || context.length === 0) {
+      return body
+    }
+    return [
+      ...(typeof body === 'string'
+        ? [{ type: 'text' as const, text: body }]
+        : body),
+      ...(await renderInjectedContext(context, this.app)),
+    ]
+  }
+
+  private async getUserMessageBody({
+    message,
+    snapshotEntries,
+    scope,
+  }: {
+    message: ChatUserMessage
+    snapshotEntries: Record<string, string | ContentPart[]>
+    scope?: LiteSkillScope
+  }): Promise<string | ContentPart[]> {
+    const withTimeContext = (
+      content: string | ContentPart[],
+    ): string | ContentPart[] =>
+      message.timeContext
+        ? prefixTimeContext(content, message.timeContext)
+        : content
+
+    // 注意:用 != null 而非 truthy 判断,空串 promptContent 也算「已编译」,
+    // 不应误触下方的 fallback 重新计算。
+    if (message.promptContent != null) {
+      return withTimeContext(message.promptContent)
+    }
+
+    if (message.snapshotRef?.hash) {
+      const snapshotContent = snapshotEntries[message.snapshotRef.hash]
+      if (snapshotContent) {
+        return withTimeContext(snapshotContent)
+      }
+    }
+
+    const query = message.content
+      ? editorStateToPlainText(message.content, {
+          ignoreMentionableTypes: ['model'],
+        })
+      : ''
+    const imageParts = message.mentionables
+      .filter((m): m is MentionableImage => m.type === 'image')
+      .map(
+        (mentionable): ContentPart => ({
+          type: 'image_url',
+          image_url: {
+            url: mentionable.data,
+          },
+        }),
+      )
+
+    const blocks = message.mentionables.filter(
+      (m): m is MentionableBlock => m.type === 'block',
+    )
+    const assistantQuotes = message.mentionables.filter(
+      (m): m is MentionableAssistantQuote => m.type === 'assistant-quote',
+    )
+    const pdfs = message.mentionables.filter(
+      (m): m is MentionablePDF => m.type === 'pdf',
+    )
+    const offices = message.mentionables.filter(
+      (m): m is MentionableOffice => m.type === 'office',
+    )
+    const textAttachments = message.mentionables.filter(
+      (m): m is MentionableTextAttachment => m.type === 'text-attachment',
+    )
+    const webSelections = message.mentionables.filter(
+      (m): m is MentionableWebSelection => m.type === 'web-selection',
+    )
+    const localFolders = message.mentionables.filter(
+      (m): m is MentionableLocalFolder => m.type === 'local-folder',
+    )
+    const localFolderPrompt = this.buildLocalFolderPrompt(localFolders)
+    const blockPrompt = this.buildUserSelectedContentPrompt(blocks)
+    const assistantQuotePrompt = this.buildAssistantQuotePrompt(assistantQuotes)
+    const webSelectionPrompt = this.buildWebSelectionPrompt(webSelections)
+    const officePrompt = offices
+      .map((doc) =>
+        renderAttachedDocumentBlock({
+          name: doc.name,
+          kind: doc.kind,
+          text: doc.extractedText,
+        }),
+      )
+      .join('')
+    const textAttachmentPrompt = textAttachments
+      .map((doc) =>
+        renderAttachedDocumentBlock({
+          name: doc.name,
+          kind: doc.kind,
+          text: doc.content,
+        }),
+      )
+      .join('')
+    const {
+      documentParts: pdfDocumentParts,
+      legacyText: legacyPdfFallbackText,
+    } = this.buildPdfAttachments(pdfs)
+
+    const selectedSkillsPrompt = await this.buildSelectedSkillsPrompt(
+      message.selectedSkills,
+      scope,
+    )
+    const textContent = `${localFolderPrompt}${blockPrompt}${assistantQuotePrompt}${webSelectionPrompt}${officePrompt}${textAttachmentPrompt}${legacyPdfFallbackText}${selectedSkillsPrompt}\n\n${query}\n\n`
+    if (imageParts.length === 0 && pdfDocumentParts.length === 0) {
+      return withTimeContext(textContent)
+    }
+
+    return withTimeContext([
+      ...imageParts,
+      ...pdfDocumentParts,
+      {
+        type: 'text',
+        text: textContent,
+      },
+    ])
+  }
+
+  private requiresSnapshotRebuild(message: ChatUserMessage): boolean {
+    return (
+      (message.selectedSkills?.length ?? 0) > 0 ||
+      message.mentionables.some(
+        (mentionable) =>
+          mentionable.type === 'file' ||
+          mentionable.type === 'folder' ||
+          mentionable.type === 'url' ||
+          mentionable.type === 'web-selection' ||
+          mentionable.type === 'office' ||
+          mentionable.type === 'text-attachment' ||
+          mentionable.type === 'assistant-quote',
+      )
+    )
+  }
+
+  private async buildSelectedSkillsPrompt(
+    selectedSkills?: ChatSelectedSkill[],
+    scope?: LiteSkillScope,
+  ): Promise<string> {
+    if (!selectedSkills || selectedSkills.length === 0) {
+      return ''
+    }
+
+    const loadedSkills = await Promise.all(
+      selectedSkills.map(async (skill) => {
+        const document = await getLiteSkillDocument({
+          app: this.app,
+          name: skill.name,
+          settings: this.settings,
+          scope,
+        })
+
+        if (document) {
+          return document
+        }
+
+        return {
+          entry: skill,
+          content: '',
+        }
+      }),
+    )
+
+    const validSkills = loadedSkills.filter(
+      (skill) => skill.content.trim().length > 0,
+    )
+    if (validSkills.length === 0) {
+      return ''
+    }
+
+    return `<user_selected_skills>\n${validSkills
+      .map(
+        (skill) =>
+          `<skill name="${skill.entry.name}" path="${skill.entry.path}">\n${skill.content}\n</skill>`,
+      )
+      .join('\n\n')}\n</user_selected_skills>\n`
+  }
+
+  /**
+   * The provider's native reply is handed back only to the model that wrote
+   * it: reasoning signatures and encrypted reasoning are bound to their
+   * model, and another model gets the reply rebuilt from its text and tool
+   * calls. The provider decides everything else about what is still valid.
+   */
+  private parseAssistantMessage({
+    message,
+    modelId,
+  }: {
+    message: ChatAssistantMessage
+    modelId: string
+  }): RequestMessage[] {
+    let citationContent: string | null = null
+    if (message.annotations && message.annotations.length > 0) {
+      citationContent = `Citations:
+${message.annotations
+  .filter((annotation) => annotation.type === 'url_citation')
+  .map((annotation, index) => {
+    const { url, title } = annotation.url_citation
+    return `[${index + 1}] ${title ? `${title}: ` : ''}${url}`
+  })
+  .join('\n')}`
+    }
+
+    return [
+      {
+        role: 'assistant',
+        content: [
+          message.content,
+          ...(citationContent ? [citationContent] : []),
+        ].join('\n'),
+        reasoning: message.reasoning,
+        providerMetadata:
+          message.metadata?.model?.id === modelId
+            ? message.metadata?.providerMetadata
+            : undefined,
+        tool_calls:
+          message.toolCallRequests
+            ?.map((toolCall) => this.normalizeToolCallRequest(toolCall))
+            .filter((toolCall): toolCall is NonNullable<typeof toolCall> =>
+              Boolean(toolCall),
+            ) ?? undefined,
+      },
+    ]
+  }
+
+  /**
+   * A stored tool call, in the shape the provider request speaks: ids and
+   * arguments completed, and the name taken to the model-facing boundary
+   * (`toModelToolName`). Messages persist the fully qualified name, so without
+   * that last step a replayed conversation would show the model built-in tools
+   * under one name in its history and another in its `tools` field.
+   */
+  private normalizeToolCallRequest(
+    toolCall: ToolCallRequest,
+  ): ToolCallRequest | null {
+    const callId =
+      typeof toolCall.id === 'string' ? toolCall.id.trim() : toolCall.id
+    const rawName =
+      typeof toolCall.name === 'string' ? toolCall.name.trim() : toolCall.name
+    if (!callId || !rawName) {
+      return null
+    }
+    const name = toModelToolName(rawName)
+
+    const args = getToolCallArgumentsObject(toolCall.arguments)
+    if (!args) {
+      return {
+        ...toolCall,
+        id: callId,
+        name,
+        arguments: createCompleteToolCallArguments({ value: {} }),
+      }
+    }
+
+    return {
+      ...toolCall,
+      id: callId,
+      name,
+      arguments: createCompleteToolCallArguments({ value: args }),
+    }
+  }
+
+  private parseExternalAgentResultMessage(
+    message: ChatExternalAgentResultMessage,
+  ): RequestMessage {
+    return serializeExternalAgentResultToUserMessage(message)
+  }
+
+  private parseSubagentResultMessage(
+    message: ChatSubagentResultMessage,
+  ): RequestMessage {
+    return serializeSubagentResultToUserMessage(message)
+  }
+
+  private parseTerminalCommandResultMessage(
+    message: ChatTerminalCommandResultMessage,
+  ): RequestMessage {
+    return serializeTerminalCommandResultToUserMessage(message)
+  }
+
+  private parseToolMessage({
+    message,
+    prunedToolCallIds,
+  }: {
+    message: ChatToolMessage
+    prunedToolCallIds?: ReadonlySet<string>
+  }): RequestMessage[] {
+    const toolMessages: RequestMessage[] = []
+    const collectedContentParts: ContentPart[] = []
+
+    for (const toolCall of message.toolCalls) {
+      // Same boundary as the assistant tool_calls above: a tool result answers
+      // the call by name on providers that pair them that way (Gemini), so it
+      // has to speak the model-facing name too.
+      const request = {
+        ...toolCall.request,
+        name: toModelToolName(toolCall.request.name),
+      }
+      if (
+        prunedToolCallIds &&
+        isContextPrunedToolCall(toolCall.request, prunedToolCallIds)
+      ) {
+        toolMessages.push({
+          role: 'tool',
+          tool_call: request,
+          content: PRUNED_TOOL_RESULT_PLACEHOLDER,
+        })
+        continue
+      }
+      switch (toolCall.response.status) {
+        case ToolCallResponseStatus.PendingApproval:
+        case ToolCallResponseStatus.Running:
+        case ToolCallResponseStatus.AwaitingUserInput:
+          // Skip incomplete tool calls to avoid confusing the next planning step.
+          break
+        case ToolCallResponseStatus.Aborted:
+          toolMessages.push({
+            role: 'tool',
+            tool_call: request,
+            content: `Tool call ${request.id} was cancelled by the user.`,
+          })
+          break
+        case ToolCallResponseStatus.Rejected:
+          toolMessages.push({
+            role: 'tool',
+            tool_call: request,
+            content: toolCall.response.reason
+              ? `Tool call ${request.id} was rejected: ${toolCall.response.reason}`
+              : `Tool call ${request.id} is rejected`,
+          })
+          break
+        case ToolCallResponseStatus.Success: {
+          toolMessages.push({
+            role: 'tool',
+            tool_call: request,
+            content: toolCall.response.data.text,
+          })
+          // Collect hoistable parts (image_url and document) for a follow-up
+          // user message after all tool messages, so the message sequence stays valid.
+          const parts = toolCall.response.data.contentParts
+          if (parts) {
+            const hoistableParts = parts
+              .filter((p) => p.type === 'image_url' || p.type === 'document')
+              .map(replaceUnresolvedCachedImage)
+            if (hoistableParts.length > 0) {
+              const hasImage = hoistableParts.some(
+                (p) => p.type === 'image_url',
+              )
+              const hasDoc = hoistableParts.some((p) => p.type === 'document')
+              const headerLabel =
+                hasImage && hasDoc
+                  ? `Attachments from tool call: ${request.name}`
+                  : hasDoc
+                    ? `PDF attachments from tool call: ${request.name}`
+                    : `Images from tool call: ${request.name}`
+              collectedContentParts.push(
+                { type: 'text', text: `[${headerLabel}]` },
+                ...hoistableParts,
+              )
+            }
+          }
+          break
+        }
+        case ToolCallResponseStatus.Error:
+          toolMessages.push({
+            role: 'tool',
+            tool_call: request,
+            content: `Error: ${toolCall.response.error}`,
+          })
+          break
+      }
+    }
+
+    // Append a single user message with all collected attachments after the
+    // tool block, preserving the required tool → user message ordering.
+    if (collectedContentParts.length > 0) {
+      toolMessages.push({
+        role: 'user',
+        content: collectedContentParts,
+      })
+    }
+
+    return toolMessages
+  }
+
+  public async compileUserMessagePrompt({
+    message,
+    onQueryProgressChange,
+    scope,
+  }: {
+    message: ChatUserMessage
+    onQueryProgressChange?: (queryProgress: QueryProgressState) => void
+    /** Scopes skill resolution — see `LiteSkillScope`. Omitted (the default)
+     * for every non-module call site; the module chat mode send path passes
+     * `{ moduleChatModeId }` explicitly. This body compile happens before
+     * runtime-profile resolution, so it cannot infer the mode on its own. */
+    scope?: LiteSkillScope
+  }): Promise<{
+    promptContent: ChatUserMessage['promptContent']
+  }> {
+    try {
+      if (
+        !message.content &&
+        message.mentionables.length === 0 &&
+        (message.selectedSkills?.length ?? 0) === 0
+      ) {
+        return {
+          promptContent: '',
+        }
+      }
+      const query = message.content
+        ? editorStateToPlainText(message.content, {
+            ignoreMentionableTypes: ['model'],
+          })
+        : ''
+      return {
+        promptContent: await this.compileUserPromptParts({
+          query,
+          mentionables: message.mentionables,
+          selectedSkills: message.selectedSkills,
+          onQueryProgressChange,
+          scope,
+        }),
+      }
+    } catch (error) {
+      console.error('Failed to compile user message', error)
+      onQueryProgressChange?.({
+        type: 'idle',
+      })
+      throw error
+    }
+  }
+
+  public async compilePlainUserMessagePrompt({
+    prompt,
+    mentionables,
+    selectedSkills,
+    onQueryProgressChange,
+    scope,
+  }: {
+    prompt: string
+    mentionables: Mentionable[]
+    selectedSkills?: ChatSelectedSkill[]
+    onQueryProgressChange?: (queryProgress: QueryProgressState) => void
+    scope?: LiteSkillScope
+  }): Promise<{
+    promptContent: ChatUserMessage['promptContent']
+  }> {
+    try {
+      if (
+        prompt.trim().length === 0 &&
+        mentionables.length === 0 &&
+        (selectedSkills?.length ?? 0) === 0
+      ) {
+        return {
+          promptContent: '',
+        }
+      }
+
+      return {
+        promptContent: await this.compileUserPromptParts({
+          query: prompt,
+          mentionables,
+          selectedSkills,
+          onQueryProgressChange,
+          scope,
+        }),
+      }
+    } catch (error) {
+      console.error('Failed to compile plain user message', error)
+      onQueryProgressChange?.({
+        type: 'idle',
+      })
+      throw error
+    }
+  }
+
+  private async compileUserPromptParts({
+    query,
+    mentionables,
+    selectedSkills,
+    onQueryProgressChange,
+    scope,
+  }: {
+    query: string
+    mentionables: Mentionable[]
+    selectedSkills?: ChatSelectedSkill[]
+    onQueryProgressChange?: (queryProgress: QueryProgressState) => void
+    scope?: LiteSkillScope
+  }): Promise<ChatUserMessage['promptContent']> {
+    onQueryProgressChange?.({
+      type: 'reading-mentionables',
+    })
+
+    const allMentionedFiles = mentionables
+      .filter((m): m is MentionableFile => m.type === 'file')
+      .map((m) => this.app.vault.getFileByPath(m.file.path))
+      .filter((file): file is TFile => Boolean(file))
+    const mentionedImageFiles = allMentionedFiles.filter(isImageTFile)
+    const files = allMentionedFiles.filter((f) => !isImageTFile(f))
+    const folders = mentionables
+      .filter((m): m is MentionableFolder => m.type === 'folder')
+      .map((m) => this.app.vault.getFolderByPath(m.folder.path))
+      .filter((folder): folder is TFolder => Boolean(folder))
+
+    const filePrompt = await this.buildMentionedFilePrompt({
+      files,
+      folders,
+    })
+
+    const blocks = mentionables.filter(
+      (m): m is MentionableBlock => m.type === 'block',
+    )
+    const assistantQuotes = mentionables.filter(
+      (m): m is MentionableAssistantQuote => m.type === 'assistant-quote',
+    )
+    const pdfs = mentionables.filter(
+      (m): m is MentionablePDF => m.type === 'pdf',
+    )
+    const offices = mentionables.filter(
+      (m): m is MentionableOffice => m.type === 'office',
+    )
+    const textAttachments = mentionables.filter(
+      (m): m is MentionableTextAttachment => m.type === 'text-attachment',
+    )
+    const webSelections = mentionables.filter(
+      (m): m is MentionableWebSelection => m.type === 'web-selection',
+    )
+    const localFolders = mentionables.filter(
+      (m): m is MentionableLocalFolder => m.type === 'local-folder',
+    )
+    const localFolderPrompt = this.buildLocalFolderPrompt(localFolders)
+    const blockPrompt = this.buildUserSelectedContentPrompt(blocks)
+    const assistantQuotePrompt = this.buildAssistantQuotePrompt(assistantQuotes)
+    const webSelectionPrompt = this.buildWebSelectionPrompt(webSelections)
+    const officePrompt = offices
+      .map((doc) =>
+        renderAttachedDocumentBlock({
+          name: doc.name,
+          kind: doc.kind,
+          text: doc.extractedText,
+        }),
+      )
+      .join('')
+    const textAttachmentPrompt = textAttachments
+      .map((doc) =>
+        renderAttachedDocumentBlock({
+          name: doc.name,
+          kind: doc.kind,
+          text: doc.content,
+        }),
+      )
+      .join('')
+    const {
+      documentParts: pdfDocumentParts,
+      legacyText: legacyPdfFallbackText,
+    } = this.buildPdfAttachments(pdfs)
+
+    const inlineImageDataUrls = mentionables
+      .filter((m): m is MentionableImage => m.type === 'image')
+      .map(({ data }) => data)
+    const vaultImageDataUrls = (
+      await Promise.all(
+        mentionedImageFiles.map(async (file) => {
+          try {
+            return await tFileToImageDataUrl(this.app, file, {
+              cache: true,
+            })
+          } catch (error) {
+            console.warn(
+              '[YOLO] Failed to read mentioned image file',
+              file.path,
+              error,
+            )
+            return null
+          }
+        }),
+      )
+    ).filter((url): url is string => url !== null)
+    const imageDataUrls = [...inlineImageDataUrls, ...vaultImageDataUrls]
+    const selectedSkillsPrompt = await this.buildSelectedSkillsPrompt(
+      selectedSkills,
+      scope,
+    )
+
+    onQueryProgressChange?.({
+      type: 'idle',
+    })
+
+    return [
+      ...imageDataUrls.map(
+        (data): ContentPart => ({
+          type: 'image_url',
+          image_url: {
+            url: data,
+          },
+        }),
+      ),
+      ...pdfDocumentParts,
+      {
+        type: 'text',
+        text: `${filePrompt}${localFolderPrompt}${blockPrompt}${assistantQuotePrompt}${webSelectionPrompt}${officePrompt}${textAttachmentPrompt}${legacyPdfFallbackText}${selectedSkillsPrompt}\n\n${query}\n\n`,
+      },
+    ]
+  }
+
+  /**
+   * Directories outside the vault have no vault reader, so the absolute path
+   * is the whole context — the agent reaches the contents itself.
+   */
+  private buildLocalFolderPrompt(folders: MentionableLocalFolder[]): string {
+    if (folders.length === 0) {
+      return ''
+    }
+
+    const uniquePaths = [...new Set(folders.map((folder) => folder.path))]
+    // State the fact, name no tool: which tools can reach an absolute path
+    // depends on the user's settings, so the model picks from what it has.
+    return `## Mentioned Local Folders (outside the vault)
+${uniquePaths.map((path) => `- \`${path}\``).join('\n')}
+
+Absolute filesystem paths — vault file tools cannot reach them.\n\n`
+  }
+
+  private buildWebSelectionPrompt(
+    selections: MentionableWebSelection[],
+  ): string {
+    if (selections.length === 0) {
+      return ''
+    }
+
+    return `## Selected web page snippets
+${selections
+  .map((selection) => {
+    const title = selection.title.trim() || selection.url
+    return `<web_selection url="${escapeXmlAttr(selection.url)}" title="${escapeXmlAttr(title)}">\n${escapeXmlText(selection.content)}\n</web_selection>`
+  })
+  .join('\n\n')}\n\n`
+  }
+
+  private buildUserSelectedContentPrompt(blocks: MentionableBlock[]): string {
+    return blocks
+      .map(
+        (
+          {
+            file,
+            content,
+            startLine,
+            endLine,
+            pageNumber,
+            contentFormat,
+            comment,
+            annotationNumber,
+          },
+          index,
+        ) => {
+          const attrs = [`path="${escapeXmlAttr(file.path)}"`]
+          if (pageNumber !== undefined) {
+            attrs.push(`page="${pageNumber}"`)
+            const trimmedComment = comment?.trim()
+            if (trimmedComment) {
+              attrs.push(`index="${annotationNumber ?? index + 1}"`)
+            }
+            const commentSuffix = trimmedComment
+              ? `\n<comment>\n${trimmedComment}\n</comment>`
+              : ''
+            return `<user_selected_content ${attrs.join(' ')}>\n\`\`\`${file.path} (page ${pageNumber})\n${content}\n\`\`\`${commentSuffix}\n</user_selected_content>\n`
+          }
+
+          attrs.push(`startLine="${startLine}"`, `endLine="${endLine}"`)
+          if (contentFormat === 'markdown-table') {
+            attrs.push('format="markdown-table"')
+            return `<user_selected_content ${attrs.join(' ')}>\n\`\`\`md\n${content}\n\`\`\`\n</user_selected_content>\n`
+          }
+
+          const numberedContent = this.addLineNumbersToContent({
+            content,
+            startLine,
+          })
+          return `<user_selected_content ${attrs.join(' ')}>\n\`\`\`${file.path}\n${numberedContent}\n\`\`\`\n</user_selected_content>\n`
+        },
+      )
+      .join('')
+  }
+
+  private buildAssistantQuotePrompt(
+    quotes: MentionableAssistantQuote[],
+  ): string {
+    if (quotes.length === 0) {
+      return ''
+    }
+
+    return `## Referenced assistant reply snippets
+${quotes
+  .map(
+    (
+      { annotationNumber, conversationId, messageId, content, comment },
+      index,
+    ) =>
+      `<assistant_quote index="${annotationNumber ?? index + 1}" conversationId="${conversationId}" messageId="${messageId}">\n<quote>\n${content}\n</quote>${comment?.trim() ? `\n<comment>\n${comment.trim()}\n</comment>` : ''}\n</assistant_quote>`,
+  )
+  .join('\n\n')}\n\n`
+  }
+
+  /**
+   * Single entry that turns PDF mentionables into request payload pieces:
+   *   • `documentParts`: native `document` content parts for new uploads that
+   *     carry raw bytes. Pass-through for adapters that advertise the `pdf`
+   *     modality; `prepareDocumentsForModel` converts to text otherwise.
+   *   • `legacyText`: an `<document type="pdf">` block for legacy mentionables
+   *     that only have the pre-extracted `data` text (serialized before native
+   *     PDF support landed). Empty string when there are no legacy items.
+   */
+  private buildPdfAttachments(pdfs: MentionablePDF[]): {
+    documentParts: ContentPart[]
+    legacyText: string
+  } {
+    const documentParts: ContentPart[] = []
+    const legacyBlocks: string[] = []
+
+    for (const pdf of pdfs) {
+      if (pdf.rawData) {
+        documentParts.push({
+          type: 'document',
+          mediaType: 'application/pdf',
+          name: pdf.name,
+          data: pdf.rawData,
+          pageCount: pdf.pageCount,
+        })
+      } else if (pdf.data) {
+        legacyBlocks.push(
+          renderAttachedDocumentBlock({
+            name: pdf.name,
+            kind: 'pdf',
+            text: pdf.data,
+            pageCount: pdf.pageCount,
+          }),
+        )
+      }
+    }
+
+    return {
+      documentParts,
+      // Each block is a self-contained `<document>` element; join into one.
+      legacyText: legacyBlocks.join(''),
+    }
+  }
+
+  /**
+   * After compaction, the original `load_tool_schemas` results are gone. Re-inject
+   * full schemas for on-demand tools that were already disclosed so the model
+   * can keep calling them without redundant `load_tool_schemas` round-trips. Schemas
+   * over the per-tool budget are intentionally not persisted by compaction;
+   * the prompt tells the model to fall back to `load_tool_schemas` for those.
+   *
+   * Returned as a `user` message so it sticks to the request prefix without
+   * polluting the system prompt. It is built deterministically from the
+   * compaction payload, so this entry remains cache-stable across turns.
+   */
+  private buildCompactionDisclosureInjection(
+    compaction?: ChatConversationCompactionLike | null,
+  ): RequestMessage | null {
+    const latest = getLatestChatConversationCompaction(compaction)
+    const schemas = latest?.loadedDeferredToolSchemas
+    if (!schemas || schemas.length === 0) {
+      return null
+    }
+
+    const entries = schemas
+      .map((schema) => {
+        const description = (schema.description ?? '').trim()
+        let parameters: string
+        try {
+          parameters = JSON.stringify(schema.parameters, null, 2)
+        } catch {
+          parameters = '{}'
+        }
+        return `- ${schema.name}:\n  description: ${description}\n  parameters:\n${parameters
+          .split('\n')
+          .map((line) => `    ${line}`)
+          .join('\n')}`
+      })
+      .join('\n\n')
+
+    return {
+      role: 'user',
+      content: `<previously-loaded-tools>
+The following deferred tools were already disclosed by load_tool_schemas earlier in this conversation. Call them through invoke_tool using the schemas below, without calling load_tool_schemas again.
+
+If you need a tool from <tool_catalog> that is NOT listed here (for example because its schema was too large to persist across compaction), call load_tool_schemas with {"tools":["<exact name from the catalog>"]} to re-disclose it.
+
+${entries}
+</previously-loaded-tools>`,
+    }
+  }
+
+  /**
+   * Resolve the system prompt for this request, freezing it per conversation
+   * when a snapshot store is injected.
+   *
+   * The system prompt is the head of the provider cache prefix. Memory writes
+   * (and time variables / project instructions) would otherwise change it
+   * mid-conversation and invalidate the whole prefix cache every iteration.
+   * Freezing keeps the bytes stable for the conversation's lifetime; the
+   * snapshot refreshes only when a prompt-relevant config input changes
+   * (see {@link computeSystemPromptFingerprint}) or on a new conversation.
+   *
+   * When no store is injected (tests / non-agent callers) the prompt is
+   * computed fresh on every call, preserving the previous behavior.
+   */
+  private async resolveSystemPromptSnapshot({
+    conversationId,
+    hasTools,
+    hasOnDemandTools,
+    deferredToolCatalogText,
+    compaction,
+    runtimeModePrompt,
+    modeEnvironmentPrompt,
+    modePersonaPrompt,
+    modePersonaModuleId,
+    moduleChatModeId,
+    contextPolicy,
+    mode,
+  }: {
+    conversationId: string
+    hasTools: boolean
+    hasOnDemandTools: boolean
+    deferredToolCatalogText?: string
+    compaction?: ChatConversationCompactionLike | null
+    runtimeModePrompt?: string
+    modeEnvironmentPrompt?: string
+    modePersonaPrompt?: string
+    modePersonaModuleId?: string
+    /** Full running mode id — scopes skill resolution to the mode's own
+     * declared skills. See `ChatModeRuntime.moduleChatModeId`. */
+    moduleChatModeId?: string
+    contextPolicy?: ChatContextPolicy
+    mode: SystemPromptSnapshotMode
+  }): Promise<SystemPromptSnapshot> {
+    const build = async (): Promise<SystemPromptSnapshot> => {
+      const systemSections = await this.buildSystemPromptSections(
+        hasTools,
+        hasOnDemandTools,
+        deferredToolCatalogText,
+        runtimeModePrompt,
+        modePersonaPrompt,
+        modePersonaModuleId,
+        contextPolicy,
+        moduleChatModeId,
+        modeEnvironmentPrompt,
+      )
+      const systemContent = systemSections
+        .map((section) =>
+          typeof section.content === 'string' ? section.content : '',
+        )
+        .filter((text) => text.length > 0)
+        .join('\n\n')
+      return { systemSections, systemContent }
+    }
+
+    const store = this.systemPromptSnapshotStore
+    if (!store) {
+      return build()
+    }
+
+    const fingerprint = this.computeSystemPromptFingerprint(
+      hasTools,
+      hasOnDemandTools,
+      deferredToolCatalogText,
+      compaction,
+      runtimeModePrompt,
+      modePersonaPrompt,
+      contextPolicy,
+      moduleChatModeId,
+      modeEnvironmentPrompt,
+    )
+    return store.getOrCreate(conversationId, fingerprint, build, {
+      reuseOnly: mode === 'reuse',
+    })
+  }
+
+  /**
+   * Stable fingerprint of every *configuration-level* input that legitimately
+   * changes the system prompt text. A change here refreshes the frozen
+   * snapshot; everything NOT listed (memory file content, project-instruction
+   * and skill file content, time variables) is intentionally frozen until the
+   * next conversation. Settings that never reach the system prompt (reasoning
+   * level, …) are excluded so they don't evict the snapshot.
+   */
+  private computeSystemPromptFingerprint(
+    hasTools: boolean,
+    hasOnDemandTools: boolean,
+    deferredToolCatalogText: string | undefined,
+    compaction?: ChatConversationCompactionLike | null,
+    runtimeModePrompt?: string,
+    modePersonaPrompt?: string,
+    contextPolicy?: ChatContextPolicy,
+    moduleChatModeId?: string,
+    modeEnvironmentPrompt?: string,
+  ): string {
+    // `useAssistant === false` (module chat modes) makes `getCurrentAssistant`
+    // return null below, which already changes the `assistant` field of this
+    // fingerprint whenever an assistant WAS selected. The explicit
+    // `useAssistant`/`modePersonaPrompt` entries below additionally cover the
+    // "no assistant selected either way" edge case, and the persona text
+    // itself, which the `assistant` field can't see.
+    const useAssistant = contextPolicy?.useAssistant ?? true
+    const assistant = useAssistant ? this.getCurrentAssistant() : null
+    const latestCompaction = getLatestChatConversationCompaction(compaction)
+    // The exact memory indexes this request will read. Captures baseDir, the
+    // assistant name, AND the sibling-driven duplicate index — so a same-named
+    // assistant being added/renamed (which changes which file we read) refreshes
+    // the snapshot even though the current assistant's own fields are unchanged.
+    // Only the two MEMORY.md indexes are watched: the fact files under them
+    // never reach the system prompt, so editing one must not evict the prefix.
+    const memoryPaths = resolveMemoryIndexPaths({
+      settings: this.settings,
+      assistantId: this.settings.currentAssistantId,
+    })
+
+    if (this.promptSourcePathsCallback) {
+      const watchedPaths = new Set<string>()
+      if (memoryPaths.global) watchedPaths.add(memoryPaths.global)
+      if (memoryPaths.assistant) watchedPaths.add(memoryPaths.assistant)
+      resolveProjectInstructionFilePaths(
+        this.app,
+        assistant?.enableProjectInstructions === true,
+        assistant?.workspaceScope,
+      ).forEach((p) => watchedPaths.add(p))
+      this.promptSourcePathsCallback(watchedPaths)
+    }
+
+    return stableStringify({
+      hasTools,
+      hasOnDemandTools,
+      deferredToolCatalogText: deferredToolCatalogText ?? '',
+      runtimeModePrompt: runtimeModePrompt?.trim() ?? '',
+      // Switching between Max and another mode changes this text (and only
+      // this text, when the tool grant happens to coincide) — without it the
+      // frozen snapshot would keep serving the previous mode's system prompt.
+      modeEnvironmentPrompt: modeEnvironmentPrompt?.trim() ?? '',
+      useAssistant,
+      modePersonaPrompt: modePersonaPrompt?.trim() ?? '',
+      includeSkills: this.includeSkills,
+      systemPrompt: this.settings.systemPrompt ?? '',
+      // Normalize the same way the real path/skill lookups do, so cosmetic-only
+      // edits (trailing slash, whitespace) don't needlessly evict the snapshot.
+      baseDir: normalizePath(this.settings.yolo?.baseDir ?? ''),
+      disabledSkillIds: [...(this.settings.skills?.disabledSkillIds ?? [])]
+        .map((id) => id.trim())
+        .sort(),
+      currentAssistantId: this.settings.currentAssistantId ?? '',
+      // Distinguishes module modes whose `modePersonaPrompt` text happens to
+      // be identical (unlikely but not disallowed) — the mode's declared
+      // skill set can still differ, and that's what `<available_skills>`
+      // reflects.
+      moduleChatModeId: moduleChatModeId ?? '',
+      memoryPaths,
+      promptSourceRevision: this.getPromptSourceRevision?.() ?? 0,
+      // A context compaction restarts the conversation from a compressed
+      // boundary. Refresh the frozen system prompt after that boundary so
+      // memory written before compaction is visible again, without refreshing
+      // on every memory-file write during the same uncompressed context.
+      latestCompaction: latestCompaction
+        ? {
+            anchorMessageId: latestCompaction.anchorMessageId,
+            triggerToolCallId: latestCompaction.triggerToolCallId ?? null,
+            compactedAt: latestCompaction.compactedAt,
+          }
+        : null,
+      // Only assistant fields that reach the system prompt — not modelId / icon /
+      // updatedAt, which would over-evict on unrelated edits.
+      assistant: assistant
+        ? {
+            name: assistant.name,
+            systemPrompt: assistant.systemPrompt ?? '',
+            skillPreferences: assistant.skillPreferences ?? null,
+            enableProjectInstructions:
+              assistant.enableProjectInstructions ?? false,
+            workspaceScope: assistant.workspaceScope ?? null,
+          }
+        : null,
+    })
+  }
+
+  /**
+   * Build the ordered list of system-prompt-side sections. The order is the
+   * same as the legacy string-concat order in `getSystemMessage`, so joining
+   * the string contents with `\n\n` reproduces the original system prompt
+   * byte-for-byte. Buckets are assigned per the breakdown spec.
+   */
+  private async buildSystemPromptSections(
+    hasTools: boolean,
+    hasOnDemandTools: boolean,
+    deferredToolCatalogText: string | undefined,
+    runtimeModePrompt?: string,
+    modePersonaPrompt?: string,
+    modePersonaModuleId?: string,
+    contextPolicy?: ChatContextPolicy,
+    moduleChatModeId?: string,
+    modeEnvironmentPrompt?: string,
+  ): Promise<SystemPromptSections> {
+    const sections: SystemPromptSections = []
+    const useAssistant = contextPolicy?.useAssistant ?? true
+    // `useAssistant === false` (module chat modes) is a complete product
+    // contract of its own: gating `currentAssistant` to null here is what
+    // makes assistant memory / workspace scope / project instructions all
+    // fall out below for free (each already keys off `currentAssistant`).
+    // Only the assistant-instructions section and skills policy need an
+    // explicit branch — see `buildCustomInstructionsSubsections`.
+    const currentAssistant = useAssistant ? this.getCurrentAssistant() : null
+
+    // Custom-instructions block — split into sub-sections so that memory /
+    // skills / system text can be counted independently. Order MUST match the
+    // legacy parts[] order in `buildCustomInstructionsSection`.
+    const customInstructionSubsections =
+      await this.buildCustomInstructionsSubsections(
+        useAssistant,
+        modePersonaPrompt,
+        modePersonaModuleId,
+        moduleChatModeId,
+      )
+    sections.push(...customInstructionSubsections)
+
+    const baseBehaviorContent = this.buildDefaultBehaviorSection(
+      hasTools,
+      hasOnDemandTools,
+    )
+    if (baseBehaviorContent) {
+      sections.push({
+        bucket: 'system',
+        id: 'system.base-behavior',
+        content: baseBehaviorContent,
+      })
+    }
+
+    // Sits in the frozen system-prompt snapshot next to the base behaviour
+    // rules that explain how to use it, so the whole two-step protocol is
+    // cached as one prefix instead of re-sent per turn.
+    if (deferredToolCatalogText) {
+      sections.push({
+        bucket: 'system',
+        id: 'system.tool-catalog',
+        content: deferredToolCatalogText,
+      })
+    }
+
+    const trimmedRuntimeModePrompt = runtimeModePrompt?.trim()
+    if (trimmedRuntimeModePrompt) {
+      sections.push({
+        bucket: 'system',
+        id: 'system.runtime-mode',
+        content: trimmedRuntimeModePrompt,
+      })
+    }
+
+    // Max's environment (cwd, OS, shell, date, tool discipline) — sits right
+    // after the capability prompt it qualifies, and inside the frozen
+    // snapshot because none of it changes within a conversation.
+    const trimmedModeEnvironmentPrompt = modeEnvironmentPrompt?.trim()
+    if (trimmedModeEnvironmentPrompt) {
+      sections.push({
+        bucket: 'system',
+        id: 'system.max-mode',
+        content: trimmedModeEnvironmentPrompt,
+      })
+    }
+
+    const workspaceScopeContent = this.buildWorkspaceScopeSection(
+      currentAssistant?.workspaceScope,
+    )
+    if (workspaceScopeContent) {
+      sections.push({
+        bucket: 'rules',
+        id: 'rules.workspace-scope',
+        content: workspaceScopeContent,
+      })
+    }
+
+    const projectInstructionsContent = await getProjectInstructionsSection(
+      this.app,
+      currentAssistant?.enableProjectInstructions === true,
+      currentAssistant?.workspaceScope,
+    )
+    if (projectInstructionsContent) {
+      sections.push({
+        bucket: 'rules',
+        id: 'rules.project-instructions',
+        content: projectInstructionsContent,
+      })
+    }
+
+    return sections
+  }
+
+  private buildWorkspaceScopeSection(
+    scope: AssistantWorkspaceScope | undefined,
+  ): string {
+    if (!scope?.enabled) return ''
+
+    const include = scope.include.map((path) => path.trim()).filter(Boolean)
+    const exclude = scope.exclude.map((path) => path.trim()).filter(Boolean)
+    if (include.length === 0 && exclude.length === 0) return ''
+
+    // Exclude paths are intentionally never surfaced here: they are enforced
+    // by the tool layer regardless of what the model is told, and listing
+    // them would leak vault structure into the request without changing the
+    // enforcement outcome (#577).
+    if (include.length === 0) {
+      return `<workspace_scope>
+- Some vault paths are outside your working range. Out-of-scope access will be rejected by the tool layer and reported to you.
+- All file paths must be vault-relative.
+- If the task requires an out-of-scope path, tell the user about the workspace restriction.
+</workspace_scope>`
+    }
+
+    return `<workspace_scope>
+- Included paths: ${include.join(', ')}
+- All file paths must be vault-relative.
+- Each listed folder includes itself and all descendants.
+- Do not attempt to access paths outside this scope. If the task requires an out-of-scope path, tell the user about the workspace restriction.
+</workspace_scope>`
+  }
+
+  /**
+   * Ordered breakdown of the legacy `customInstructionsSection`. The string
+   * contents joined with `\n\n` reproduce the original block exactly; each
+   * entry is tagged with the bucket the UI should attribute its tokens to.
+   *
+   * IMPORTANT: this is the single source of truth for memory / skills / global
+   * custom-instructions / assistant-instructions prompt assembly. Both
+   * `getSystemMessage` and `generateRequestSections` consume it — do NOT add a
+   * second path that re-reads memory files or skill entries.
+   */
+  private async buildCustomInstructionsSubsections(
+    useAssistant = true,
+    modePersonaPrompt?: string,
+    modePersonaModuleId?: string,
+    moduleChatModeId?: string,
+  ): Promise<SystemPromptSections> {
+    const sections: SystemPromptSections = []
+    const currentAssistant = useAssistant ? this.getCurrentAssistant() : null
+
+    // Custom system prompt (global). `![[Note]]` embeds written here are
+    // expanded to the note's text in place; see expandPromptEmbeds. This and
+    // the assistant prompt below are the only two positions that expand —
+    // both are authored by the user and only ever read by the model.
+    const customInstruction = (
+      await expandPromptEmbeds(this.app, this.settings.systemPrompt)
+    ).trim()
+
+    // Assistant instructions — bucket: system (assistant prompt is system-prompt-side).
+    // Module chat modes (`useAssistant === false`) inject their persona in
+    // the exact same slot instead — an in-place substitution, not an
+    // addition, per `ChatContextPolicy`.
+    if (currentAssistant?.systemPrompt) {
+      const resolvedAssistantSystemPrompt = (
+        await expandPromptEmbeds(this.app, currentAssistant.systemPrompt)
+      ).trim()
+      if (resolvedAssistantSystemPrompt) {
+        sections.push({
+          bucket: 'system',
+          id: 'system.assistant-instructions',
+          content: `<assistant_instructions name="${currentAssistant.name}">
+${resolvedAssistantSystemPrompt}
+</assistant_instructions>`,
+        })
+      }
+    } else if (!useAssistant && modePersonaPrompt?.trim()) {
+      sections.push({
+        bucket: 'system',
+        id: 'system.assistant-instructions',
+        content: `<module_mode_instructions module="${modePersonaModuleId ?? ''}">
+${modePersonaPrompt.trim()}
+</module_mode_instructions>`,
+      })
+    }
+
+    // Memory block — bucket: memory. Only the two MEMORY.md indexes are
+    // injected, in full; the fact files they point at are read on demand with
+    // the ordinary file tools. The XML shape is part of the provider cache
+    // prefix — keep it stable.
+    const memoryDirPaths = resolveMemoryDirPaths({
+      settings: this.settings,
+      assistantId: currentAssistant?.id,
+    })
+    const memoryIndexes = await readMemoryIndexes({
+      app: this.app,
+      settings: this.settings,
+      assistantId: currentAssistant?.id,
+    })
+    if (memoryIndexes.global || memoryIndexes.assistant) {
+      const memoryParts: string[] = []
+      if (memoryIndexes.global) {
+        memoryParts.push(`<global>
+${memoryIndexes.global}
+</global>`)
+      }
+      if (memoryIndexes.assistant) {
+        memoryParts.push(`<assistant>
+${memoryIndexes.assistant}
+</assistant>`)
+      }
+      sections.push({
+        bucket: 'memory',
+        id: 'memory.context',
+        content: `<memory>
+${memoryParts.join('\n\n')}
+</memory>`,
+      })
+    }
+
+    // Memory rules — bucket: system (per breakdown spec).
+    // Injected unconditionally: a first-time user has no index yet, so gating
+    // the rules on one existing would mean the model never learns that memory
+    // exists and the cold start could never happen. The text is fixed English
+    // in the cache prefix, and read-only modes simply never use its write half.
+    // It names the real directories rather than a tool, because the modes that
+    // can write use different file tools (`fs_write` / `write_file`).
+    const memoryLocationRule = memoryDirPaths.assistant
+      ? `- Location: \`${memoryDirPaths.global}/\` applies to every assistant; \`${memoryDirPaths.assistant}/\` only to this one. Facts private to this assistant go there, everything else goes to global.`
+      : `- Location: \`${memoryDirPaths.global}/\` applies to every assistant.`
+    sections.push({
+      bucket: 'system',
+      id: 'system.memory-rules',
+      content: `<memory_rules>
+Memory is for durable facts that do not belong in a vault note: who the user is, how they want you to work, and context that must survive across sessions.
+${memoryLocationRule}
+- Layout: each directory holds a MEMORY.md index plus one file per fact. You see the index above in full; you do not see the files. Index line: \`- [Title](file.md) — when to open me\`.
+- Read: at the start of a task, if an index line looks relevant, read that file before acting. Never rely on the index line alone.
+- Write: one fact per file, frontmatter \`name\` (kebab-case, equals the filename) and \`description\` (one sentence). Say why a preference exists so it can be applied to new situations. Link related facts with [[name]].
+- Before adding, check the index for an entry on the same subject and update it instead. Delete a file and its index line when it is wrong or obsolete.
+- Write absolute dates, never relative ones. Do not record what a vault note already says; point at the note.
+- Every add, rename, or delete of a fact file updates MEMORY.md in the same turn. Create the directory and MEMORY.md if missing.
+</memory_rules>`,
+    })
+
+    if (this.includeSkills) {
+      const disabledSkillNames = this.settings.skills?.disabledSkillIds ?? []
+      const skillScope: LiteSkillScope | undefined = moduleChatModeId
+        ? { moduleChatModeId }
+        : undefined
+      // Module chat modes bypass assistant skill preferences entirely: the
+      // allowed set is the mode's own declared skills (scoped by
+      // `moduleChatModeId`) plus every enabled vault skill. Built-in modes
+      // keep the exact prior behavior: no assistant selected means no skills.
+      const enabledSkillEntries =
+        useAssistant && !currentAssistant
+          ? []
+          : (
+              await listLiteSkillEntries(this.app, {
+                settings: this.settings,
+                scope: skillScope,
+              })
+            ).filter((skill) =>
+              isSkillEnabledForAssistant({
+                assistant: useAssistant ? currentAssistant : null,
+                skillName: skill.name,
+                disabledSkillNames,
+                defaultLoadMode: skill.mode,
+              }),
+            )
+
+      if (enabledSkillEntries.length > 0) {
+        sections.push({
+          bucket: 'skills',
+          id: 'skills.available',
+          content: `<available_skills>
+${enabledSkillEntries
+  .map(
+    (skill) =>
+      `- name: ${skill.name} | description: ${skill.description} | path: ${skill.path}`,
+  )
+  .join('\n')}
+</available_skills>`,
+        })
+
+        sections.push({
+          bucket: 'skills',
+          id: 'skills.usage-rules',
+          content: `<skills_usage_rules>
+- To use a skill, read its full body from the listed path, exactly as written.
+- Skills in <always_on_skills> or <user_selected_skills> are already loaded.
+</skills_usage_rules>`,
+        })
+      }
+
+      const alwaysSkills = enabledSkillEntries.filter((skill) => {
+        return (
+          resolveAssistantSkillPolicy({
+            assistant: currentAssistant,
+            skillName: skill.name,
+            defaultLoadMode: skill.mode,
+          }).loadMode === 'always'
+        )
+      })
+      if (alwaysSkills.length > 0) {
+        const loadedAlwaysSkills = await Promise.all(
+          alwaysSkills.map((skill) =>
+            getLiteSkillDocument({
+              app: this.app,
+              name: skill.name,
+              settings: this.settings,
+              scope: skillScope,
+            }),
+          ),
+        )
+        const validAlwaysSkills = loadedAlwaysSkills.filter(
+          (skill): skill is NonNullable<typeof skill> => Boolean(skill),
+        )
+        if (validAlwaysSkills.length > 0) {
+          sections.push({
+            bucket: 'skills',
+            id: 'skills.always-on',
+            content: `<always_on_skills>
+${validAlwaysSkills
+  .map(
+    (skill) => `<skill name="${skill.entry.name}" path="${skill.entry.path}">
+${skill.content}
+</skill>`,
+  )
+  .join('\n\n')}
+</always_on_skills>`,
+          })
+        }
+      }
+    }
+
+    // Global custom instructions — bucket: system
+    if (customInstruction) {
+      sections.push({
+        bucket: 'system',
+        id: 'system.custom-instructions',
+        content: `<custom_instructions>
+${customInstruction}
+</custom_instructions>`,
+      })
+    }
+
+    return sections
+  }
+
+  private buildDefaultBehaviorSection(
+    hasTools: boolean,
+    hasOnDemandTools: boolean,
+  ): string {
+    let section = `- Format your responses in Markdown.
+- When writing mathematical notation, use Obsidian-compatible LaTeX delimiters: $...$ for inline math and $$...$$ for display math. Put opening and closing $$ delimiters on separate lines. Do not use \\(...\\) or \\[...\\].
+- Always reply in the same language as the user's message.
+- Only use tools exposed in this request. Never simulate unavailable tool calls or claim an action succeeded without a successful tool result.`
+
+    if (hasTools) {
+      section += `
+- The chat interface shows the user every tool call, so report what you found or changed rather than narrating the calls.
+- Before calling file-reading tools, use relevant content already present in the conversation, especially <user_selected_content> and prior tool results. Do not re-read the same or an overlapping range; if more context is necessary, read only the smallest missing range. Re-read only to verify content that may have changed.
+- If the current user message already includes <user_selected_skills>, treat them as user-selected context and avoid reloading the same skill again unless you need to verify something.`
+      if (hasOnDemandTools) {
+        section += `
+- Tools listed in <tool_catalog> are available but are not registered above, so their schemas are not loaded. Reach them in two steps.
+- First call load_tool_schemas with {"tools":["<exact name from the catalog>"]} — batch every tool you expect to need in one call rather than one at a time.
+- Then call invoke_tool with {"tool_name":"<the same name>","arguments":{...}}, filling arguments from the returned schema. If a <previously-loaded-tools> block lists the tool, it is already disclosed and you can invoke it directly.`
+      }
+    }
+
+    return section
+  }
+
+  private async buildMentionedPathsPrompt({
+    files,
+    folders,
+  }: {
+    files: TFile[]
+    folders: TFolder[]
+  }): Promise<string> {
+    const folderPathSet = new Set(folders.map((folder) => folder.path))
+    const unifiedFiles = this.collectMentionedFiles({
+      files,
+      folders,
+    })
+
+    if (unifiedFiles.length === 0 && folderPathSet.size === 0) {
+      return ''
+    }
+
+    const outlinedFilePaths = new Set(
+      unifiedFiles
+        .filter(({ file }) => file.extension === 'md')
+        .slice(0, MAX_MENTIONED_FILE_OUTLINES)
+        .map(({ file }) => file.path),
+    )
+    const fileLines = await Promise.all(
+      unifiedFiles.map(async ({ file }) => {
+        const frontmatter =
+          file.extension === 'md'
+            ? this.app.metadataCache.getFileCache(file)?.frontmatter
+            : null
+        const properties = getMentionedFileProperties(frontmatter)
+        const propertyLines =
+          properties.length > 0
+            ? [
+                '  - Properties:',
+                ...properties.map(
+                  ({ key, value }) => `    - \`${key}\`: \`${value}\``,
+                ),
+              ]
+            : []
+
+        if (!outlinedFilePaths.has(file.path)) {
+          return [`- \`${file.path}\``, ...propertyLines].join('\n')
+        }
+
+        try {
+          const content = await readTFileContent(file, this.app.vault)
+          const headings = extractMarkdownAtxHeadings(content)
+          if (headings.length === 0) {
+            return [`- \`${file.path}\``, ...propertyLines].join('\n')
+          }
+
+          return [
+            `- \`${file.path}\``,
+            ...propertyLines,
+            ...headings.map(
+              (heading) =>
+                `  - L${heading.line} ${'#'.repeat(heading.level)} ${heading.text}`,
+            ),
+          ].join('\n')
+        } catch (error) {
+          console.warn(
+            '[YOLO] Failed to read mentioned file outline',
+            file.path,
+            error,
+          )
+          return [`- \`${file.path}\``, ...propertyLines].join('\n')
+        }
+      }),
+    )
+
+    const markdownFileCount = unifiedFiles.filter(
+      ({ file }) => file.extension === 'md',
+    ).length
+    const omittedOutlineCount = Math.max(
+      0,
+      markdownFileCount - outlinedFilePaths.size,
+    )
+
+    const sections = [
+      `## Mentioned Vault Files (outline only)
+${fileLines.join('\n')}`,
+    ]
+
+    if (folderPathSet.size > 0) {
+      sections.push(`## Mentioned Vault Folders
+${[...folderPathSet].map((path) => `- \`${path}\``).join('\n')}`)
+    }
+
+    if (omittedOutlineCount > 0) {
+      sections.push(
+        `Additional mentioned markdown files omitted from outline due to limit: ${omittedOutlineCount}`,
+      )
+    }
+
+    sections.push(
+      'This section provides only paths and outlines. Use file tools only if you need the full contents or a specific line range.',
+    )
+
+    return `${sections.join('\n\n')}\n`
+  }
+
+  private async buildMentionedFilePrompt({
+    files,
+    folders,
+  }: {
+    files: TFile[]
+    folders: TFolder[]
+  }): Promise<string> {
+    const mentionContextMode = this.getMentionContextMode()
+
+    if (mentionContextMode === 'light') {
+      return this.buildMentionedPathsPrompt({
+        files,
+        folders,
+      })
+    }
+
+    const folderPrompt = await this.buildMentionedPathsPrompt({
+      files: [],
+      folders,
+    })
+    const fullFilePrompt = await this.buildFullMentionedFilesPrompt({
+      files,
+    })
+
+    return `${folderPrompt}${fullFilePrompt}`
+  }
+
+  private async buildFullMentionedFilesPrompt({
+    files,
+  }: {
+    files: TFile[]
+  }): Promise<string> {
+    const uniqueFiles = this.collectMentionedFiles({
+      files,
+      folders: [],
+    }).map(({ file }) => file)
+
+    if (uniqueFiles.length === 0) {
+      return ''
+    }
+
+    const fileEntries = await Promise.all(
+      uniqueFiles.map(async (file) => {
+        try {
+          // Image attachments are handled as image_url content parts in
+          // compileUserMessagePrompt; never inline their binary as text.
+          if (isImageTFile(file)) {
+            return null
+          }
+          const ext = file.extension?.toLowerCase() ?? ''
+          let rawContent: string
+          // Module-owned formats: same dispatch fs_read uses (see that tool's
+          // `resolveModuleFileTextRenderer` branch) — a claimed extension
+          // renders to its model-facing summary
+          // instead of the @mention `full` mode dumping raw bytes into the
+          // prompt. `undefined` (module not installed/active, or nothing ever
+          // registered the extension) falls through exactly as before.
+          const fileTextRenderer = this.resolveModuleFileTextRenderer?.(ext)
+          if (fileTextRenderer) {
+            if (file.stat.size > MODULE_RENDERED_FILE_SOURCE_MAX_BYTES) {
+              throw new Error(
+                `File too large to render (${file.stat.size} bytes). Max source size for a module-rendered format (.${ext}) is ${MODULE_RENDERED_FILE_SOURCE_MAX_BYTES} bytes.`,
+              )
+            }
+            const sourceContent = await readTFileContent(file, this.app.vault)
+            rawContent = await fileTextRenderer.render({
+              path: file.path,
+              content: sourceContent,
+            })
+          } else if (ext === 'pdf') {
+            const { pages } = await extractPdfText(this.app, file, {
+              maxBinaryBytes: PDF_READ_MAX_BYTES,
+              maxPages: PDF_READ_MAX_PAGES,
+              useCache: true,
+            })
+            rawContent = pages
+              .map((p) => `<page ${p.page}>\n${p.text}\n</page ${p.page}>`)
+              .join('\n')
+          } else {
+            rawContent = await readTFileContent(file, this.app.vault)
+          }
+          return { file, content: rawContent }
+        } catch (error) {
+          console.warn('[YOLO] Failed to read mentioned file', file.path, error)
+          return null
+        }
+      }),
+    )
+    const readableFileEntries = fileEntries.filter(
+      (entry): entry is { file: TFile; content: string } => entry !== null,
+    )
+
+    if (readableFileEntries.length === 0) {
+      return ''
+    }
+
+    const entriesWithMeta = readableFileEntries.map(({ file, content }) => {
+      const numberedContent =
+        content.length === 0
+          ? ''
+          : this.addLineNumbersToContent({ content, startLine: 1 })
+      const lineCount = content.length === 0 ? 0 : content.split('\n').length
+      return { file, content, numberedContent, lineCount }
+    })
+
+    const fileListLines = entriesWithMeta
+      .map(({ file, lineCount }) => `- \`${file.path}\` (${lineCount} lines)`)
+      .join('\n')
+    const header =
+      '## Mentioned Vault Files (full content already provided below)\n' +
+      'The following files are fully attached in this message:\n' +
+      `${fileListLines}\n\n` +
+      'The content below is the latest version of these files at this turn. ' +
+      'Do NOT call any file-reading tool (e.g. read_file) to re-read them — use the content provided here directly. ' +
+      'Only call file tools if you need a file that is NOT in the list above.\n\n'
+
+    const body = entriesWithMeta
+      .map(({ file, content, numberedContent, lineCount }) => {
+        const wikilinks =
+          file.path.endsWith('.md') && content.length > 0
+            ? collectWikilinkPaths(this.app, content, file.path)
+            : []
+        const wikilinksBlock =
+          wikilinks.length > 0
+            ? `<wikilinks file="${file.path}">\n${wikilinks
+                .map((w) => `${w.link} -> ${w.path}`)
+                .join('\n')}\n</wikilinks>\n`
+            : ''
+        return (
+          `### \`${file.path}\` (full content, ${lineCount} lines)\n` +
+          `\`\`\`${file.path}\n${numberedContent}\n\`\`\`\n${wikilinksBlock}`
+        )
+      })
+      .join('')
+
+    return `${header}${body}`
+  }
+
+  private collectMentionedFiles({
+    files,
+    folders,
+  }: {
+    files: TFile[]
+    folders: TFolder[]
+  }): MentionedFileContextEntry[] {
+    const collected: MentionedFileContextEntry[] = []
+    const seenPaths = new Set<string>()
+
+    const pushFile = (
+      file: TFile,
+      source: MentionedFileContextEntry['source'],
+    ): void => {
+      if (!file.path || seenPaths.has(file.path)) {
+        return
+      }
+      seenPaths.add(file.path)
+      collected.push({ file, source })
+    }
+
+    for (const file of files) {
+      pushFile(file, 'file')
+    }
+
+    for (const folder of folders) {
+      for (const file of getNestedFiles(folder, this.app.vault)) {
+        pushFile(file, 'folder')
+      }
+    }
+
+    return collected
+  }
+
+  private addLineNumbersToContent({
+    content,
+    startLine,
+  }: {
+    content: string
+    startLine: number
+  }): string {
+    const lines = content.split('\n')
+    const linesWithNumbers = lines.map((line, index) => {
+      return `${startLine + index}|${line}`
+    })
+    return linesWithNumbers.join('\n')
+  }
+}

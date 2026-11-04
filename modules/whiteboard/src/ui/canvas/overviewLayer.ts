@@ -1,0 +1,1880 @@
+// The overview tier's renderer for the `.yoloboard` canvas: one `<canvas>`
+// that draws every card and edge itself, replacing their DOM entirely below
+// OVERVIEW_SCALE_THRESHOLD.
+//
+// Why a canvas at all, on a board whose whole rendering architecture is DOM:
+// the measured ceiling is not what a card *contains* but that it exists.
+// `PaintArtifactCompositor::Update` — Blink handing its paint artifacts to the
+// compositor — grows with the number of mounted elements whatever they hold,
+// and at 1200 mounted cards it alone eats most of a frame. That number is
+// bounded at readable zooms because a screen only holds so many cards; below
+// ~0.15 it is not. So the fix is not to make the cards cheaper, it is for
+// there to be no cards: at that zoom nothing in one is legible anyway, and a
+// few thousand rectangles is an afternoon's work for a canvas.
+//
+// Screen space, not world space. The canvas is a sibling of the world layer
+// rather than a child: inside it, the camera's CSS `scale` would blur the
+// bitmap and force a re-raster on every zoom frame. Here it is redrawn instead
+// — which costs a pass over the board data per frame and nothing at rest.
+//
+// Groups deliberately stay in the DOM at every tier: there are a few
+// dozen of them, they are the most common thing to drag at this zoom, and
+// keeping them means dragging one needs no new code. That is also why the
+// canvas is inserted *before* the world layer: groups paint over it, as they
+// do the cards in every other tier, and so do the snap guides, the resize
+// handles and an in-flight connection's curve.
+//
+// `WhiteboardCanvas` is the only importer; this module must never import it
+// back (single-direction dependency between the canvas and its collaborators).
+
+import type { ScreenPoint } from '../../domain/camera'
+import { type ColorPreset, resolveColor } from '../../domain/color'
+import {
+  EDGE_CONTROL_MAX_PX,
+  computeEdgeGeometry,
+  resolveEdgeSides,
+} from '../../domain/edges'
+import {
+  type BoardNode,
+  type Edge,
+  type EdgeId,
+  type NodeId,
+  isPlainText,
+} from '../../domain/fileFormat'
+import { fileNodeKind } from '../../domain/naming'
+import {
+  type AnnotationColor,
+  type PdfAnnotation,
+  displayColor,
+} from '../../domain/pdfAnnotations'
+import { fileNodeOf, isPortal, portalWeight } from '../../domain/portals'
+import type { CardRect } from '../../domain/resize'
+import { SPREAD_METRICS, isSpreadTitle } from '../../domain/spread'
+import {
+  type CanvasView,
+  computeWorldViewportRect,
+} from '../../domain/virtualization'
+import {
+  ARRANGE_ANIMATION_MS,
+  EDGE_ARROW_WORLD_PX,
+  EDGE_LABEL_FONT_PX,
+  EDGE_LABEL_MAX_WIDTH_EM,
+  EDGE_LABEL_PADDING_PX,
+  EDGE_PASSAGE_MARK_WORLD_PX,
+  EDGE_STROKE_WORLD_PX,
+  OVERVIEW_ARROW_MIN_SCREEN_PX,
+  OVERVIEW_CARD_WASH_ALPHA,
+  OVERVIEW_GROUP_LABEL_MIN_SCREEN_PX,
+  OVERVIEW_LABEL_MIN_FONT_PX,
+  OVERVIEW_MIN_EDGE_STROKE_PX,
+  OVERVIEW_THEMED_BORDER_ALPHA,
+  OVERVIEW_THEMED_CARD_WASH_ALPHA,
+  OVERVIEW_TITLE_MIN_CARD_PX,
+  SPREAD_TITLE_WORLD,
+  TITLE_BLOCK_LINE_HEIGHT,
+  TITLE_BLOCK_WORLD_FONT_PX,
+  TITLE_BLOCK_WORLD_PADDING,
+} from '../constants'
+import { type PdfPageLabels, nodeTitleText, wrapTitleLines } from '../lod'
+import type { PageBox, PageFrame } from '../pdf/annotationGeometry'
+import { boxesFor, outlinesFor } from '../pdf/annotationLayer'
+import { READER_METRICS } from '../pdf/readerLayout'
+
+import {
+  type TitleBadge,
+  type TitleBadgeTone,
+  wearsTitleLine,
+} from './titleLine'
+
+const OVERVIEW_CANVAS_CLASS = 'yolo-whiteboard-overview'
+const OVERVIEW_HIDDEN_CLASS = 'yolo-whiteboard-overview-hidden'
+/** How dark bare text's block of ink is drawn, zoomed out past reading it. */
+const OVERVIEW_TEXT_ALPHA = 0.18
+/** Below this many CSS pixels wide a page is drawn as its card alone, not
+ * its picture: there is nothing of the page left to see, and a minimap holds
+ * hundreds of pages each narrower than a pixel — scaling every one of their
+ * thumbnails down was most of what redrawing it cost. */
+const PICTURE_MIN_SCREEN_PX = 4
+/** Past this many wrapped titles the cache starts over rather than growing
+ * with every card a long session has ever shown. */
+const TITLE_LINES_CACHE_LIMIT = 2000
+
+/** The surface a draw is for: its size in CSS pixels, which decides
+ * whether a card or an edge is on it at all; whether it carries text —
+ * titles and edge labels, which the tier sizes for a screen and the
+ * minimap has no room for; and whether it shows the selection, which is
+ * the board being worked on, not the board being found your way around. */
+type Surface = Readonly<{
+  width: number
+  height: number
+  text: boolean
+  selection: boolean
+}>
+
+/** A page's annotations as the overview draws them: its highlights one path
+ * per colour, in page fractions, and its framed areas. */
+type PageMarks = Readonly<{
+  highlights: ReadonlyMap<AnnotationColor, Path2D>
+  areas: readonly Readonly<{ color: AnnotationColor; box: PageBox }>[]
+}>
+
+/** By the page's list of annotations, then by where its PDF points land. */
+const pageMarksCache = new WeakMap<
+  readonly PdfAnnotation[],
+  WeakMap<PageFrame, PageMarks>
+>()
+
+/**
+ * Concrete colour values for one draw.
+ *
+ * The rest of the module never asks what colour anything is — every element
+ * carries `--yolo-whiteboard-color` and the stylesheet paints from it. A canvas
+ * cannot: it needs the value. Read once through `getComputedStyle` when the
+ * tier is entered and cached for as long as it lasts ("勿逐帧读"); a theme
+ * change lands on the next entry.
+ *
+ * The strings are kept as the browser gave them and handed straight back to
+ * `fillStyle`, so any colour syntax a theme uses works. Where the stylesheet
+ * mixes in transparency (`color-mix(… 70% …)`) this uses `globalAlpha` on the
+ * same colour, which needs no parsing and composites the same way.
+ *
+ * Dropped again whenever the document's body classes change, which is how a
+ * theme or light/dark switch reaches a plugin (`watchTheme`).
+ */
+type Palette = Readonly<{
+  presets: Readonly<Record<ColorPreset, string>>
+  /** Obsidian's uncoloured canvas grey — what an uncoloured node washes with. */
+  neutral: string
+  border: string
+  accent: string
+  text: string
+  muted: string
+  background: string
+  fontFamily: string
+  /** What each PDF annotation colour paints with (styles/pdf/
+   * annotations.css). */
+  annotations: Readonly<Record<AnnotationColor, string>>
+  /** What each title line badge is tinted with (styles/cards/
+   * title-line.css). */
+  badges: Readonly<Record<TitleBadgeTone, string>>
+  /** A dark theme, which shows PDF pages inverted (styles/pdf/card.css). */
+  dark: boolean
+}>
+
+/**
+ * The narrow surface `WhiteboardCanvas` injects so the overview can read the
+ * board, the camera and the selection it does not own — and, while a gesture
+ * is in flight, the geometry that has not been committed to the board yet.
+ */
+/** A portal's contents, and the frame they show through, in world units —
+ * and `scale`, what they are drawn at (domain/portals.ts's
+ * `ComposedPortal`): what is sized in world units inside a card, its type,
+ * is drawn that much larger or smaller. */
+export type PortalLayer = Readonly<{
+  /** The frame it is cut to; null for cards picked up out of it, which are
+   * in the hand rather than behind the frame, and drawn at its scale still. */
+  clip: Readonly<{ x: number; y: number; w: number; h: number }> | null
+  scale: number
+  nodes: readonly BoardNode[]
+  edges: readonly Edge[]
+}>
+
+export type OverviewLayerCallbacks = Readonly<{
+  getView: () => CanvasView
+  /** Every non-group node, in board order — groups keep their DOM. */
+  getCardNodes: () => readonly BoardNode[]
+  /** How wide an open spread's title may run before its name wraps, in
+   * world units (domain/spread.ts's `spreadTitleMaxWidth`). */
+  spreadTitleMaxWidth: (id: NodeId) => number
+  /** What a card's title line says it is (./titleLine.ts's
+   * `titleBadgeOf`), or null for a card without one. */
+  titleBadge: (node: BoardNode) => TitleBadge | null
+  /** The groups, which only the minimap draws (`paintBoard`): in the tier
+   * they keep their DOM. */
+  getGroupNodes: () => readonly BoardNode[]
+  getEdges: () => readonly Edge[]
+  /** What is behind each open portal (domain/portals.ts), cut to where it
+   * shows through: drawn after the board's own, each in its frame.
+   * `getCardNodes` and `getEdges` are the board's own. */
+  getPortalLayers: () => readonly PortalLayer[]
+  getNode: (id: NodeId) => BoardNode | undefined
+  isSelected: (id: NodeId) => boolean
+  isEdgeSelected: (id: EdgeId) => boolean
+  /** The edge whose label is being typed, or null. That one label stays in
+   * the DOM for the length of the rename (canvas.ts's `syncEdgeRenameChrome`)
+   * because a canvas holds no caret, so this is the one this layer must not
+   * draw as well. */
+  getRenamingEdgeId: () => EdgeId | null
+  /** Whether the card has its DOM in the world layer now — outside the tier,
+   * the cards that do not are the ones this layer draws (`render`). */
+  isMounted: (id: NodeId) => boolean
+  /**
+   * Live rectangles for the nodes a drag or a resize is moving, or null when
+   * nothing is. In the DOM tiers this feedback is a `transform` on the card's
+   * element; here it is the same numbers, drawn.
+   */
+  getLiveRects: () => ReadonlyMap<NodeId, CardRect> | null
+  /** What a PDF card's or a sheet's title says about its page — see
+   * ui/lod.ts's `nodeTitleText`. */
+  pdfPageLabels: PdfPageLabels
+  /** The small picture standing for a card (../pictures/pictures.ts), as
+   * the theme shows it — for a PDF card, the one of its page `page` — or
+   * null while it has none. */
+  picture: (node: BoardNode, dark: boolean, page?: number) => ImageBitmap | null
+  /** The annotations on a page that has a picture, and where its PDF points
+   * land on it (../pictures/pdfPages.ts's `pageFrame`); null when there are
+   * none to draw. */
+  pageAnnotations: (
+    path: string,
+    page: number,
+  ) => Readonly<{
+    frame: PageFrame
+    annotations: readonly PdfAnnotation[]
+  }> | null
+}>
+
+/**
+ * Owns the overview `<canvas>`, its backing-store size, the theme colours it
+ * draws in, and the dirty flag that keeps a still board from being redrawn.
+ * One instance per `WhiteboardCanvas`, constructed in `ensureDom`.
+ */
+export class OverviewLayer {
+  private readonly canvasEl: HTMLCanvasElement
+  private readonly ctx: CanvasRenderingContext2D | null
+  private active = false
+  /** Outside the tier, whether the canvas is showing cards the DOM has not
+   * mounted yet — see `renderUnmounted`. */
+  private underlay = false
+  private dirty = false
+  /** Counts `markDirty` calls — see `revision`. */
+  private revisionCount = 0
+  private palette: Palette | null = null
+  /** Titles already broken into lines, by text and the card's world size.
+   * Kept in world units, so a zoom does not invalidate them; dropped with the
+   * palette, whose font they were measured in. */
+  private readonly titleLines = new Map<string, readonly string[]>()
+  /** Cards in flight — see `animate`. */
+  private readonly motions = new Map<
+    NodeId,
+    Readonly<{
+      direction: 'in' | 'out'
+      offset: Readonly<{ x: number; y: number }>
+      delay: number
+      start: number
+    }>
+  >()
+  /** Where each title line was last drawn, in world units. */
+  private readonly titleRects = new Map<
+    NodeId,
+    Readonly<{ x: number; y: number; w: number; h: number }>
+  >()
+  /** Viewport size in CSS pixels, pushed in rather than measured: reading it
+   * here would force a layout flush on a frame that has just written the
+   * world's transform. `WhiteboardCanvas` already measures the viewport on its
+   * visibility tick and passes what it read. */
+  private width = 0
+  private height = 0
+  private appliedDpr = 0
+  private appliedWidth = 0
+  private appliedHeight = 0
+  /** The camera the last draw was made for — see `render`. */
+  private lastView: CanvasView | null = null
+  /** Watches for the theme changing under a tier that has already read its
+   * colours — see `watchTheme`. */
+  private themeObserver: MutationObserver | null = null
+
+  constructor(
+    private readonly context: YoloModuleHostFileViewContextV1,
+    /** The element whose computed style the theme colours are read from — the
+     * view root, which is where the board's own colour tokens are declared. */
+    private readonly styleSourceEl: HTMLElement,
+    parentEl: HTMLElement,
+    private readonly callbacks: OverviewLayerCallbacks,
+  ) {
+    const doc = context.getDocument()
+    this.canvasEl = doc.createElement('canvas')
+    this.canvasEl.className = `${OVERVIEW_CANVAS_CLASS} ${OVERVIEW_HIDDEN_CLASS}`
+    parentEl.appendChild(this.canvasEl)
+    this.ctx = this.canvasEl.getContext('2d')
+    this.watchTheme()
+  }
+
+  /**
+   * Drops the cached palette when the theme changes.
+   *
+   * The colours are read once per entry into the tier and then held, which is
+   * right — reading computed style per frame is not a thing to do — but a tier
+   * can outlast a theme: switching to dark while zoomed out would leave the
+   * board drawn in the light one's colours until the next entry, which may be
+   * minutes of panning away.
+   *
+   * Obsidian gives a plugin no theme event; what it does is rewrite the body's
+   * classes (`theme-dark`/`theme-light`, the active theme's own), so that is
+   * what is watched. A false positive costs one `getComputedStyle` on the next
+   * frame that draws, which is why this stays a class-attribute watch rather
+   * than anything that tries to work out whether the colours really moved.
+   *
+   * The observer is the *view's own* window's, and watches the view's own
+   * document: in a popout both are that window's, not the main one's
+   * (CLAUDE.md, Popout / Multi-window).
+   */
+  private watchTheme(): void {
+    const doc = this.styleSourceEl.ownerDocument
+    const win = doc.defaultView
+    if (!win) return
+    this.themeObserver = new win.MutationObserver(() => {
+      this.palette = null
+      this.titleLines.clear()
+      this.markDirty()
+    })
+    this.themeObserver.observe(doc.body, {
+      attributes: true,
+      attributeFilter: ['class'],
+    })
+  }
+
+  get isActive(): boolean {
+    return this.active
+  }
+
+  /**
+   * Enters or leaves the tier. Entering drops the cached palette so the theme
+   * is re-read: the moment the tier is entered is both the only moment the
+   * values are needed and a cheap place to spend one `getComputedStyle`. A
+   * theme that changes *during* the tier is caught by `watchTheme`.
+   */
+  setActive(active: boolean): void {
+    if (active === this.active) return
+    this.active = active
+    this.underlay = false
+    this.canvasEl.classList.toggle(OVERVIEW_HIDDEN_CLASS, !active)
+    this.lastView = null
+    if (active) {
+      this.palette = null
+      this.titleLines.clear()
+      this.dirty = true
+      return
+    }
+    this.motions.clear()
+    this.clear()
+  }
+
+  /** The board, the camera or the selection moved: the next frame redraws.
+   * Nothing else does — a still board costs nothing. */
+  markDirty(): void {
+    this.dirty = true
+    this.revisionCount += 1
+  }
+
+  /** Cards were mounted or unmounted: outside the tier that changes what the
+   * canvas has to draw, though not what the board shows (`revision`) — and
+   * inside it too, behind a portal that builds what is behind it. */
+  markMountsChanged(): void {
+    this.dirty = true
+  }
+
+  /**
+   * Changes whenever what the board shows does — its contents, the
+   * selection, a picture arriving, the theme — and not when the camera
+   * moves, which reaches `render` by the view's identity instead. What a
+   * surface holding the board at a view of its own (the minimap) watches to
+   * know when to draw again.
+   */
+  get revision(): number {
+    return this.revisionCount
+  }
+
+  /**
+   * Draws the whole board into another surface — the minimap's
+   * (./minimap.ts) — with this tier's drawing, so the two show the board the
+   * same way. Groups too, which the tier leaves to the DOM: on a surface of
+   * its own they are the landmarks the board is read by — and no text, which
+   * the tier sizes for a screen: a PDF's title would run across a minimap.
+   * No selection either: a minimap is for finding your way, and a ring
+   * there only repeats what the board already shows. The caller owns the
+   * context's transform and clears it first.
+   */
+  paintBoard(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    size: Readonly<{ width: number; height: number }>,
+  ): void {
+    this.palette ??= this.readPalette(ctx)
+    const live = this.callbacks.getLiveRects()
+    const surface = { ...size, text: false, selection: false }
+    this.drawGroups(ctx, view, live)
+    this.drawBoard(ctx, view, surface, live)
+    ctx.globalAlpha = 1
+  }
+
+  /** Edges, then cards — the board's own, then each portal's in its frame
+   * — and the portals' frames over what they frame (`drawFrames`). Behind a
+   * portal, what `skipBehind` names is left out: in the tier, the cards a
+   * portal zoomed in on shows built (canvas.ts's `drawnPortals`). */
+  private drawBoard(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    surface: Surface,
+    live: ReadonlyMap<NodeId, CardRect> | null,
+    skipBehind?: (id: NodeId) => boolean,
+  ): void {
+    this.drawEdges(ctx, view, surface, live)
+    this.drawCards(ctx, view, surface, live)
+    this.inPortals(ctx, view, (layer) => {
+      this.drawEdges(ctx, view, surface, live, layer.edges, layer.scale)
+      this.drawCards(
+        ctx,
+        view,
+        surface,
+        live,
+        skipBehind,
+        layer.nodes,
+        layer.scale,
+      )
+      return true
+    })
+    this.drawFrames(ctx, view, surface, live)
+    this.inPortals(ctx, view, (layer) =>
+      this.drawFrames(ctx, view, surface, live, skipBehind, layer.nodes),
+    )
+  }
+
+  /**
+   * A portal is its frame and nothing else (portal.css): what shows through
+   * it is drawn cut to it (`inPortals`), and its name is its title line. The
+   * frame goes over what it frames — drawn after it, as the DOM keeps what
+   * is behind a portal inside its border (canvas.ts's `portalClip`) — and
+   * the selection's ring with it. True if any was drawn.
+   */
+  private drawFrames(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    surface: Surface,
+    live: ReadonlyMap<NodeId, CardRect> | null,
+    skip?: (id: NodeId) => boolean,
+    nodes: readonly BoardNode[] = this.callbacks.getCardNodes(),
+  ): boolean {
+    const palette = this.palette
+    if (!palette) return false
+    const frames: {
+      node: BoardNode
+      x: number
+      y: number
+      w: number
+      h: number
+    }[] = []
+    for (const node of nodes) {
+      if (!isPortal(node) || skip?.(node.id)) continue
+      const rect = live?.get(node.id) ?? node
+      const x = rect.x * view.scale + view.tx
+      const y = rect.y * view.scale + view.ty
+      const w = rect.w * view.scale
+      const h = rect.h * view.scale
+      if (
+        x >= surface.width ||
+        y >= surface.height ||
+        x + w <= 0 ||
+        y + h <= 0
+      ) {
+        continue
+      }
+      frames.push({ node, x, y, w, h })
+    }
+    if (frames.length === 0) return false
+    const isSelected = (id: NodeId): boolean =>
+      surface.selection && this.callbacks.isSelected(id)
+    // A card's border, and a selected card's ring (`drawCards`).
+    ctx.globalAlpha = 1
+    ctx.lineWidth = 1
+    ctx.strokeStyle = palette.border
+    ctx.beginPath()
+    for (const frame of frames) {
+      if (!isSelected(frame.node.id)) this.strokeRectPath(ctx, frame)
+    }
+    ctx.stroke()
+    ctx.strokeStyle = palette.accent
+    ctx.lineWidth = 2
+    ctx.beginPath()
+    for (const frame of frames) {
+      if (isSelected(frame.node.id)) this.strokeRectPath(ctx, frame)
+    }
+    ctx.stroke()
+    ctx.lineWidth = 1
+    return true
+  }
+
+  /** Runs `draw` for each open portal, with the context cut to its frame;
+   * true if any of them drew. */
+  private inPortals(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    draw: (layer: PortalLayer) => boolean,
+  ): boolean {
+    let drew = false
+    for (const layer of this.callbacks.getPortalLayers()) {
+      const { clip } = layer
+      if (!clip) {
+        if (draw(layer)) drew = true
+        continue
+      }
+      const x = clip.x * view.scale + view.tx
+      const y = clip.y * view.scale + view.ty
+      const w = clip.w * view.scale
+      const h = clip.h * view.scale
+      if (x >= this.width || y >= this.height || x + w <= 0 || y + h <= 0) {
+        continue
+      }
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(x, y, w, h)
+      ctx.clip()
+      if (draw(layer)) drew = true
+      ctx.restore()
+    }
+    return drew
+  }
+
+  /** The groups as frames: a faint wash of their colour and its border —
+   * the group stylesheet's look with the label left out, which at a
+   * minimap's size would be a smudge. */
+  private drawGroups(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    live: ReadonlyMap<NodeId, CardRect> | null,
+  ): void {
+    const palette = this.palette
+    if (!palette) return
+    ctx.lineWidth = 1
+    for (const node of this.callbacks.getGroupNodes()) {
+      const rect = live?.get(node.id) ?? node
+      const color = this.colorOf(node, palette) ?? palette.neutral
+      const x = rect.x * view.scale + view.tx
+      const y = rect.y * view.scale + view.ty
+      const w = rect.w * view.scale
+      const h = rect.h * view.scale
+      ctx.fillStyle = color
+      ctx.globalAlpha = OVERVIEW_CARD_WASH_ALPHA / 2
+      ctx.fillRect(x, y, w, h)
+      ctx.strokeStyle = color
+      ctx.globalAlpha = OVERVIEW_THEMED_BORDER_ALPHA
+      ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1)
+    }
+    ctx.globalAlpha = 1
+  }
+
+  setViewportSize(width: number, height: number): void {
+    if (width === this.width && height === this.height) return
+    this.width = width
+    this.height = height
+    this.dirty = true
+  }
+
+  /** Called once per frame from the canvas's rAF loop, after the camera has
+   * advanced — so what is drawn is the camera the world layer was just given. */
+  render(): void {
+    const view = this.callbacks.getView()
+    // The camera controller replaces its view object rather than mutating it,
+    // so identity is an exact "has the camera moved" test that costs one
+    // comparison — no notification path from the camera to here, and no way
+    // for the two to disagree about whether a frame is needed.
+    if (view !== this.lastView) this.dirty = true
+    if (!this.dirty) return
+    const ctx = this.ctx
+    if (!ctx || this.width === 0 || this.height === 0) return
+    this.dirty = false
+    this.lastView = view
+    if (!this.active) {
+      this.renderUnmounted(ctx, view)
+      return
+    }
+    this.palette ??= this.readPalette(ctx)
+    this.resizeBackingStore(ctx)
+    ctx.clearRect(0, 0, this.width, this.height)
+    const live = this.callbacks.getLiveRects()
+    // Edges first, so a card covers the line that ends at it rather than the
+    // other way round -- the order the DOM tiers paint in.
+    const surface = {
+      width: this.width,
+      height: this.height,
+      text: true,
+      selection: true,
+    }
+    // Recorded as the frame draws them — the board's own and every
+    // portal's — so cleared once, before any.
+    this.titleRects.clear()
+    this.drawBoard(ctx, view, surface, live, (id) =>
+      this.callbacks.isMounted(id),
+    )
+    this.drawMotions(ctx, view)
+    ctx.globalAlpha = 1
+  }
+
+  /**
+   * Outside the tier: the cards on screen whose DOM has not been mounted
+   * yet, drawn as the tier draws them, under the world layer.
+   *
+   * The DOM tiers mount what the camera shows a few cards a frame
+   * (MOUNT_QUOTA_PER_FRAME) and look again at what it shows every
+   * RECOMPUTE_INTERVAL_MS, so a camera that widens faster than that — a
+   * sharp zoom out from reading a page — showed blank board where the cards
+   * it had not mounted yet were, and then had them appear. The tier's exit
+   * already covers that moment by drawing on until the mount queue drains
+   * (canvas.ts's `settleOverviewLinger`); this is the same handoff for every
+   * other moment: a card that mounts covers its own drawing from the frame it
+   * mounts in, so there is never a frame where it is shown by neither.
+   *
+   * Only the cards with no DOM, not the whole board as in the tier: a bare
+   * text card's DOM is transparent, and what the tier draws for one would
+   * show through it. Nor edges: theirs is still in the document. When it
+   * draws nothing the canvas goes out of the document again, so a board whose
+   * cards are all there costs a pass over them per camera move and nothing
+   * at rest.
+   */
+  private renderUnmounted(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+  ): void {
+    this.palette ??= this.readPalette(ctx)
+    this.resizeBackingStore(ctx)
+    if (this.underlay) ctx.clearRect(0, 0, this.width, this.height)
+    this.titleRects.clear()
+    const surface = {
+      width: this.width,
+      height: this.height,
+      text: true,
+      selection: true,
+    }
+    const live = this.callbacks.getLiveRects()
+    const mounted = (id: NodeId) => this.callbacks.isMounted(id)
+    const ownDrew = this.drawCards(ctx, view, surface, live, mounted)
+    const portalsDrew = this.inPortals(ctx, view, (layer) =>
+      this.drawCards(
+        ctx,
+        view,
+        surface,
+        live,
+        mounted,
+        layer.nodes,
+        layer.scale,
+      ),
+    )
+    const ownFramesDrew = this.drawFrames(ctx, view, surface, live, mounted)
+    const portalFramesDrew = this.inPortals(ctx, view, (layer) =>
+      this.drawFrames(ctx, view, surface, live, mounted, layer.nodes),
+    )
+    const drew = ownDrew || portalsDrew || ownFramesDrew || portalFramesDrew
+    ctx.globalAlpha = 1
+    if (drew === this.underlay) return
+    this.underlay = drew
+    this.canvasEl.classList.toggle(OVERVIEW_HIDDEN_CLASS, !drew)
+    if (!drew) this.clear()
+  }
+
+  /**
+   * Moves a card in from `offset` (world units from where it is) while it
+   * fades in, or out to it while it fades away — the overview tier's side of
+   * a PDF spread being dealt out or gathered back (canvas.ts). The DOM tiers
+   * do this with Web Animations on the elements; here there are no elements,
+   * so the canvas carries the motion and redraws every frame until it ends.
+   * A card that has gone out stays unseen until it leaves the board.
+   */
+  animate(
+    id: NodeId,
+    motion: Readonly<{
+      direction: 'in' | 'out'
+      offset: Readonly<{ x: number; y: number }>
+      delay: number
+    }>,
+  ): void {
+    if (!this.active) return
+    this.motions.set(id, {
+      ...motion,
+      start: this.context.getWindow().performance.now(),
+    })
+    this.dirty = true
+  }
+
+  /** Puts cards back where they are, at full opacity, mid-motion or not. */
+  stopAnimating(ids: Iterable<NodeId>): void {
+    for (const id of ids) this.motions.delete(id)
+    this.dirty = true
+  }
+
+  /** The cards in motion, each at its own place and opacity; the next frame
+   * is owed while any is still moving. */
+  private drawMotions(ctx: CanvasRenderingContext2D, view: CanvasView): void {
+    const palette = this.palette
+    if (!palette || this.motions.size === 0) return
+    const now = this.context.getWindow().performance.now()
+    /** A card came to rest this frame: the next is still owed, since it is
+     * `drawCards` that draws it from there on. */
+    let landed = false
+    let moving = false
+    for (const [id, motion] of this.motions) {
+      const node = this.callbacks.getNode(id)
+      const elapsed = now - motion.start - motion.delay
+      const t = Math.min(1, Math.max(0, elapsed / ARRANGE_ANIMATION_MS))
+      if (!node) {
+        this.motions.delete(id)
+        continue
+      }
+      // Drawn here on the frame it arrives too — `drawCards` skipped it
+      // this frame — and handed back to `drawCards` from the next.
+      if (motion.direction === 'in' && t >= 1) {
+        this.motions.delete(id)
+        landed = true
+      }
+      if (t < 1) moving = true
+      // ARRANGE_ANIMATION_EASING's curve, near enough for 220ms: fast out
+      // of the start, settling into the end.
+      const eased = 1 - (1 - t) ** 4
+      const away = motion.direction === 'in' ? 1 - eased : eased
+      const alpha = 1 - away
+      if (alpha <= 0) continue
+      const x = (node.x + motion.offset.x * away) * view.scale + view.tx
+      const y = (node.y + motion.offset.y * away) * view.scale + view.ty
+      const w = node.w * view.scale
+      const h = node.h * view.scale
+      ctx.globalAlpha = alpha
+      ctx.fillStyle = palette.background
+      ctx.fillRect(x, y, w, h)
+      // The wash it wears once it lands (`drawCards`), or it would change
+      // the frame it stops moving.
+      const picture = this.pictureOf(node, { w }, palette.dark)
+      const own = this.colorOf(node, palette)
+      if (!picture || own !== null) {
+        ctx.globalAlpha =
+          alpha *
+          (picture ? OVERVIEW_THEMED_CARD_WASH_ALPHA : OVERVIEW_CARD_WASH_ALPHA)
+        ctx.fillStyle = own ?? palette.neutral
+        ctx.fillRect(x, y, w, h)
+      }
+      // Its pages, as they will be drawn once it lands (`drawCards`), and
+      // then no title: a PDF's stays put, drawn by `drawCards` throughout.
+      ctx.globalAlpha = alpha
+      const pictured = this.drawPicture(
+        ctx,
+        node,
+        { x, y, w, h },
+        palette.dark,
+        view.scale,
+        picture,
+      )
+      // The border it will have when it lands (`drawCards`): a selection's
+      // ring, the faint accent of a selected spread's sheet, or the plain
+      // one — so nothing changes the frame it stops.
+      const selected = this.callbacks.isSelected(node.id)
+      const ofSelected =
+        !selected &&
+        node.type === 'pdf-page' &&
+        this.callbacks.isSelected(node.parent)
+      ctx.globalAlpha = ofSelected ? alpha * 0.45 : alpha
+      ctx.lineWidth = selected ? 2 : 1
+      ctx.strokeStyle = selected || ofSelected ? palette.accent : palette.border
+      ctx.beginPath()
+      this.strokeRectPath(ctx, { x, y, w, h })
+      ctx.stroke()
+      ctx.globalAlpha = alpha
+      ctx.lineWidth = 1
+      if (pictured || w < OVERVIEW_TITLE_MIN_CARD_PX) continue
+      const title = nodeTitleText(node, this.callbacks.pdfPageLabels)
+      ctx.font = `500 ${TITLE_BLOCK_WORLD_FONT_PX * view.scale}px ${palette.fontFamily}`
+      ctx.fillStyle = palette.text
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(title, x + w / 2, y + h / 2, w)
+    }
+    ctx.globalAlpha = 1
+    if (moving || landed) this.dirty = true
+  }
+
+  destroy(): void {
+    this.themeObserver?.disconnect()
+    this.themeObserver = null
+    this.canvasEl.remove()
+  }
+
+  private clear(): void {
+    this.ctx?.clearRect(0, 0, this.canvasEl.width, this.canvasEl.height)
+  }
+
+  /**
+   * Matches the backing store to the viewport and the display's pixel ratio.
+   * `devicePixelRatio` comes from the view's own window, which in an Obsidian
+   * popout is a different window on a possibly different display (Popout /
+   * Multi-window, CLAUDE.md).
+   */
+  private resizeBackingStore(ctx: CanvasRenderingContext2D): void {
+    const dpr = this.context.getWindow().devicePixelRatio || 1
+    const w = Math.round(this.width * dpr)
+    const h = Math.round(this.height * dpr)
+    if (
+      w !== this.appliedWidth ||
+      h !== this.appliedHeight ||
+      dpr !== this.appliedDpr
+    ) {
+      this.canvasEl.width = w
+      this.canvasEl.height = h
+      this.appliedWidth = w
+      this.appliedHeight = h
+      this.appliedDpr = dpr
+    }
+    // Re-stated every frame: resizing the backing store resets the context.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  }
+
+  private readPalette(ctx: CanvasRenderingContext2D): Palette {
+    const style = this.context.getWindow().getComputedStyle(this.styleSourceEl)
+    const read = (name: string, fallback: string): string => {
+      const value = style.getPropertyValue(name).trim()
+      return value.length > 0 && this.parses(ctx, value) ? value : fallback
+    }
+    return {
+      presets: {
+        '1': read('--yolo-whiteboard-color-1', '#e93147'),
+        '2': read('--yolo-whiteboard-color-2', '#ec7500'),
+        '3': read('--yolo-whiteboard-color-3', '#e0ac00'),
+        '4': read('--yolo-whiteboard-color-4', '#08b94e'),
+        '5': read('--yolo-whiteboard-color-5', '#00bfbc'),
+        '6': read('--yolo-whiteboard-color-6', '#7852ee'),
+      },
+      neutral: read('--yolo-whiteboard-color', '#c0c0c0'),
+      border: read('--background-modifier-border', '#dcddde'),
+      accent: read('--interactive-accent', '#7c3aed'),
+      text: read('--text-normal', '#222222'),
+      muted: read('--text-muted', '#5c5c5c'),
+      background: read('--background-primary', '#ffffff'),
+      fontFamily: style.fontFamily || 'sans-serif',
+      annotations: {
+        yellow: read('--color-yellow', '#e0ac00'),
+        green: read('--color-green', '#08b94e'),
+        blue: read('--color-blue', '#086ddd'),
+        pink: read('--color-pink', '#d53984'),
+        purple: read('--color-purple', '#7852ee'),
+      },
+      badges: {
+        red: read('--color-red', '#e93147'),
+        blue: read('--color-blue', '#086ddd'),
+      },
+      dark: this.styleSourceEl.closest('.theme-dark') !== null,
+    }
+  }
+
+  /** Whether the canvas can paint with this colour — a theme may hand back a
+   * value the 2D context does not accept, and a rejected `fillStyle` silently
+   * keeps the previous colour, which would paint the board in the wrong one
+   * rather than in the fallback. */
+  private parses(ctx: CanvasRenderingContext2D, value: string): boolean {
+    const before = ctx.fillStyle
+    ctx.fillStyle = value
+    const accepted = ctx.fillStyle !== before
+    ctx.fillStyle = before
+    // A value that normalises to exactly what was already set reads as
+    // rejected; accepting the false negative costs a fallback colour, where
+    // the false positive would cost a wrong one.
+    return accepted
+  }
+
+  /** A node's colour, or null when it has none — the same three-way resolution
+   * the DOM path makes (domain/color.ts), landing on a value instead of a
+   * class. */
+  private colorOf(node: BoardNode, palette: Palette): string | null {
+    const resolved = resolveColor(node.color)
+    switch (resolved.kind) {
+      case 'preset':
+        return palette.presets[resolved.preset]
+      case 'custom':
+        return resolved.hex
+      case 'none':
+        return null
+    }
+  }
+
+  private colorOfEdge(edge: Edge, palette: Palette): string {
+    const resolved = resolveColor(edge.color)
+    switch (resolved.kind) {
+      case 'preset':
+        return palette.presets[resolved.preset]
+      case 'custom':
+        return resolved.hex
+      case 'none':
+        return palette.neutral
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Cards
+  //
+  // Drawn as a DOM card with no content yet is (the switch is direct, so the
+  // two tiers have to look the same): an opaque fill,
+  // a wash of the node's colour over it, a border, and — only where a card is
+  // big enough on screen for the line to mean anything — its title block.
+  //
+  // Batched by colour rather than drawn card by card. Every `fillStyle` write
+  // is a state change in the rasteriser, and a board has at most seven colours;
+  // one path per colour turns three thousand of them into a handful.
+  // -----------------------------------------------------------------------
+
+  private drawCards(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    surface: Surface,
+    live: ReadonlyMap<NodeId, CardRect> | null,
+    skip?: (id: NodeId) => boolean,
+    nodes: readonly BoardNode[] = this.callbacks.getCardNodes(),
+    unit = 1,
+  ): boolean {
+    const isSelected = (id: NodeId): boolean =>
+      surface.selection && this.callbacks.isSelected(id)
+    const palette = this.palette
+    if (!palette) return false
+    // What a world unit inside these cards measures on screen: behind a
+    // portal at another scale (`PortalLayer`), type is drawn that much
+    // larger or smaller.
+    const typeScale = view.scale * unit
+    // Screen rects of everything on screen, kept once so the passes below
+    // agree and the projection is done once per card rather than four times.
+    const visible: {
+      node: BoardNode
+      x: number
+      y: number
+      w: number
+      h: number
+    }[] = []
+    const texts: typeof visible = []
+    const titles: TitleLine[] = []
+    for (const node of nodes) {
+      if (skip?.(node.id)) continue
+      const moving = this.motions.has(node.id)
+      const rect = live?.get(node.id) ?? node
+      const x = rect.x * view.scale + view.tx
+      const y = rect.y * view.scale + view.ty
+      const w = rect.w * view.scale
+      const h = rect.h * view.scale
+      if (
+        x >= surface.width ||
+        y >= surface.height ||
+        x + w <= 0 ||
+        y + h <= 0
+      ) {
+        continue
+      }
+      const item = { node, x, y, w, h }
+      // Its title line stands where a spread's title does (title-line.css)
+      // — and a PDF's stays drawn here while the card fades in under it: a
+      // spread folding keeps its title in place throughout.
+      const badge = this.callbacks.titleBadge(node)
+      if (badge && wearsTitleLine(node)) {
+        const th = SPREAD_METRICS.titleHeight * typeScale
+        titles.push({
+          node,
+          badge,
+          x,
+          y: y - SPREAD_METRICS.titleGap * typeScale - th,
+          w,
+          h: th,
+          // Its own width, never under a page's default (title-line.css).
+          maxW: Math.max(w, SPREAD_METRICS.pageWidth * typeScale),
+        })
+      }
+      // The rest of it is drawn on its own, at its own opacity
+      // (`drawMotions`).
+      if (moving) continue
+      if (isPlainText(node)) texts.push(item)
+      else if (badge && isSpreadTitle(node)) {
+        titles.push({
+          ...item,
+          badge,
+          maxW: this.callbacks.spreadTitleMaxWidth(node.id) * view.scale,
+        })
+      } else if (!isPortal(node)) visible.push(item)
+    }
+    // Bare text has no card to draw: at this distance it is its picture of
+    // itself (../pictures/cardPictures.ts) where it has one, and a block of
+    // ink, in its colour, as greyed-out text is drawn, until it does — and a
+    // selection ring when it is selected, drawn with the cards' below.
+    if (texts.length > 0) {
+      for (const text of texts) {
+        ctx.globalAlpha = 1
+        if (this.drawPicture(ctx, text.node, text, palette.dark, view.scale)) {
+          continue
+        }
+        ctx.globalAlpha = OVERVIEW_TEXT_ALPHA
+        ctx.fillStyle = this.colorOf(text.node, palette) ?? palette.text
+        ctx.fillRect(text.x, text.y, text.w, text.h)
+      }
+      ctx.globalAlpha = 1
+      ctx.strokeStyle = palette.accent
+      ctx.lineWidth = 2
+      ctx.beginPath()
+      let anySelected = false
+      for (const text of texts) {
+        if (!isSelected(text.node.id)) continue
+        this.strokeRectPath(ctx, text)
+        anySelected = true
+      }
+      if (anySelected) ctx.stroke()
+      ctx.lineWidth = 1
+    }
+    const drew = texts.length > 0 || (surface.text && titles.length > 0)
+    if (visible.length === 0) {
+      if (surface.text) this.drawTitleLines(ctx, view, titles, unit)
+      return drew
+    }
+
+    // 1. The opaque surface, in one path.
+    ctx.globalAlpha = 1
+    ctx.fillStyle = palette.background
+    ctx.beginPath()
+    for (const card of visible) ctx.rect(card.x, card.y, card.w, card.h)
+    ctx.fill()
+
+    // 2. The colour wash, one path per colour and strength. A card that has
+    //    a picture of itself (../pictures/) — its content, a PDF's pages, an
+    //    image — is drawn as the DOM tiers show it with that content: washed
+    //    only if it has a colour, and as lightly as cards/color.css washes
+    //    it. One without stands in its title block's look, washed whatever
+    //    its colour. Every card's colour is kept too (`byColor`), for the
+    //    borders below.
+    const pictures = new Map<NodeId, ImageBitmap>()
+    for (const card of visible) {
+      const picture = this.pictureOf(card.node, card, palette.dark)
+      if (picture) pictures.set(card.node.id, picture)
+    }
+    const byColor = new Map<string, typeof visible>()
+    const washes = new Map<number, Map<string, typeof visible>>()
+    for (const card of visible) {
+      const own = this.colorOf(card.node, palette)
+      const color = own ?? palette.neutral
+      const bucket = byColor.get(color)
+      if (bucket) bucket.push(card)
+      else byColor.set(color, [card])
+      const pictured = pictures.has(card.node.id)
+      if (pictured && own === null) continue
+      const alpha = pictured
+        ? OVERVIEW_THEMED_CARD_WASH_ALPHA
+        : OVERVIEW_CARD_WASH_ALPHA
+      const strength = washes.get(alpha) ?? new Map<string, typeof visible>()
+      washes.set(alpha, strength)
+      const wash = strength.get(color)
+      if (wash) wash.push(card)
+      else strength.set(color, [card])
+    }
+    for (const [alpha, strength] of washes) {
+      ctx.globalAlpha = alpha
+      for (const [color, cards] of strength) {
+        ctx.fillStyle = color
+        ctx.beginPath()
+        for (const card of cards) ctx.rect(card.x, card.y, card.w, card.h)
+        ctx.fill()
+      }
+    }
+
+    // 2b. The pictures, over their wash as the content is over its card.
+    //     Such a card needs no title block: it shows its own.
+    ctx.globalAlpha = 1
+    for (const card of visible) {
+      const picture = pictures.get(card.node.id)
+      if (picture) {
+        this.drawPicture(
+          ctx,
+          card.node,
+          card,
+          palette.dark,
+          view.scale,
+          picture,
+        )
+      }
+    }
+    const pictured = new Set(pictures.keys())
+
+    // 3. Borders. An uncoloured card takes the theme's border token at full
+    //    strength; a coloured one takes its own colour at the stylesheet's 70%.
+    ctx.lineWidth = 1
+    ctx.globalAlpha = 1
+    ctx.strokeStyle = palette.border
+    ctx.beginPath()
+    for (const card of visible) {
+      if (this.colorOf(card.node, palette) !== null) continue
+      if (isSelected(card.node.id)) continue
+      this.strokeRectPath(ctx, card)
+    }
+    ctx.stroke()
+    ctx.globalAlpha = OVERVIEW_THEMED_BORDER_ALPHA
+    for (const [color, cards] of byColor) {
+      ctx.strokeStyle = color
+      ctx.beginPath()
+      let any = false
+      for (const card of cards) {
+        if (this.colorOf(card.node, palette) === null) continue
+        if (isSelected(card.node.id)) continue
+        this.strokeRectPath(ctx, card)
+        any = true
+      }
+      if (any) ctx.stroke()
+    }
+
+    // 4. Selection, over everything: one ring, in the accent, at the weight the
+    //    stylesheet gives a selected card.
+    ctx.globalAlpha = 1
+    ctx.strokeStyle = palette.accent
+    ctx.lineWidth = 2
+    ctx.beginPath()
+    let anySelected = false
+    for (const card of visible) {
+      if (!isSelected(card.node.id)) continue
+      this.strokeRectPath(ctx, card)
+      anySelected = true
+    }
+    if (anySelected) ctx.stroke()
+    ctx.lineWidth = 1
+
+    // 4b. The sheets of a selected spread, lit faintly — the stylesheet's
+    //     `.yolo-whiteboard-spread-sheet-of-selected`.
+    ctx.globalAlpha = 0.45
+    ctx.beginPath()
+    let anyLit = false
+    for (const card of visible) {
+      const node = card.node
+      if (node.type !== 'pdf-page') continue
+      if (isSelected(node.id)) continue
+      if (!isSelected(node.parent)) continue
+      this.strokeRectPath(ctx, card)
+      anyLit = true
+    }
+    if (anyLit) ctx.stroke()
+    ctx.globalAlpha = 1
+
+    if (!surface.text) return true
+    // 5. Titles, where a card is wide enough on screen to hold one. The type
+    //    and the box it wraps in are the DOM card's title block — 32 world
+    //    units, so it shrinks with the card — which is what makes the switch
+    //    between tiers invisible.
+    const fontPx = TITLE_BLOCK_WORLD_FONT_PX * typeScale
+    const lineHeight = fontPx * TITLE_BLOCK_LINE_HEIGHT
+    ctx.font = `500 ${fontPx}px ${palette.fontFamily}`
+    ctx.fillStyle = palette.text
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    for (const card of visible) {
+      if (card.w < OVERVIEW_TITLE_MIN_CARD_PX) continue
+      if (pictured.has(card.node.id)) continue
+      const title = nodeTitleText(card.node, this.callbacks.pdfPageLabels)
+      if (title.length === 0) continue
+      // Wrapped in its own size, as its title block lays it out.
+      const lines = this.wrapTitle(ctx, title, fileNodeOf(card.node), typeScale)
+      const top = card.y + card.h / 2 - ((lines.length - 1) * lineHeight) / 2
+      for (let i = 0; i < lines.length; i += 1) {
+        ctx.fillText(lines[i], card.x + card.w / 2, top + i * lineHeight)
+      }
+    }
+    // 6. Title lines, over every card, as the stylesheet stacks them
+    //    (title-line.css).
+    this.drawTitleLines(ctx, view, titles, unit)
+    return true
+  }
+
+  /** Title lines as the DOM draws them (title-line.css): the badge and the
+   * name, no box — and a card's ring when it is selected. An open spread's
+   * and its folded card's are the same line in the same place, so folding
+   * one changes nothing about it. */
+  private drawTitleLines(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    titles: readonly TitleLine[],
+    unit = 1,
+  ): void {
+    const palette = this.palette
+    if (!palette || titles.length === 0) return
+    // What a world unit inside these cards measures on screen (`drawCards`).
+    const typeScale = view.scale * unit
+    // Held at a floor on screen, as a group's label is (constants.ts's
+    // OVERVIEW_GROUP_LABEL_MIN_SCREEN_PX): the name is what an overview is
+    // for. Everything in the line grows by the same factor, upwards from the
+    // title's bottom edge so it never covers the paper, and as far right as
+    // the whole name needs up to the document's width on screen; past that
+    // the name wraps, and the line grows further up — the paper never moves
+    // for it. A grown name wraps sooner, so it can take more lines the
+    // further out the board is. Never narrower than the title's own node
+    // grown, though: a one-column document far out would leave the name a
+    // character or two a line.
+    const grow = Math.max(
+      1,
+      OVERVIEW_GROUP_LABEL_MIN_SCREEN_PX /
+        (SPREAD_TITLE_WORLD.nameFont * typeScale),
+    )
+    const u = typeScale * grow
+    const gap = SPREAD_TITLE_WORLD.gap * u
+    const badgeFont = `600 ${SPREAD_TITLE_WORLD.badgeFont * u}px ${palette.fontFamily}`
+    const nameFont = `500 ${SPREAD_TITLE_WORLD.nameFont * u}px ${palette.fontFamily}`
+    ctx.globalAlpha = 1
+    ctx.textBaseline = 'middle'
+    ctx.textAlign = 'left'
+    for (const title of titles) {
+      const name = nodeTitleText(title.node)
+      const badgeText = title.badge.text
+      const pad = SPREAD_TITLE_WORLD.padding * u
+      ctx.font = badgeFont
+      const badgeW =
+        ctx.measureText(badgeText).width +
+        SPREAD_TITLE_WORLD.badgePadding * 2 * u
+      ctx.font = nameFont
+      const measure = (text: string) => ctx.measureText(text).width
+      const lines = wrapTitleLines(
+        name,
+        Math.max(title.maxW, title.w * grow) - pad - badgeW - gap - pad,
+        Number.MAX_SAFE_INTEGER,
+        measure,
+      )
+      const nameW = Math.max(0, ...lines.map(measure))
+      const lineH =
+        SPREAD_TITLE_WORLD.nameFont * SPREAD_TITLE_WORLD.nameLineHeight * u
+      const h = Math.max(
+        title.h * grow,
+        lines.length * lineH + SPREAD_TITLE_WORLD.paddingBlock * 2 * u,
+      )
+      const box = {
+        x: title.x,
+        y: title.y + title.h - h,
+        w: Math.max(title.w, pad + badgeW + gap + nameW + pad),
+        h,
+      }
+      // Where it was drawn is where it is pointed at: the line reaches past
+      // the node's rectangle, and a press on any of it is a press on the
+      // title (`titleLineAt`).
+      this.titleRects.set(title.node.id, {
+        x: (box.x - view.tx) / view.scale,
+        y: (box.y - view.ty) / view.scale,
+        w: box.w / view.scale,
+        h: box.h / view.scale,
+      })
+      if (this.callbacks.isSelected(title.node.id)) {
+        ctx.strokeStyle = palette.accent
+        ctx.lineWidth = 2
+        ctx.beginPath()
+        this.strokeRectPath(ctx, box)
+        ctx.stroke()
+      }
+      const mid = box.y + box.h / 2
+      // The type, on its tint.
+      const badgeH = SPREAD_TITLE_WORLD.badgeHeight * u
+      ctx.globalAlpha = 0.12
+      ctx.fillStyle = palette.badges[title.badge.tone]
+      ctx.fillRect(box.x + pad, mid - badgeH / 2, badgeW, badgeH)
+      ctx.globalAlpha = 1
+      ctx.font = badgeFont
+      ctx.fillText(
+        badgeText,
+        box.x + pad + SPREAD_TITLE_WORLD.badgePadding * u,
+        mid,
+      )
+      ctx.font = nameFont
+      ctx.fillStyle = palette.text
+      const top = mid - ((lines.length - 1) * lineH) / 2
+      for (let i = 0; i < lines.length; i += 1) {
+        ctx.fillText(lines[i], box.x + pad + badgeW + gap, top + i * lineH)
+      }
+    }
+    ctx.lineWidth = 1
+  }
+
+  /** Where the canvas last drew a card's title line (world units), which at
+   * this tier grows past its node to stay readable; null when it drew none,
+   * or the tier is not showing. */
+  titleRect(id: NodeId): CardRect | null {
+    if (!this.active) return null
+    return this.titleRects.get(id) ?? null
+  }
+
+  /** The card whose drawn title line is under `point` (world units), if
+   * any — the line reaches past its node's rectangle at this tier. */
+  titleLineAt(point: Readonly<{ x: number; y: number }>): NodeId | null {
+    if (!this.active) return null
+    for (const [id, rect] of this.titleRects) {
+      if (
+        point.x >= rect.x &&
+        point.x <= rect.x + rect.w &&
+        point.y >= rect.y &&
+        point.y <= rect.y + rect.h
+      ) {
+        return id
+      }
+    }
+    return null
+  }
+
+  /**
+   * The picture `drawPicture` starts from — a folded PDF card's, the first
+   * page it shows — or null when the card has none to show at `rect`'s size.
+   * Asked before the card's wash too: a card with a picture is washed as a
+   * DOM card with content is, and one without as its title block.
+   */
+  private pictureOf(
+    node: BoardNode,
+    rect: Readonly<{ w: number }>,
+    dark: boolean,
+  ): ImageBitmap | null {
+    if (rect.w < PICTURE_MIN_SCREEN_PX) return null
+    return isFoldedPdf(node)
+      ? this.callbacks.picture(node, dark, Math.floor(node.startPage ?? 1))
+      : this.callbacks.picture(node, dark)
+  }
+
+  /**
+   * What a card shows at this tier where it has a picture: an image card its
+   * image, fitted in the card as the card fits it (cards/media.css); a sheet
+   * its page; a folded PDF card the pages its reader shows from where it was
+   * left (../pdf/readerLayout.ts: edge to edge at the card's width, a seam
+   * between each), as far down as there are pictures; any other card its
+   * content, which its picture shows over the card's whole box. False when
+   * there is none (`pictureOf`).
+   */
+  private drawPicture(
+    ctx: CanvasRenderingContext2D,
+    node: BoardNode,
+    rect: Readonly<{ x: number; y: number; w: number; h: number }>,
+    dark: boolean,
+    scale: number,
+    first = this.pictureOf(node, rect, dark),
+  ): boolean {
+    if (!first) return false
+    if (node.type === 'file' && fileNodeKind(node.file) === 'image') {
+      const picture = first
+      const fit = Math.min(rect.w / picture.width, rect.h / picture.height)
+      const w = picture.width * fit
+      const h = picture.height * fit
+      ctx.drawImage(
+        picture,
+        rect.x + (rect.w - w) / 2,
+        rect.y + (rect.h - h) / 2,
+        w,
+        h,
+      )
+      return true
+    }
+    if (node.type === 'pdf-page') {
+      ctx.drawImage(first, rect.x, rect.y, rect.w, rect.h)
+      this.drawAnnotations(ctx, node.file, node.page, rect, dark)
+      return true
+    }
+    if (!isFoldedPdf(node)) {
+      ctx.drawImage(first, rect.x, rect.y, rect.w, rect.h)
+      return true
+    }
+    const start = node.startPage ?? 1
+    let page = Math.floor(start)
+    let picture: ImageBitmap | null = first
+    const bottom = rect.y + rect.h
+    let y = rect.y - (start - page) * pageHeight(picture, rect.w)
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(rect.x, rect.y, rect.w, rect.h)
+    ctx.clip()
+    while (picture && y < bottom) {
+      const h = pageHeight(picture, rect.w)
+      ctx.drawImage(picture, rect.x, y, rect.w, h)
+      this.drawAnnotations(ctx, node.file, page, { ...rect, y, h }, dark)
+      y += h + READER_METRICS.gap * scale
+      page += 1
+      picture = y < bottom ? this.callbacks.picture(node, dark, page) : null
+    }
+    ctx.restore()
+    return true
+  }
+
+  /**
+   * A page's annotations over its picture at `page` (screen pixels), as a
+   * reader's annotation layer draws them (styles/pdf/annotations.css): a
+   * highlight one shape over its lines, multiplied into the page — screened
+   * into the inverted one of a dark theme — and a framed area a box with a
+   * faint wash.
+   *
+   * The highlights are one path per colour in page fractions, made once per
+   * list of annotations (`pageMarks`) and drawn through the page's rectangle
+   * as a transform: a board of annotated pages costs a fill per colour per
+   * page, not a path rebuilt point by point every frame.
+   */
+  private drawAnnotations(
+    ctx: CanvasRenderingContext2D,
+    path: string,
+    pageNumber: number,
+    page: Readonly<{ x: number; y: number; w: number; h: number }>,
+    dark: boolean,
+  ): void {
+    const palette = this.palette
+    const shown = this.callbacks.pageAnnotations(path, pageNumber)
+    if (!palette || !shown) return
+    const marks = this.pageMarks(shown.annotations, shown.frame)
+    const alpha = ctx.globalAlpha
+    ctx.save()
+    if (marks.highlights.size > 0) {
+      ctx.save()
+      ctx.translate(page.x, page.y)
+      ctx.scale(page.w, page.h)
+      ctx.globalCompositeOperation = dark ? 'screen' : 'multiply'
+      ctx.globalAlpha = alpha * (dark ? 0.4 : 0.45)
+      for (const [color, outline] of marks.highlights) {
+        ctx.fillStyle = palette.annotations[color]
+        ctx.fill(outline)
+      }
+      ctx.restore()
+    }
+    ctx.lineWidth = 1
+    for (const { color, box } of marks.areas) {
+      const x = page.x + box.left * page.w
+      const y = page.y + box.top * page.h
+      const w = (box.right - box.left) * page.w
+      const h = (box.bottom - box.top) * page.h
+      ctx.fillStyle = palette.annotations[color]
+      ctx.globalAlpha = alpha * 0.1
+      ctx.fillRect(x, y, w, h)
+      ctx.strokeStyle = palette.annotations[color]
+      ctx.globalAlpha = alpha
+      ctx.strokeRect(x, y, w, h)
+    }
+    ctx.restore()
+  }
+
+  /** A page's annotations as the overview draws them, made once per list —
+   * a store hands out a new one only when the page's annotations change. */
+  private pageMarks(
+    annotations: readonly PdfAnnotation[],
+    frame: PageFrame,
+  ): PageMarks {
+    let perFrame = pageMarksCache.get(annotations)
+    if (!perFrame) {
+      perFrame = new WeakMap()
+      pageMarksCache.set(annotations, perFrame)
+    }
+    const cached = perFrame.get(frame)
+    if (cached) return cached
+    // The view's own window's, like everything else it draws with.
+    const win = this.context.getWindow() as Window & typeof globalThis
+    const highlights = new Map<AnnotationColor, Path2D>()
+    const areas: PageMarks['areas'][number][] = []
+    for (const annotation of annotations) {
+      const color = displayColor(annotation.color)
+      if (annotation.type === 'area') {
+        for (const box of boxesFor(annotation, frame))
+          areas.push({ color, box })
+        continue
+      }
+      const outline = highlights.get(color) ?? new win.Path2D()
+      highlights.set(color, outline)
+      for (const points of outlinesFor(annotation, frame)) {
+        points.forEach(([x, y], at) => {
+          if (at === 0) outline.moveTo(x, y)
+          else outline.lineTo(x, y)
+        })
+        outline.closePath()
+      }
+    }
+    const marks = { highlights, areas }
+    perFrame.set(frame, marks)
+    return marks
+  }
+
+  /** A card's title in the lines its title block would give it. Measured at
+   * the font the context has now and taken back to world units, where the
+   * answer does not change as the camera zooms. */
+  private wrapTitle(
+    ctx: CanvasRenderingContext2D,
+    title: string,
+    node: BoardNode,
+    scale: number,
+  ): readonly string[] {
+    const key = `${node.w}x${node.h}\n${title}`
+    const cached = this.titleLines.get(key)
+    if (cached) return cached
+    if (this.titleLines.size >= TITLE_LINES_CACHE_LIMIT) this.titleLines.clear()
+    const padding = TITLE_BLOCK_WORLD_PADDING
+    const lineHeight = TITLE_BLOCK_WORLD_FONT_PX * TITLE_BLOCK_LINE_HEIGHT
+    const lines = wrapTitleLines(
+      title,
+      node.w - padding.x * 2,
+      Math.max(1, Math.floor((node.h - padding.y * 2) / lineHeight)),
+      (text) => ctx.measureText(text).width / scale,
+    )
+    this.titleLines.set(key, lines)
+    return lines
+  }
+
+  /** Adds a card's border to the current path, inset by half a line so the
+   * stroke lands inside the rectangle rather than straddling its edge. */
+  private strokeRectPath(
+    ctx: CanvasRenderingContext2D,
+    card: Readonly<{ x: number; y: number; w: number; h: number }>,
+  ): void {
+    const inset = ctx.lineWidth / 2
+    ctx.rect(
+      card.x + inset,
+      card.y + inset,
+      Math.max(0, card.w - ctx.lineWidth),
+      Math.max(0, card.h - ctx.lineWidth),
+    )
+  }
+
+  // -----------------------------------------------------------------------
+  // Edges
+  //
+  // The same bezier the DOM tiers draw (domain/edges.ts's
+  // `computeEdgeGeometry`), so the two are visually continuous across the
+  // switch, projected into screen space and batched by colour like the cards.
+  //
+  // Labels are drawn too, and drawn last so they sit over the curves the way
+  // the opaque DOM chip does — but still inside this method, which runs before
+  // the cards, because the label layer sits before the cards in the world
+  // (canvas.ts's `ensureDom`) and a card covers a label that runs under it.
+  // Arrowheads are drawn once they are big enough to read as arrowheads.
+  // -----------------------------------------------------------------------
+
+  private drawEdges(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    surface: Surface,
+    live: ReadonlyMap<NodeId, CardRect> | null,
+    edges: readonly Edge[] = this.callbacks.getEdges(),
+    unit = 1,
+  ): void {
+    const palette = this.palette
+    if (!palette) return
+    // Stroke weight follows the same half-cancelled law the stylesheet uses
+    // (`--yolo-whiteboard-zoom-multiplier`, 1/sqrt(scale)), which in screen
+    // pixels is `1.5 * sqrt(scale)` -- with a floor, because a line thinner
+    // than a pixel is drawn as a faded one and a board of them reads as haze.
+    // Behind a portal, of the scale they are seen at: `unit` times the
+    // camera's (domain/portals.ts's `portalWeight`).
+    const weight = Math.sqrt(view.scale) * portalWeight(unit)
+    const stroke = Math.max(
+      OVERVIEW_MIN_EDGE_STROKE_PX,
+      EDGE_STROKE_WORLD_PX * weight,
+    )
+    const arrow = EDGE_ARROW_WORLD_PX * weight
+    // The stylesheet's ring radius, under the same law.
+    const ring = EDGE_PASSAGE_MARK_WORLD_PX * weight
+    const drawArrows = arrow >= OVERVIEW_ARROW_MIN_SCREEN_PX
+    // Asked once, before the sweep: at the bottom of the tier there is no
+    // label small enough to be worth drawing, and that is also where there are
+    // the most edges to have skipped one for.
+    const drawLabels =
+      surface.text && EDGE_LABEL_FONT_PX * weight >= OVERVIEW_LABEL_MIN_FONT_PX
+
+    type Segment = Readonly<{
+      start: ScreenPoint
+      c1: ScreenPoint
+      c2: ScreenPoint
+      end: ScreenPoint
+      fromArrow: boolean
+      toArrow: boolean
+      /** The end reaches a passage inside its card (edges.css's
+       * `.yolo-whiteboard-edge-passage-end`): at this tier no card can say
+       * where, so the end meets its side's middle and carries the ring. */
+      fromMark: boolean
+      toMark: boolean
+      selected: boolean
+    }>
+    const byColor = new Map<string, Segment[]>()
+    // Labels are collected here rather than walked for separately: their
+    // anchor is a point on the geometry this loop already computes.
+    const labels: { text: string; x: number; y: number }[] = []
+    const renamingEdgeId = this.callbacks.getRenamingEdgeId()
+    const toScreen = (p: ScreenPoint): ScreenPoint => ({
+      x: p.x * view.scale + view.tx,
+      y: p.y * view.scale + view.ty,
+    })
+
+    // The band of the board the viewport covers, in world units, grown by the
+    // margin that bounds a curve outside its endpoints (edgeLayer's
+    // `edgeIsVisible` documents the bound). Rejecting an edge here costs four
+    // comparisons; rejecting it after its geometry costs the geometry, and at
+    // this zoom four edges in five are off screen.
+    const world = computeWorldViewportRect(
+      surface.width,
+      surface.height,
+      view,
+      0,
+    )
+    const margin = EDGE_CONTROL_MAX_PX
+
+    for (const edge of edges) {
+      // Within one card an edge is drawn only where the card, drawn as a
+      // reader, places its passages — never in this tier
+      // (domain/edges.ts's `resolveEdgeEnds`).
+      if (edge.fromNode === edge.toNode) continue
+      const fromNode = this.callbacks.getNode(edge.fromNode)
+      const toNode = this.callbacks.getNode(edge.toNode)
+      if (!fromNode || !toNode) continue
+      const from = {
+        id: edge.fromNode,
+        ...(live?.get(edge.fromNode) ?? fromNode),
+      }
+      const to = { id: edge.toNode, ...(live?.get(edge.toNode) ?? toNode) }
+      if (
+        Math.min(from.x, to.x) - margin > world.right ||
+        Math.max(from.x + from.w, to.x + to.w) + margin < world.left ||
+        Math.min(from.y, to.y) - margin > world.bottom ||
+        Math.max(from.y + from.h, to.y + to.h) + margin < world.top
+      ) {
+        continue
+      }
+      const sides = resolveEdgeSides(from, to, edge.fromSide, edge.toSide)
+      const geometry = computeEdgeGeometry(
+        from,
+        to,
+        sides.fromSide,
+        sides.toSide,
+      )
+      const start = toScreen(geometry.start)
+      const end = toScreen(geometry.end)
+      // A curve stays inside the hull of its control points, so a box around
+      // all four is enough to decide it cannot be seen.
+      const c1 = toScreen(geometry.c1)
+      const c2 = toScreen(geometry.c2)
+      if (
+        Math.min(start.x, end.x, c1.x, c2.x) > surface.width ||
+        Math.max(start.x, end.x, c1.x, c2.x) < 0 ||
+        Math.min(start.y, end.y, c1.y, c2.y) > surface.height ||
+        Math.max(start.y, end.y, c1.y, c2.y) < 0
+      ) {
+        continue
+      }
+      const selected =
+        surface.selection && this.callbacks.isEdgeSelected(edge.id)
+      const color = selected ? palette.accent : this.colorOfEdge(edge, palette)
+      const segment: Segment = {
+        start,
+        c1,
+        c2,
+        end,
+        fromArrow: edge.fromEnd === 'arrow',
+        toArrow: edge.toEnd === 'arrow',
+        fromMark: edge.fromAnchor !== undefined,
+        toMark: edge.toAnchor !== undefined,
+        selected,
+      }
+      const bucket = byColor.get(color)
+      if (bucket) bucket.push(segment)
+      else byColor.set(color, [segment])
+      if (!drawLabels) continue
+      const text = edge.label?.trim() ?? ''
+      if (text.length > 0 && edge.id !== renamingEdgeId) {
+        const at = toScreen(geometry.label)
+        labels.push({ text, x: at.x, y: at.y })
+      }
+    }
+    if (byColor.size === 0) return
+
+    ctx.globalAlpha = 1
+    ctx.lineCap = 'round'
+    for (const [color, segments] of byColor) {
+      ctx.strokeStyle = color
+      ctx.fillStyle = color
+      // A selected edge is drawn heavier, exactly as the stylesheet does it, so
+      // it needs its own pass at its own width.
+      for (const selected of [false, true]) {
+        const pass = segments.filter((s) => s.selected === selected)
+        if (pass.length === 0) continue
+        ctx.lineWidth = selected ? stroke * 2 : stroke
+        ctx.beginPath()
+        for (const s of pass) {
+          ctx.moveTo(s.start.x, s.start.y)
+          ctx.bezierCurveTo(s.c1.x, s.c1.y, s.c2.x, s.c2.y, s.end.x, s.end.y)
+        }
+        ctx.stroke()
+        if (!drawArrows) continue
+        ctx.beginPath()
+        for (const s of pass) {
+          if (s.toArrow) this.arrowHeadPath(ctx, s.c2, s.end, arrow)
+          if (s.fromArrow) this.arrowHeadPath(ctx, s.c1, s.start, arrow)
+        }
+        ctx.fill()
+        this.passageMarks(ctx, pass, palette.background, ring, stroke)
+      }
+    }
+    ctx.lineWidth = 1
+    this.drawEdgeLabels(ctx, view, surface, labels, weight)
+  }
+
+  /** Rings on the ends that reach a passage, in the colour the pass is
+   * stroking in, open in the board's background. */
+  private passageMarks(
+    ctx: CanvasRenderingContext2D,
+    segments: readonly Readonly<{
+      start: ScreenPoint
+      end: ScreenPoint
+      fromMark: boolean
+      toMark: boolean
+    }>[],
+    background: string,
+    radius: number,
+    stroke: number,
+  ): void {
+    const points: ScreenPoint[] = []
+    for (const s of segments) {
+      if (s.fromMark) points.push(s.start)
+      if (s.toMark) points.push(s.end)
+    }
+    if (points.length === 0) return
+    const color = ctx.strokeStyle
+    ctx.beginPath()
+    for (const at of points) {
+      ctx.moveTo(at.x + radius, at.y)
+      ctx.arc(at.x, at.y, radius, 0, Math.PI * 2)
+    }
+    ctx.fillStyle = background
+    ctx.fill()
+    ctx.lineWidth = stroke
+    ctx.strokeStyle = color
+    ctx.stroke()
+    ctx.fillStyle = color
+  }
+
+  /**
+   * The chips that name relations, over the curves they belong to.
+   *
+   * Not drawn while the tier only ran below 0.15, on the grounds that the type
+   * was a smudge by then. That is still true down there — hence the floor —
+   * but the tier now reaches 0.35, where a label is the one piece of text on
+   * the board saying what a line *means*, and a board of unnamed lines is the
+   * thing this zoom exists to read.
+   *
+   * One line, ellipsised at the stylesheet's `max-width`, where the element
+   * wraps: wrapping buys a second row of type this small, which is not a
+   * trade. The chip is a plain rectangle rather than the element's rounded
+   * one — its radius is 4 world units, under a pixel and a half here, so the
+   * corners are a rounding error and `fillRect` is what a rounding error
+   * should cost.
+   */
+  private drawEdgeLabels(
+    ctx: CanvasRenderingContext2D,
+    view: CanvasView,
+    surface: Surface,
+    labels: readonly Readonly<{ text: string; x: number; y: number }>[],
+    /** `drawEdges`'s: sqrt of the scale the labels are seen at. */
+    root: number,
+  ): void {
+    const palette = this.palette
+    if (!palette || labels.length === 0) return
+    // The counter-scaled law the stylesheet uses, in screen pixels: a size
+    // written in world units as `15 * 1/sqrt(scale)` lands at `15 * sqrt`.
+    const fontPx = EDGE_LABEL_FONT_PX * root
+    const padX = EDGE_LABEL_PADDING_PX.x * root
+    const padY = EDGE_LABEL_PADDING_PX.y * root
+    const lineHeight = fontPx * 1.3
+    const maxTextWidth = EDGE_LABEL_MAX_WIDTH_EM * fontPx
+
+    ctx.globalAlpha = 1
+    ctx.font = `${fontPx}px ${palette.fontFamily}`
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'middle'
+    const drawn: { text: string; width: number; x: number; y: number }[] = []
+    for (const label of labels) {
+      const text = this.ellipsise(ctx, label.text, maxTextWidth)
+      const width = ctx.measureText(text).width
+      const x = label.x - width / 2
+      const y = label.y
+      // Off-screen labels are cheap to skip and not cheap to draw: an edge is
+      // kept for its curve, and the curve's midpoint can be well outside the
+      // viewport the curve crosses.
+      if (
+        x - padX > surface.width ||
+        x + width + padX < 0 ||
+        y - lineHeight / 2 - padY > surface.height ||
+        y + lineHeight / 2 + padY < 0
+      ) {
+        continue
+      }
+      drawn.push({ text, width, x, y })
+    }
+    if (drawn.length === 0) return
+
+    ctx.fillStyle = palette.background
+    for (const label of drawn) {
+      ctx.fillRect(
+        label.x - padX,
+        label.y - lineHeight / 2 - padY,
+        label.width + padX * 2,
+        lineHeight + padY * 2,
+      )
+    }
+    ctx.fillStyle = palette.text
+    for (const label of drawn) ctx.fillText(label.text, label.x, label.y)
+  }
+
+  /** The text as it fits, with an ellipsis where it stops — what the element's
+   * `max-width` plus wrapping does, minus the wrapping. Binary search rather
+   * than a character at a time: `measureText` is the cost here, and a label
+   * long enough to need cutting is long enough for the difference to show. */
+  private ellipsise(
+    ctx: CanvasRenderingContext2D,
+    text: string,
+    maxWidth: number,
+  ): string {
+    if (ctx.measureText(text).width <= maxWidth) return text
+    let low = 0
+    let high = text.length
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2)
+      if (ctx.measureText(`${text.slice(0, mid)}…`).width <= maxWidth) {
+        low = mid
+      } else {
+        high = mid - 1
+      }
+    }
+    return `${text.slice(0, low)}…`
+  }
+
+  /** A filled triangle at `tip`, pointing the way the curve arrives there —
+   * which the last control point gives, since a bezier leaves its endpoint
+   * along the line to its neighbouring control point. */
+  private arrowHeadPath(
+    ctx: CanvasRenderingContext2D,
+    from: ScreenPoint,
+    tip: ScreenPoint,
+    size: number,
+  ): void {
+    const dx = tip.x - from.x
+    const dy = tip.y - from.y
+    const length = Math.hypot(dx, dy)
+    if (length < 1e-3) return
+    const ux = dx / length
+    const uy = dy / length
+    const baseX = tip.x - ux * size
+    const baseY = tip.y - uy * size
+    const halfWidth = size / 2
+    ctx.moveTo(tip.x, tip.y)
+    ctx.lineTo(baseX - uy * halfWidth, baseY + ux * halfWidth)
+    ctx.lineTo(baseX + uy * halfWidth, baseY - ux * halfWidth)
+    ctx.closePath()
+  }
+}
+
+/** A title line the canvas draws: an open spread's title node, or the
+ * strip over a card that wears one (`drawTitleLines`). Screen pixels. */
+type TitleLine = Readonly<{
+  node: BoardNode
+  badge: TitleBadge
+  x: number
+  y: number
+  w: number
+  h: number
+  /** How wide its line may run before the name wraps (title-line.css): the
+   * document's width, a folded card's being its own. Screen pixels. */
+  maxW: number
+}>
+
+/** A PDF card as its reader: not an open spread's title. */
+function isFoldedPdf(
+  node: BoardNode,
+): node is Extract<BoardNode, { type: 'file' }> {
+  return (
+    node.type === 'file' &&
+    fileNodeKind(node.file) === 'pdf' &&
+    !isSpreadTitle(node)
+  )
+}
+
+/** A page's height at `width`, in the shape of its picture. */
+function pageHeight(picture: ImageBitmap, width: number): number {
+  return (width * picture.height) / picture.width
+}

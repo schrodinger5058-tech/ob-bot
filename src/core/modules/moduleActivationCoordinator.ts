@@ -1,0 +1,409 @@
+import { withAbort } from '../../utils/async/settle'
+
+import {
+  type ModuleArtifactDescriptor,
+  type ModuleArtifactReadStore,
+  type VerifiedModuleArtifact,
+  verifyInstalledModuleArtifact,
+} from './moduleArtifactVerifier'
+import type {
+  ModuleDeviceStateStore,
+  ModuleDeviceStateTransaction,
+} from './moduleDeviceStateStore'
+import type { ModuleArtifactPlatform } from './moduleStore'
+import { isHostApiCompatible } from './officialModuleCatalog'
+import type {
+  ModuleIntentStateSource,
+  YoloModuleDefinition,
+  YoloModuleEntry,
+} from './types'
+import type { VerifiedModuleArtifactRegistry } from './verifiedModuleArtifactRegistry'
+
+export type ModuleActivationCoordinatorOptions = Readonly<{
+  deviceStateStore: Pick<ModuleDeviceStateStore, 'list' | 'runExclusive'>
+  intentStateSource?: Pick<ModuleIntentStateSource, 'load'>
+  artifactStore: ModuleArtifactReadStore
+  platform: ModuleArtifactPlatform
+  hostApi: string
+  loader: Readonly<{
+    load(
+      entry: YoloModuleEntry,
+      bytes: Uint8Array,
+      signal?: AbortSignal,
+    ): Promise<YoloModuleDefinition>
+  }>
+  runtime: Readonly<{
+    activate(
+      definition: YoloModuleDefinition,
+      version: string,
+      signal?: AbortSignal,
+    ): Promise<void>
+    isActive(moduleId: string, version?: string): boolean
+  }>
+  activationTimeoutMs?: number
+  startupTimeoutMs?: number
+  subtleCrypto?: Pick<SubtleCrypto, 'digest'>
+  verifiedArtifactRegistry?: Pick<
+    VerifiedModuleArtifactRegistry,
+    'publish' | 'clear' | 'clearAll'
+  >
+  /**
+   * Projects the module's declared skill packages into the Vault. This is the
+   * only seam where both halves of the input exist: the module's chat modes
+   * (and therefore their `skills` declarations) are committed by
+   * `runtime.activate`, and the verified artifact is published here. It runs
+   * inside the activation's abort/timeout scope.
+   *
+   * A projection failure never fails the activation. Skills are one of the
+   * things a module contributes, and by this point the module is already
+   * live: reporting it as failed would advertise a running module as broken,
+   * and `moduleStartupReconciler` skips the retry for anything the runtime
+   * reports active, so the module would stay in that split state for the rest
+   * of the session. Instead the affected modes come up without those skills,
+   * the error goes to `reportSkillProjectionError`, and the next activation
+   * (restart, or disable then enable) reconciles the projection from the
+   * artifact again.
+   *
+   * Deactivation deliberately leaves the projection in place; only uninstall
+   * clears it. An installed-but-disabled module still has its artifact on
+   * disk, so a projection that tracks the artifact is the consistent state,
+   * and rewriting the whole tree on every toggle would only manufacture Vault
+   * sync churn.
+   */
+  materializeSkills?: (
+    moduleId: string,
+    artifact: VerifiedModuleArtifact,
+    signal: AbortSignal,
+  ) => Promise<void>
+  reportActivationError?: (moduleId: string, error: unknown) => void
+  /** Diagnostic channel for `materializeSkills`; see above for why it is
+   * kept apart from `reportActivationError`. */
+  reportSkillProjectionError?: (moduleId: string, error: unknown) => void
+}>
+
+export type ModuleActivationResult = Readonly<{
+  moduleId: string
+  status: 'activated' | 'skipped' | 'failed'
+  version?: string
+  error?: string
+}>
+
+const ACTIVATION_ABORTED = 'Module activation was aborted'
+const EMPTY_RESULTS = Object.freeze([]) as readonly ModuleActivationResult[]
+export const DEFAULT_MODULE_ACTIVATION_TIMEOUT_MS = 30_000
+
+/** Loads each enabled module's exact verified target. Interrupted targets retry. */
+export class ModuleActivationCoordinator {
+  private readonly errors = new Map<string, string>()
+  private readonly controllers = new Set<AbortController>()
+  private readonly activationTimeoutMs: number
+  private readonly startupTimeoutMs: number
+  private activation: Promise<readonly ModuleActivationResult[]> | undefined
+  private disposed = false
+
+  constructor(private readonly options: ModuleActivationCoordinatorOptions) {
+    this.activationTimeoutMs =
+      options.activationTimeoutMs ?? DEFAULT_MODULE_ACTIVATION_TIMEOUT_MS
+    this.startupTimeoutMs =
+      options.startupTimeoutMs ?? this.activationTimeoutMs + 5_000
+  }
+
+  activatePersistedModules(): Promise<readonly ModuleActivationResult[]> {
+    if (this.disposed) return Promise.reject(disposedError())
+    this.activation ??= this.activateAll()
+    return this.activation
+  }
+
+  getError(moduleId: string): string | undefined {
+    return this.errors.get(moduleId)
+  }
+
+  activateModule(moduleId: string): Promise<ModuleActivationResult> {
+    if (this.disposed) return Promise.reject(disposedError())
+    const controller = new AbortController()
+    this.controllers.add(controller)
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, this.startupTimeoutMs)
+    return this.activateModuleWithSignal(moduleId, controller.signal)
+      .catch((error) => {
+        if (timedOut) {
+          throw new Error(
+            `Module "${moduleId}" activation timed out after ${this.startupTimeoutMs} ms`,
+          )
+        }
+        throw error
+      })
+      .finally(() => {
+        clearTimeout(timeout)
+        this.controllers.delete(controller)
+      })
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    for (const controller of this.controllers) controller.abort()
+    this.controllers.clear()
+    this.options.verifiedArtifactRegistry?.clearAll()
+  }
+
+  private async activateAll(): Promise<readonly ModuleActivationResult[]> {
+    this.options.verifiedArtifactRegistry?.clearAll()
+    const controller = new AbortController()
+    this.controllers.add(controller)
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, this.startupTimeoutMs)
+    try {
+      const states = await withAbort(
+        this.options.deviceStateStore.list(),
+        controller.signal,
+        ACTIVATION_ABORTED,
+      )
+      if (states.length === 0) return EMPTY_RESULTS
+      const results = await withAbort(
+        Promise.all(
+          [...states]
+            .sort((left, right) => left.moduleId.localeCompare(right.moduleId))
+            .map((state) =>
+              this.activateModuleWithSignal(state.moduleId, controller.signal),
+            ),
+        ),
+        controller.signal,
+        ACTIVATION_ABORTED,
+      )
+      return Object.freeze(results)
+    } catch (error) {
+      if (timedOut) {
+        throw new Error(
+          `Persisted module activation timed out after ${this.startupTimeoutMs} ms`,
+        )
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+      this.controllers.delete(controller)
+    }
+  }
+
+  private async activateModuleWithSignal(
+    moduleId: string,
+    signal: AbortSignal,
+  ): Promise<ModuleActivationResult> {
+    try {
+      const intents = await withAbort(
+        this.options.intentStateSource?.load([moduleId]) ?? Promise.resolve([]),
+        signal,
+        ACTIVATION_ABORTED,
+      )
+      const matches = intents.filter((intent) => intent.id === moduleId)
+      if (matches.length !== 1 || matches[0]?.state !== 'enabled') {
+        this.options.verifiedArtifactRegistry?.clear(moduleId)
+        return result({ moduleId, status: 'skipped' })
+      }
+      return await this.options.deviceStateStore.runExclusive(
+        moduleId,
+        (transaction) =>
+          this.activateTransaction(moduleId, transaction, signal),
+      )
+    } catch (error) {
+      if (signal.aborted) throw error
+      return this.failed(moduleId, error)
+    }
+  }
+
+  private async activateTransaction(
+    moduleId: string,
+    transaction: ModuleDeviceStateTransaction,
+    signal: AbortSignal,
+  ): Promise<ModuleActivationResult> {
+    const state = await withAbort(
+      transaction.read(),
+      signal,
+      ACTIVATION_ABORTED,
+    )
+    if (!state) return result({ moduleId, status: 'skipped' })
+    const descriptor = state.pending?.descriptor ?? state.active
+    if (!descriptor) return result({ moduleId, status: 'skipped' })
+
+    // Activation is idempotent. Installing a module writes its `enabled`
+    // intent and then activates it, and that same write wakes the startup
+    // reconciler, which activates it again: two activations of one descriptor
+    // reach here, serialized by the device-state lock but both intending to
+    // start it. The second must not start it again: `activateVerifiedArtifact`
+    // opens by clearing the verified artifact of the module that is already
+    // running, and `runtime.activate` then throws "already active", leaving a
+    // live module that can no longer read its own style or worker assets
+    // until the next restart.
+    if (!this.options.runtime.isActive(moduleId, descriptor.version)) {
+      await this.activateDescriptor(descriptor, signal)
+    }
+    if (state.pending) {
+      await transaction.write({
+        ...state,
+        active: descriptor,
+        pending: null,
+      })
+    }
+    this.errors.delete(moduleId)
+    return result({
+      moduleId,
+      status: 'activated',
+      version: descriptor.version,
+    })
+  }
+
+  private async activateDescriptor(
+    descriptor: ModuleArtifactDescriptor,
+    signal: AbortSignal,
+  ): Promise<void> {
+    this.assertCompatible(descriptor)
+    const subtleCrypto =
+      this.options.subtleCrypto ?? globalThis.crypto?.subtle ?? null
+    if (!subtleCrypto) throw new Error('Web Crypto SHA-256 is unavailable')
+    const artifact = await withAbort(
+      verifyInstalledModuleArtifact(
+        this.options.artifactStore,
+        descriptor,
+        subtleCrypto,
+      ),
+      signal,
+      ACTIVATION_ABORTED,
+    )
+    await this.activateVerifiedArtifact(artifact, descriptor, signal)
+  }
+
+  private assertCompatible(descriptor: ModuleArtifactDescriptor): void {
+    if (
+      descriptor.platform !== this.options.platform ||
+      !isHostApiCompatible(this.options.hostApi, descriptor.hostApi)
+    ) {
+      throw new Error(
+        `Module "${descriptor.id}" version "${descriptor.version}" is incompatible with the current Host API or platform`,
+      )
+    }
+  }
+
+  private async activateVerifiedArtifact(
+    artifact: VerifiedModuleArtifact,
+    descriptor: ModuleArtifactDescriptor,
+    parentSignal: AbortSignal,
+  ): Promise<void> {
+    this.options.verifiedArtifactRegistry?.clear(descriptor.id)
+    const controller = new AbortController()
+    this.controllers.add(controller)
+    const abortFromParent = () => controller.abort()
+    parentSignal.addEventListener('abort', abortFromParent, { once: true })
+    if (this.disposed || parentSignal.aborted) controller.abort()
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, this.activationTimeoutMs)
+    try {
+      const entry = artifact.variant.files.find(
+        (file) => file.role === 'entry' && file.path === artifact.variant.entry,
+      )
+      if (!entry) {
+        throw new Error(`Module "${descriptor.id}" selected entry is missing`)
+      }
+      const definition = await this.options.loader.load(
+        { id: descriptor.id, byteSize: entry.byteSize, sha256: entry.sha256 },
+        artifact.entryBytes,
+        controller.signal,
+      )
+      // Published before runtime.activate, not after: activation commits the
+      // module's contributions, which can synchronously build file-view
+      // instances for already-open leaves — module code running there must
+      // be able to read its own assets (e.g. style.css). The artifact is
+      // already fully verified at this point, and the catch below clears the
+      // registry if activation fails.
+      this.options.verifiedArtifactRegistry?.publish(
+        descriptor.id,
+        descriptor.version,
+        artifact,
+      )
+      await this.options.runtime.activate(
+        definition,
+        descriptor.version,
+        controller.signal,
+      )
+      if (this.disposed || parentSignal.aborted || controller.signal.aborted) {
+        throw new Error(`Module "${descriptor.id}" activation was aborted`)
+      }
+      try {
+        const projection = this.options.materializeSkills?.(
+          descriptor.id,
+          artifact,
+          controller.signal,
+        )
+        // Raced against the signal rather than awaited outright: the
+        // projection talks to the Vault adapter, and a request that never
+        // settles would otherwise outlive the abort and hold the whole
+        // startup open. The signal it also receives lets it stop between
+        // steps; this bounds the wait even when it cannot.
+        if (projection) {
+          await withAbort(projection, controller.signal, ACTIVATION_ABORTED)
+        }
+      } catch (error) {
+        // An aborted projection (activation timeout, plugin unload) is not a
+        // defect of the module and there is no one to act on it; the next
+        // activation reconciles the projection either way.
+        if (!controller.signal.aborted) {
+          this.reportSkillProjectionError(descriptor.id, error)
+        }
+      }
+    } catch (error) {
+      this.options.verifiedArtifactRegistry?.clear(descriptor.id)
+      if (timedOut) {
+        throw new Error(
+          `Module "${descriptor.id}" activation timed out after ${this.activationTimeoutMs} ms`,
+        )
+      }
+      if (controller.signal.aborted) {
+        throw new Error(`Module "${descriptor.id}" activation was aborted`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+      parentSignal.removeEventListener('abort', abortFromParent)
+      this.controllers.delete(controller)
+    }
+  }
+
+  private reportSkillProjectionError(moduleId: string, error: unknown): void {
+    try {
+      this.options.reportSkillProjectionError?.(moduleId, error)
+    } catch {
+      // Diagnostics cannot undo an activation that already succeeded.
+    }
+  }
+
+  private failed(moduleId: string, error: unknown): ModuleActivationResult {
+    const message = errorMessage(error)
+    this.errors.set(moduleId, message)
+    try {
+      this.options.reportActivationError?.(moduleId, error)
+    } catch {
+      // Diagnostics cannot block activation of the remaining modules.
+    }
+    return result({ moduleId, status: 'failed', error: message })
+  }
+}
+
+function result(value: ModuleActivationResult): ModuleActivationResult {
+  return Object.freeze({ ...value })
+}
+
+function disposedError(): Error {
+  return new Error('Module activation coordinator is disposed')
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}

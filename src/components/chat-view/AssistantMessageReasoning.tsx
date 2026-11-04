@@ -1,0 +1,530 @@
+import { ChevronDown, ChevronRight } from 'lucide-react'
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+
+import { useLanguage } from '../../contexts/language-context'
+import {
+  MOTION_DURATION_ENTER_S,
+  MOTION_EASE_OUT_CSS,
+} from '../../styles/tokens/motion'
+import { getNodeWindow } from '../../utils/dom/window-context'
+import DotLoader from '../common/DotLoader'
+
+import TransitioningMarkdown from './TransitioningMarkdown'
+import { useAssistantStreamedReasoning } from './useAssistantRenderStream'
+
+type ReasoningStage = 'requesting' | 'thinking' | 'settled'
+
+const REASONING_PREVIEW_MAX_BUFFER_LENGTH = 4000
+const REASONING_PREVIEW_TRIM_CHUNK_LENGTH = 2000
+// WAAPI's `duration` wants milliseconds; the shared token is in seconds.
+const REASONING_PREVIEW_TRANSITION_MS = MOTION_DURATION_ENTER_S * 1000
+const useSafeLayoutEffect =
+  typeof window === 'undefined' ? useEffect : useLayoutEffect
+
+export const getReasoningRollText = (reasoning: string): string => {
+  let start = 0
+  if (reasoning.length > REASONING_PREVIEW_MAX_BUFFER_LENGTH) {
+    start =
+      Math.ceil(
+        (reasoning.length - REASONING_PREVIEW_MAX_BUFFER_LENGTH) /
+          REASONING_PREVIEW_TRIM_CHUNK_LENGTH,
+      ) * REASONING_PREVIEW_TRIM_CHUNK_LENGTH
+    const nearbyBoundary = reasoning.slice(start, start + 160).search(/\s/)
+    if (nearbyBoundary >= 0) start += nearbyBoundary + 1
+  }
+
+  return reasoning
+    .slice(start)
+    .replace(/\r\n?/g, '\n')
+    .replace(/^[\t ]*(?:[-*#>`]+|\d+[.)])[\t ]*/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+export const getReasoningPreviewHoldOffset = (
+  contentHeight: number,
+  lineHeight: number,
+): number =>
+  lineHeight > 0 && contentHeight > lineHeight + 0.5 ? lineHeight : 0
+
+/**
+ * 轨道锚在视口顶部，所以视口长高时旧行天然不动，新行由下边缘扫出来——这一段
+ * 不需要任何位移。位移只有封顶后才有意义：内容超出上限多少，就往上滚多少。
+ * 两段动画因此永不并存，也就不存在主线程 height 与合成线程 transform 的失步。
+ */
+export const getReasoningPreviewViewportMetrics = ({
+  contentHeight,
+  holdOffset,
+  lineHeight,
+  previewLines,
+}: {
+  contentHeight: number
+  holdOffset: number
+  lineHeight: number
+  previewLines: number
+}): {
+  viewportHeight: number
+  scrollOffset: number
+  isOverflowing: boolean
+} => {
+  const visibleHeight = Math.max(0, contentHeight - holdOffset)
+  const capHeight = previewLines * lineHeight
+  return {
+    viewportHeight: Math.min(visibleHeight, capHeight),
+    scrollOffset: Math.max(0, visibleHeight - capHeight),
+    isOverflowing: visibleHeight > capHeight + 0.5,
+  }
+}
+
+/**
+ * 一次量测结果到「要写什么、要不要动画」的完整决策。
+ *
+ * `transition` 三态各自对应一种真实情形：
+ * - `reset`：首次量到、换行宽度变了、内容变短了。这三种都不是"轨道往上滚了
+ *   一截"，插值出来的位移没有意义，正在跑的动画也必须撤掉。
+ * - `hold`：位移没变（新字还在同一行里）。什么都不做，尤其不要打断正在跑的
+ *   那条动画。
+ * - `animate`：封顶之后又多出内容，轨道要往上滚，这一段才值得动画。
+ */
+export type ReasoningPreviewFrame = {
+  viewportHeight: number
+  scrollOffset: number
+  isOverflowing: boolean
+  transition: 'reset' | 'hold' | 'animate'
+}
+
+export const getReasoningPreviewFrame = ({
+  width,
+  height,
+  lineHeight,
+  previewLines,
+  previousWidth,
+  previousHeight,
+  previousScrollOffset,
+}: {
+  width: number
+  height: number
+  lineHeight: number
+  previewLines: number
+  previousWidth: number
+  previousHeight: number
+  previousScrollOffset: number
+}): ReasoningPreviewFrame => {
+  const holdOffset = getReasoningPreviewHoldOffset(height, lineHeight)
+  const { viewportHeight, scrollOffset, isOverflowing } =
+    getReasoningPreviewViewportMetrics({
+      contentHeight: height,
+      holdOffset,
+      lineHeight,
+      previewLines,
+    })
+  const widthChanged = Math.abs(width - previousWidth) > 0.5
+  const transition =
+    widthChanged || previousHeight === 0 || height < previousHeight
+      ? 'reset'
+      : Math.abs(scrollOffset - previousScrollOffset) <= 0.5
+        ? 'hold'
+        : 'animate'
+
+  return { viewportHeight, scrollOffset, isOverflowing, transition }
+}
+
+export const formatReasoningDurationSeconds = (durationMs: number): number =>
+  Math.max(1, Math.round(durationMs / 1000))
+
+/**
+ * 预览轨道只在"正在思考且未展开"时更新文字；停下来时要定格在最后一次显示的
+ * 内容上，收场过渡才不会先把字抹掉再收高度。
+ *
+ * 这里不再自带定时器：上游的思考流已经按固定节拍采样过一次，再叠一层节流只会
+ * 把同一段文字的延迟翻倍。
+ */
+const useHeldReasoningRollText = (value: string, enabled: boolean): string => {
+  const heldRef = useRef(value)
+
+  useEffect(() => {
+    if (enabled) {
+      heldRef.current = value
+    }
+  }, [enabled, value])
+
+  return enabled ? value : heldRef.current
+}
+
+const AssistantMessageReasoning = memo(function AssistantMessageReasoning({
+  reasoning: snapshotReasoning,
+  hasAnswerContent,
+  generationState,
+  reasoningDurationMs,
+  previewLines = 1,
+  conversationId,
+  messageId,
+  isGenerating = false,
+}: {
+  reasoning: string
+  hasAnswerContent: boolean
+  /** 思考块自身的展示态；与消息是否还在生成不是一回事。 */
+  generationState?: 'streaming' | 'completed' | 'aborted' | 'error'
+  reasoningDurationMs?: number
+  /** 预览视口的最大可见行数；>1 时切换为随内容长高的面板形态。 */
+  previewLines?: number
+  /**
+   * 生成中的思考文本走 assistant render stream。三者都给出时本组件自行订阅；
+   * 缺省（例如正文内联的 `<think>` 块）时仍以 props 为准。
+   */
+  conversationId?: string
+  messageId?: string
+  isGenerating?: boolean
+}) {
+  const { t } = useLanguage()
+  const [isExpanded, setIsExpanded] = useState(false)
+  const hasUserInteracted = useRef(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+
+  const isStreaming = generationState === 'streaming'
+  // `reasoning` 只供 React 结构（预览轨道、stage、可展开性）使用；markdown 主体
+  // 读 `reasoningSource`，以 `snapshotReasoning` 作初值/回退值。
+  const { reasoning, reasoningSource } = useAssistantStreamedReasoning({
+    conversationId,
+    messageId,
+    isStreaming: isGenerating,
+    reasoning: snapshotReasoning,
+    ownerNodeRef: rootRef,
+  })
+
+  const hasReasoningText = useMemo(
+    () => reasoning.trim().length > 0,
+    [reasoning],
+  )
+  const previousReasoning = useRef(reasoning)
+  const [showActivity, setShowActivity] = useState(
+    () => isStreaming && (!hasAnswerContent || !hasReasoningText),
+  )
+
+  const stage = useMemo<ReasoningStage>(() => {
+    if (isStreaming && !hasReasoningText && !hasAnswerContent) {
+      return 'requesting'
+    }
+    if (isStreaming && !hasAnswerContent && hasReasoningText) {
+      return 'thinking'
+    }
+    return 'settled'
+  }, [hasAnswerContent, hasReasoningText, isStreaming])
+
+  const stageLabel = useMemo(() => {
+    if (stage === 'requesting') {
+      return t('quickAsk.statusRequesting', 'Requesting...')
+    }
+    if (stage === 'thinking') {
+      return t('quickAsk.statusThinking', 'Thinking...')
+    }
+    if (reasoningDurationMs !== undefined) {
+      return ''
+    }
+    return t('chat.reasoning', 'Reasoning')
+  }, [reasoningDurationMs, stage, t])
+
+  const isToggleable = hasReasoningText
+  const showBody = hasReasoningText && isExpanded
+  const showDots = showActivity
+  const visibleStageLabel = useMemo(() => {
+    if (!showDots) {
+      return stageLabel
+    }
+
+    return stageLabel.replace(/\.\.\.$/, '')
+  }, [showDots, stageLabel])
+  const settledDurationSeconds =
+    reasoningDurationMs !== undefined
+      ? formatReasoningDurationSeconds(reasoningDurationMs)
+      : null
+  const isPreviewLive = stage === 'thinking' && !showBody
+  const reasoningRollText = useMemo(
+    () => (isPreviewLive ? getReasoningRollText(reasoning) : ''),
+    [isPreviewLive, reasoning],
+  )
+  const reasoningPreview = useHeldReasoningRollText(
+    reasoningRollText,
+    isPreviewLive,
+  )
+  const showPreview = reasoningPreview.length > 0 && isPreviewLive
+  const isPanelPreview = previewLines > 1
+  const [isPreviewOverflowing, setIsPreviewOverflowing] = useState(false)
+  const previewViewportRef = useRef<HTMLDivElement | null>(null)
+  const previewTrackRef = useRef<HTMLDivElement | null>(null)
+  const previewHeightRef = useRef(0)
+  const previewWidthRef = useRef(0)
+  const previewScrollOffsetRef = useRef(0)
+  const previewAnimationRef = useRef<Animation | null>(null)
+
+  useSafeLayoutEffect(() => {
+    const viewport = previewViewportRef.current
+    const track = previewTrackRef.current
+    if (!viewport || !track) return
+
+    if (!showPreview) {
+      previewAnimationRef.current?.cancel()
+      previewAnimationRef.current = null
+      previewHeightRef.current = 0
+      previewWidthRef.current = 0
+      previewScrollOffsetRef.current = 0
+      track.setCssProps({
+        '--yolo-assistant-metadata-preview-scroll-offset': '0px',
+      })
+      if (isPanelPreview) {
+        viewport.setCssProps({
+          '--yolo-assistant-metadata-preview-viewport-height': '0px',
+        })
+        setIsPreviewOverflowing(false)
+      }
+      return
+    }
+
+    const trackWindow = getNodeWindow(track)
+    // popout 是独立 BrowserWindow：全局 ResizeObserver 属于主窗口，拿它去观察
+    // 另一个 realm 的节点不会生效。
+    const ObserverCtor = trackWindow.ResizeObserver
+    if (typeof ObserverCtor === 'undefined') return
+
+    const observer = new ObserverCtor((entries) => {
+      const entry = entries[entries.length - 1]
+      if (!entry) return
+
+      // 轨道是 absolute 且贴着视口的内联轴铺满，所以它自己的盒子同时给出
+      // "内容有多高"和"一行有多宽"，两个量都不必再另外读几何。回调在浏览器
+      // 算完布局之后才触发，读到的就是最新布局，不会像在 useLayoutEffect 里读
+      // scrollHeight 那样把待处理的布局强行同步 flush 一遍；而且只有尺寸真的
+      // 变了才触发——预览轨道恰好只在换行时才需要重新量。
+      const { width, height } = entry.contentRect
+      // 不缓存行高：回调只在换行时触发，本来就远稀于 token 频率，而缓存反倒要
+      // 处理主题 / 字号变化时的失效。此处布局已是干净的，读它不触发重排。
+      const lineHeight = Number.parseFloat(
+        trackWindow.getComputedStyle(track).lineHeight,
+      )
+      const previousScrollOffset = previewScrollOffsetRef.current
+      const frame = getReasoningPreviewFrame({
+        width,
+        height,
+        lineHeight,
+        previewLines,
+        previousWidth: previewWidthRef.current,
+        previousHeight: previewHeightRef.current,
+        previousScrollOffset,
+      })
+      previewHeightRef.current = height
+      previewWidthRef.current = width
+      previewScrollOffsetRef.current = frame.scrollOffset
+      track.setCssProps({
+        '--yolo-assistant-metadata-preview-scroll-offset': `${frame.scrollOffset}px`,
+      })
+
+      if (isPanelPreview) {
+        viewport.setCssProps({
+          '--yolo-assistant-metadata-preview-viewport-height': `${frame.viewportHeight}px`,
+        })
+        setIsPreviewOverflowing(frame.isOverflowing)
+      }
+
+      if (frame.transition === 'hold') return
+
+      previewAnimationRef.current?.cancel()
+      previewAnimationRef.current = null
+      if (frame.transition === 'reset') return
+
+      const prefersReducedMotion = trackWindow.matchMedia(
+        '(prefers-reduced-motion: reduce)',
+      ).matches
+      if (prefersReducedMotion || typeof track.animate !== 'function') return
+
+      // 只有封顶后才走到这里，此时视口 height 已恒定，位移独占动画。透明度低谷
+      // 只适合单行的整行置换，多行时会闪整块。
+      const from = -previousScrollOffset
+      const to = -frame.scrollOffset
+      const animation = track.animate(
+        isPanelPreview
+          ? [
+              { transform: `translateY(${from}px)` },
+              { transform: `translateY(${to}px)` },
+            ]
+          : [
+              {
+                opacity: 1,
+                transform: `translateY(${from}px)`,
+              },
+              {
+                offset: 0.48,
+                opacity: 0.4,
+                transform: `translateY(${from * 0.55 + to * 0.45}px)`,
+              },
+              {
+                offset: 0.52,
+                opacity: 0.4,
+                transform: `translateY(${from * 0.45 + to * 0.55}px)`,
+              },
+              { opacity: 1, transform: `translateY(${to}px)` },
+            ],
+        {
+          duration: REASONING_PREVIEW_TRANSITION_MS,
+          easing: MOTION_EASE_OUT_CSS,
+        },
+      )
+      previewAnimationRef.current = animation
+      animation.onfinish = () => {
+        if (previewAnimationRef.current === animation) {
+          previewAnimationRef.current = null
+        }
+      }
+    })
+    observer.observe(track)
+
+    return () => observer.disconnect()
+  }, [showPreview, isPanelPreview, previewLines])
+
+  useEffect(
+    () => () => {
+      previewAnimationRef.current?.cancel()
+    },
+    [],
+  )
+
+  useEffect(() => {
+    if (!isStreaming) {
+      setShowActivity(false)
+    }
+  }, [isStreaming])
+
+  useEffect(() => {
+    if (previousReasoning.current === reasoning) {
+      return
+    }
+
+    const previousLength = previousReasoning.current.trim().length
+    const currentLength = reasoning.trim().length
+    previousReasoning.current = reasoning
+
+    if (currentLength > previousLength && !showActivity && isStreaming) {
+      setShowActivity(true)
+    }
+  }, [reasoning, showActivity, isStreaming])
+
+  useEffect(() => {
+    if (!isStreaming) {
+      return
+    }
+
+    if (!hasAnswerContent || !hasReasoningText) {
+      if (!showActivity) {
+        setShowActivity(true)
+      }
+      return
+    }
+
+    if (!showActivity) {
+      return
+    }
+
+    const timer = setTimeout(() => {
+      setShowActivity(false)
+      if (!hasUserInteracted.current) {
+        setIsExpanded(false)
+      }
+    }, 420)
+
+    return () => clearTimeout(timer)
+  }, [hasAnswerContent, hasReasoningText, isStreaming, showActivity])
+
+  const handleToggle = () => {
+    if (!isToggleable) return
+    hasUserInteracted.current = true
+    setIsExpanded(!isExpanded)
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      className={`yolo-assistant-message-metadata yolo-assistant-message-metadata--${stage}${showBody ? ' is-expanded' : ''}${showActivity ? ' is-active' : ''}${showPreview ? ' has-preview' : ''}`}
+      data-stage={stage}
+    >
+      <button
+        type="button"
+        className={`yolo-assistant-message-metadata-toggle${!isToggleable ? ' is-static' : ''}`}
+        onClick={handleToggle}
+        disabled={!isToggleable}
+      >
+        <span className="yolo-assistant-message-metadata-label">
+          <span className="yolo-assistant-message-metadata-label-text">
+            {stage === 'settled' && settledDurationSeconds !== null ? (
+              <>
+                <span className="yolo-assistant-message-metadata-label-title">
+                  Thought
+                </span>
+                <span className="yolo-assistant-message-metadata-label-detail">
+                  {' '}
+                  for {settledDurationSeconds}s
+                </span>
+              </>
+            ) : (
+              visibleStageLabel
+            )}
+          </span>
+          {showDots && (
+            <DotLoader
+              variant="dots"
+              className="yolo-assistant-message-metadata-loader"
+            />
+          )}
+        </span>
+        {isToggleable ? (
+          isExpanded ? (
+            <ChevronDown className="yolo-assistant-message-metadata-toggle-icon" />
+          ) : (
+            <ChevronRight className="yolo-assistant-message-metadata-toggle-icon" />
+          )
+        ) : null}
+      </button>
+      <div
+        ref={previewViewportRef}
+        className={`yolo-assistant-message-metadata-preview${
+          isPanelPreview
+            ? ` yolo-assistant-message-metadata-preview--panel${
+                isPreviewOverflowing ? ' is-overflowing' : ''
+              }`
+            : ''
+        }`}
+        aria-hidden
+      >
+        <div
+          ref={previewTrackRef}
+          className="yolo-assistant-message-metadata-preview-track"
+        >
+          {reasoningPreview}
+        </div>
+      </div>
+      {/*
+        折叠态由上面的预览轨道负责呈现"正在想什么"，展开态才由这里呈现全文，
+        两者不重叠。因此折叠时干脆不挂载：思考过程动辄上万字，把它留在
+        grid-template-rows: 0fr 的盒子里只是视觉上压成零高，整棵子树仍然参与
+        每一次布局。
+      */}
+      {showBody && (
+        <div className="yolo-assistant-message-metadata-content">
+          <TransitioningMarkdown
+            content={snapshotReasoning}
+            contentSource={reasoningSource}
+            scale="xs"
+            generationState={generationState}
+          />
+        </div>
+      )}
+    </div>
+  )
+})
+
+export default AssistantMessageReasoning

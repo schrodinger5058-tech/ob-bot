@@ -1,0 +1,99 @@
+import type {
+  AssistantToolPreference,
+  AssistantToolServerPreference,
+} from '../../types/assistant.types'
+import type {
+  ChatConversationCompactionLike,
+  ChatMessage,
+} from '../../types/chat'
+import type { ChatModel } from '../../types/chat-model.types'
+import type { LLMProviderApiType } from '../../types/provider.types'
+import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
+import { estimateJsonTokens } from '../../utils/llm/contextTokenEstimate'
+import { McpManager } from '../mcp/mcpManager'
+import type { ChatModeCapabilityOverrides } from '../tools/types'
+
+import type { ChatContextPolicy } from './chat-runtime-profiles'
+import { type RuntimeMode, buildRuntimeModePrompt } from './runtime-mode-prompt'
+import { selectAllowedTools } from './tool-selection'
+
+export const estimateContinuationRequestContextTokens = async ({
+  requestContextBuilder,
+  mcpManager,
+  model,
+  messages,
+  conversationId,
+  compaction,
+  apiType,
+  allowedToolNames,
+  toolPreferences,
+  toolServerPreferences,
+  capabilityOverrides,
+  runtimeMode,
+  modeEnvironmentPrompt,
+  modePersonaPrompt,
+  modePersonaModuleId,
+  moduleChatModeId,
+  contextPolicy,
+}: {
+  requestContextBuilder: RequestContextBuilder
+  mcpManager: McpManager
+  model: ChatModel
+  messages: ChatMessage[]
+  conversationId: string
+  compaction?: ChatConversationCompactionLike | null
+  apiType?: LLMProviderApiType | null
+  allowedToolNames?: string[]
+  toolPreferences?: Record<string, AssistantToolPreference>
+  toolServerPreferences?: Record<string, AssistantToolServerPreference>
+  /** The running chat mode's capability grant; see `AgentToolGateway`. */
+  capabilityOverrides?: ChatModeCapabilityOverrides
+  runtimeMode?: RuntimeMode
+  modeEnvironmentPrompt?: string
+  modePersonaPrompt?: string
+  modePersonaModuleId?: string
+  moduleChatModeId?: string
+  contextPolicy?: ChatContextPolicy
+}): Promise<number> => {
+  const availableTools = await mcpManager.listAvailableTools({
+    capabilityOverrides,
+    // Tailor built-in tool schemas to the active model so the token
+    // estimate reflects what the model will actually see at request time.
+    chatModelModalities: model.modalities,
+  })
+  const { hasTools, hasOnDemandTools, requestTools, deferredToolCatalog } =
+    await selectAllowedTools({
+      availableTools,
+      allowedToolNames,
+      toolPreferences,
+      toolServerPreferences,
+      model,
+      apiType,
+      jsSandboxSettings: mcpManager.getJsSandboxSettings(),
+      settings: mcpManager.getSettingsSnapshot(),
+    })
+
+  const runtimeModePrompt = buildRuntimeModePrompt(runtimeMode ?? 'agent')
+  const requestMessages = await requestContextBuilder.generateRequestMessages({
+    messages,
+    hasTools,
+    hasOnDemandTools,
+    deferredToolCatalogText: deferredToolCatalog?.text,
+    model,
+    conversationId,
+    compaction,
+    runtimeModePrompt,
+    modeEnvironmentPrompt,
+    modePersonaPrompt,
+    modePersonaModuleId,
+    moduleChatModeId,
+    contextPolicy,
+    // Token estimate only: never create/freeze the snapshot ahead of the real request.
+    systemPromptSnapshotMode: 'reuse',
+  })
+
+  return await estimateJsonTokens({
+    messages: requestMessages,
+    tools: requestTools,
+  })
+}

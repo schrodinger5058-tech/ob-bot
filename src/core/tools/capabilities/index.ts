@@ -1,0 +1,50 @@
+import { contextCompactionCapability } from './context-compaction'
+import { contextPruningCapability } from './context-pruning'
+import { fileEditingCapability } from './file-editing'
+import { fileReadingCapability } from './file-reading'
+import { jsSandboxCapability } from './js-sandbox'
+import { nativeFilesCapability } from './native-files'
+import { subagentDelegationCapability } from './subagent-delegation'
+import { terminalCapability } from './terminal'
+import { todoListCapability } from './todo-list'
+import { userQuestionsCapability } from './user-questions'
+import { vaultSearchCapability } from './vault-search'
+import { vaultShellCapability } from './vault-shell'
+import { webAccessCapability } from './web-access'
+
+/**
+ * The single registration point for all built-in capabilities.
+ *
+ * This is the only place a new capability needs to be registered.
+ *
+ * Registration order is also display order: the settings page renders
+ * capabilities within a category in this array's order, with no separate
+ * `BUILTIN_TOOL_DISPLAY_ORDER` table. Order below is grouped by category and
+ * matches the historical display order exactly —
+ * vault: fs_read -> bash -> fs_edit_ops; context: context_prune_tool_results
+ * -> context_compact -> ask_user_question -> todo_write;
+ * external: web_ops -> js_eval -> terminal_command -> delegate_subagent (the
+ * external category's former `BUILTIN_TOOL_DISPLAY_ORDER` list, and the
+ * vault/context orders' former natural-registration/DOM order) — see the
+ * capability-row-order regression test in
+ * `AgentsSectionContent.capability-rows.test.ts`.
+ */
+export const CAPABILITIES = [
+  fileReadingCapability,
+  vaultShellCapability,
+  fileEditingCapability,
+  contextPruningCapability,
+  contextCompactionCapability,
+  userQuestionsCapability,
+  todoListCapability,
+  webAccessCapability,
+  jsSandboxCapability,
+  terminalCapability,
+  subagentDelegationCapability,
+  // Appended, not slotted into the external group's historical order: the
+  // order above is a frozen reproduction of the historical display order, and a
+  // capability that did not exist then belongs after it (see the row-order
+  // regression test in `builtinCapabilityRows.test.ts`).
+  nativeFilesCapability,
+  vaultSearchCapability,
+] as const

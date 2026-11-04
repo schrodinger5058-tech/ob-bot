@@ -1,0 +1,450 @@
+// Rung one of the board's AI ladder: an empty text card offers
+// a few one-click instructions, and clicking one streams a single agent turn
+// straight into that card.
+//
+// Two states of one card, and that is the whole surface:
+//
+//   - **empty** — while it is the card the user is on (selected alone, or
+//     being edited), its body holds a placeholder line whose instruction
+//     words are the chips. Not an overlay and not a button beside the card:
+//     a card with nothing in it is a card asking what goes in it, and a
+//     placeholder is what that looks like. The first character
+//     typed into the card takes them away (`syncChips` is called from the same
+//     content path that renders every other card state, so "has content" is
+//     never asked twice).
+//     An open editor does not end that state, it *is* it: a card created by
+//     dragging an arrow opens its editor immediately, and chips that waited
+//     for the editor to close would mean the main gesture of rung one never
+//     showed them. So the chips sit in the body next to the editor for as
+//     long as what is typed in it is still empty — caret and chips at once,
+//     type or click. Pressing a chip must not be read as leaving the editor
+//     first, so a chip holds the focus through `mousedown` (`preventDefault`)
+//     and lets its own `click` be what closes the editor, in that order.
+//   - **generating** — the body holds a status line and the text as it
+//     arrives. Nothing is written to the board while it streams: the card is
+//     pinned, the renderer is told to leave it alone, and the accumulated text
+//     lands in one `applyBoardChange` when the run settles, so Cmd+Z undoes a
+//     generation in one step.
+//
+// Stopping keeps what has arrived, and so does double-clicking into the card
+// mid-run — the editor and the stream share the card's body, so
+// asking to type in it is asking to stop.
+//
+// The run itself is deliberately small: `host.agent.stream` with a system
+// prompt that *replaces* the host's default one, the card's context as
+// the prompt (domain/cardContext.ts), and exactly one run-scoped read-only
+// tool. No writes, no board tools, no follow-up turn.
+
+import { buildCardContext, cardSourceIds } from '../../domain/cardContext'
+import {
+  type CardInstruction,
+  cardGenerationSystemPrompt,
+  cardInstructions,
+} from '../../domain/cardInstructions'
+import type { Board, BoardNode, NodeId } from '../../domain/fileFormat'
+import {
+  readCardForModel,
+  resolveCardContextNotes,
+} from '../../host/cardContext'
+
+const CHIPS_CLASS = 'yolo-whiteboard-card-chips'
+const CHIP_CLASS = 'yolo-whiteboard-card-chip'
+const CHIP_SEPARATOR_CLASS = 'yolo-whiteboard-card-chip-separator'
+const STREAM_CLASS = 'yolo-whiteboard-card-stream'
+const STREAM_STATUS_CLASS = 'yolo-whiteboard-card-stream-status'
+const STREAM_LABEL_CLASS = 'yolo-whiteboard-card-stream-label'
+const STREAM_STOP_CLASS = 'yolo-whiteboard-card-stream-stop'
+const STREAM_TEXT_CLASS = 'yolo-whiteboard-card-stream-text'
+
+/** A tool that exists only for the duration of one `agent.stream` run. The
+ * module SDK exports no alias for it, so it is named off the request type. */
+type RunScopedTool = NonNullable<
+  Parameters<YoloModuleHostApiV1['agent']['stream']>[0]['tools']
+>[number]
+
+export type CardGenerationCallbacks = Readonly<{
+  getBoard: () => Board
+  getNode: (id: NodeId) => BoardNode | undefined
+  getSourcePath: () => string
+  /** The card's body element, or null when it is not mounted. */
+  getBody: (id: NodeId) => HTMLElement | null
+  /** False on a board that cannot be edited or is drawn as an overview. */
+  isAvailable: () => boolean
+  /** True for the lone selected card. */
+  isFocused: (id: NodeId) => boolean
+  /**
+   * The live text of this card's open editor, or null when it is not the
+   * card being edited. While an editor is open it — not the node — is what
+   * the card is showing, so it is what "still empty" has to be asked of.
+   */
+  editingText: (id: NodeId) => string | null
+  /**
+   * Hands the card's body over for streaming: pins the card, empties the
+   * body, and marks it generating. Null when the card cannot take a run.
+   */
+  beginGeneration: (id: NodeId) => HTMLElement | null
+  /**
+   * Gives it back: commits `text` as the card's content in one history step
+   * (empty text commits nothing), restores the card's ordinary content, and
+   * opens the editor when the run ended because the user asked to type.
+   */
+  endGeneration: (id: NodeId, text: string, options: { edit: boolean }) => void
+  reportError: (stage: string, error: unknown) => void
+  notice: (message: string) => void
+  t: (key: string, fallback?: string) => string
+}>
+
+type Generation = {
+  readonly nodeId: NodeId
+  readonly controller: AbortController
+  readonly labelEl: HTMLElement
+  readonly textNode: Text
+  /** Ids `read_card` has been called with, for the status line's count. */
+  readonly readIds: Set<string>
+  text: string
+  /** True once the run has been handed back — every path is idempotent. */
+  settled: boolean
+  /** Set by a stop that means "let me type in this card instead". */
+  edit: boolean
+}
+
+export class CardGeneration {
+  private readonly generations = new Map<NodeId, Generation>()
+
+  constructor(
+    private readonly host: YoloModuleHostApiV1,
+    private readonly callbacks: CardGenerationCallbacks,
+  ) {}
+
+  isGenerating(id: NodeId): boolean {
+    return this.generations.has(id)
+  }
+
+  /**
+   * Puts this card's chips where they belong, or takes them away — called
+   * from the one content path every card state goes through
+   * (`CardRenderer.renderCardPreview`), so a card that has just been
+   * rendered, edited, undone or agent-edited all reach it the same way.
+   */
+  syncChips(id: NodeId): void {
+    const body = this.callbacks.getBody(id)
+    if (!body) return
+    const existing = body.querySelector<HTMLElement>(`:scope > .${CHIPS_CLASS}`)
+    if (!this.wantsChips(id)) {
+      existing?.remove()
+      return
+    }
+    const instructions = cardInstructions(
+      cardSourceIds(this.callbacks.getBoard(), id).length > 0,
+    )
+    // Which chips a card offers depends on whether anything points into it, so
+    // a chip row built before an arrow reached this card is the wrong row —
+    // the signature is what notices, without re-reading the DOM's labels.
+    const signature = instructions.map((instruction) => instruction.key).join()
+    if (existing?.dataset.instructions === signature) return
+    existing?.remove()
+    body.appendChild(
+      this.buildChips(body.ownerDocument, id, instructions, signature),
+    )
+  }
+
+  /**
+   * Ends a run, keeping whatever has arrived. `edit` carries the one reason
+   * to stop that is also a request to open the editor.
+   */
+  stop(id: NodeId, options: { edit?: boolean } = {}): void {
+    const generation = this.generations.get(id)
+    if (!generation) return
+    generation.edit = options.edit === true
+    generation.controller.abort()
+    this.settle(generation)
+  }
+
+  /**
+   * Text that has streamed into a card but is not on the board yet — folded
+   * into a snapshot taken mid-run (`getViewData`), which is the only thing
+   * that keeps a leaf closed during a generation from losing it.
+   */
+  pendingTexts(): [NodeId, string][] {
+    const pending: [NodeId, string][] = []
+    for (const [id, generation] of this.generations) {
+      const text = generation.text.trim()
+      if (text !== '') pending.push([id, text])
+    }
+    return pending
+  }
+
+  /**
+   * Drops every run without committing — the board they were writing into is
+   * being replaced or destroyed, so there is nothing left to commit *to*.
+   */
+  abandonAll(): void {
+    for (const generation of this.generations.values()) {
+      generation.settled = true
+      generation.controller.abort()
+    }
+    this.generations.clear()
+  }
+
+  // ---- chips -------------------------------------------------------------
+
+  private wantsChips(id: NodeId): boolean {
+    if (!this.callbacks.isAvailable()) return false
+    if (this.generations.has(id)) return false
+    const node = this.callbacks.getNode(id)
+    // A file card is never "empty" in this sense: its content lives in a note,
+    // and an empty note is a note to write in, not a card to generate into.
+    if (node?.type !== 'text') return false
+    // Neither is bare text: it is something being written by hand, and an
+    // empty one only exists while its editor is open.
+    if (node.plain === true) return false
+    // Only the card the user is on offers them: the lone selected card, or
+    // the one being edited (editing clears the selection, so it has to be
+    // asked separately). A board of empty cards is not a board of prompts.
+    // An open editor is the card's content while it is open — including the
+    // keystrokes it holds that the board has not been told about yet.
+    const editing = this.callbacks.editingText(id)
+    if (editing === null && !this.callbacks.isFocused(id)) return false
+    return (editing ?? node.text).trim() === ''
+  }
+
+  private buildChips(
+    doc: Document,
+    id: NodeId,
+    instructions: readonly CardInstruction[],
+    signature: string,
+  ): HTMLElement {
+    const chips = doc.createElement('div')
+    chips.className = CHIPS_CLASS
+    chips.dataset.instructions = signature
+    // Read as the card's placeholder: one faint line where the first line of
+    // text will go, whose instruction words happen to be pressable.
+    const lead = doc.createElement('span')
+    lead.textContent = this.callbacks.t('cardAi.hint')
+    chips.appendChild(lead)
+    for (const [index, instruction] of instructions.entries()) {
+      if (index > 0) {
+        const separator = doc.createElement('span')
+        separator.className = CHIP_SEPARATOR_CLASS
+        separator.textContent = '·'
+        chips.appendChild(separator)
+      }
+      const chip = doc.createElement('button')
+      chip.type = 'button'
+      chip.className = CHIP_CLASS
+      chip.textContent = this.callbacks.t(instruction.labelKey)
+      // Order, not luck. A chip pressed while the card's editor is open would
+      // otherwise blur it first, and that blur commits and re-renders the
+      // card — taking this very chip out of the document before its `click`
+      // ever ran. Refusing the focus change here leaves exactly one thing that
+      // ends the edit: `beginGeneration`, on the click below, which blurs the
+      // editor through the ordinary `finishEdit` path (committing the empty
+      // text it opened with is a no-op, so no history step) and only then
+      // takes the body.
+      chip.addEventListener('mousedown', (event) => {
+        event.preventDefault()
+      })
+      chip.addEventListener('click', (event) => {
+        event.stopPropagation()
+        this.start(id, instruction)
+      })
+      chips.appendChild(chip)
+    }
+    return chips
+  }
+
+  // ---- the run -----------------------------------------------------------
+
+  private start(id: NodeId, instruction: CardInstruction): void {
+    if (this.generations.has(id)) return
+    void this.run(id, instruction)
+  }
+
+  private async run(
+    nodeId: NodeId,
+    instruction: CardInstruction,
+  ): Promise<void> {
+    const body = this.callbacks.beginGeneration(nodeId)
+    if (!body) return
+    const generation = this.mountStream(body, nodeId)
+    this.generations.set(nodeId, generation)
+
+    try {
+      const board = this.callbacks.getBoard()
+      const noteTexts = await resolveCardContextNotes(this.host, board, nodeId)
+      if (generation.settled) return
+      const context = buildCardContext({
+        board,
+        nodeId,
+        path: this.callbacks.getSourcePath(),
+        noteTexts,
+      })
+      const locale = this.host.i18n.getSnapshot().locale
+      this.setStatus(generation, this.callbacks.t('cardAi.status.writing'))
+      for await (const event of this.host.agent.stream({
+        systemPrompt: cardGenerationSystemPrompt(locale),
+        prompt: `${context}\n\n---\n\n${instruction.prompt}`,
+        capability: 'vault-read',
+        tools: [this.readCardTool()],
+        signal: generation.controller.signal,
+      })) {
+        if (generation.settled) return
+        switch (event.type) {
+          case 'text':
+            this.appendText(generation, event.text, event.delta)
+            break
+          case 'tool':
+            this.noteToolCall(generation, event.name, event.arguments)
+            break
+          case 'completed':
+            if (event.text) this.appendText(generation, event.text, '')
+            this.settle(generation)
+            return
+          case 'aborted':
+            this.settle(generation)
+            return
+          case 'error':
+            throw new Error(event.message)
+        }
+      }
+      this.settle(generation)
+    } catch (error) {
+      if (generation.settled) return
+      this.callbacks.reportError('card generation', error)
+      this.callbacks.notice(this.callbacks.t('cardAi.failed'))
+      this.settle(generation)
+    }
+  }
+
+  /**
+   * The run's only tool: one card, read-only. `read_board` is not given —
+   * the board's summary is already in the prompt — and nothing that writes is,
+   * so the run has nothing to ask approval for.
+   */
+  private readCardTool(): RunScopedTool {
+    return {
+      name: 'read_card',
+      description:
+        'Read one card of this whiteboard in full. Card ids are listed in the board summary you were given. Asking for a group returns every card inside it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: {
+            type: 'string',
+            description: 'The card id, e.g. "c-8f3a".',
+          },
+        },
+        required: ['id'],
+        additionalProperties: false,
+      },
+      handler: async (input) => {
+        const id = typeof input.id === 'string' ? input.id.trim() : ''
+        if (!id) return { content: '"id" is required.', isError: true }
+        const content = await readCardForModel(
+          this.host,
+          this.callbacks.getBoard(),
+          id,
+        )
+        if (content === null) {
+          return {
+            content: `No card with id "${id}" on this board.`,
+            isError: true,
+          }
+        }
+        return { content }
+      },
+    }
+  }
+
+  // ---- the streaming card ------------------------------------------------
+
+  private mountStream(body: HTMLElement, nodeId: NodeId): Generation {
+    const doc = body.ownerDocument
+    const stream = doc.createElement('div')
+    stream.className = STREAM_CLASS
+
+    const status = doc.createElement('div')
+    status.className = STREAM_STATUS_CLASS
+    const label = doc.createElement('span')
+    label.className = STREAM_LABEL_CLASS
+    label.textContent = this.callbacks.t('cardAi.status.preparing')
+    const stop = doc.createElement('button')
+    stop.type = 'button'
+    stop.className = STREAM_STOP_CLASS
+    stop.textContent = this.callbacks.t('cardAi.stop')
+    stop.addEventListener('click', (event) => {
+      event.stopPropagation()
+      this.stop(nodeId)
+    })
+    status.append(label, stop)
+
+    const text = doc.createElement('div')
+    text.className = STREAM_TEXT_CLASS
+    const textNode = doc.createTextNode('')
+    text.appendChild(textNode)
+
+    stream.append(status, text)
+    body.appendChild(stream)
+
+    return {
+      nodeId,
+      controller: new AbortController(),
+      labelEl: label,
+      textNode,
+      readIds: new Set(),
+      text: '',
+      settled: false,
+      edit: false,
+    }
+  }
+
+  /** Grows the card by what just arrived, rather than re-writing all of it. */
+  private appendText(
+    generation: Generation,
+    text: string,
+    delta: string,
+  ): void {
+    const next = text || generation.text + delta
+    if (next === generation.text) return
+    if (next.startsWith(generation.text)) {
+      generation.textNode.appendData(next.slice(generation.text.length))
+    } else {
+      generation.textNode.data = next
+    }
+    generation.text = next
+    // The status line has said everything it has to say once the card is
+    // writing itself; the stop button stays.
+    generation.labelEl.textContent = ''
+  }
+
+  private noteToolCall(
+    generation: Generation,
+    name: string,
+    args: Readonly<Record<string, unknown>> | undefined,
+  ): void {
+    if (name !== 'read_card') return
+    if (typeof args?.id === 'string') generation.readIds.add(args.id)
+    if (generation.text !== '') return
+    this.setStatus(
+      generation,
+      this.callbacks
+        .t('cardAi.status.reading')
+        .replace('{count}', String(Math.max(generation.readIds.size, 1))),
+    )
+  }
+
+  private setStatus(generation: Generation, status: string): void {
+    if (generation.text !== '') return
+    generation.labelEl.textContent = status
+  }
+
+  private settle(generation: Generation): void {
+    if (generation.settled) return
+    generation.settled = true
+    this.generations.delete(generation.nodeId)
+    generation.controller.abort()
+    this.callbacks.endGeneration(generation.nodeId, generation.text.trim(), {
+      edit: generation.edit,
+    })
+  }
+}

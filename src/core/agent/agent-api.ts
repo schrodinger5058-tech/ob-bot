@@ -1,0 +1,1007 @@
+/**
+ * The programmatic entry point for running the agent: one call in, an event
+ * stream out, for callers with no conversation to own and no UI to wire up —
+ * host features under `src/features/`, and every module call arriving through
+ * `host.agent.stream`.
+ *
+ * `AgentSessionService` (service.ts) sits below it and owns the *session*:
+ * state, persistence, approval routed to a chat surface. Chat views use it
+ * directly because they have a conversation; nobody else should hand-assemble
+ * its run input — come through `stream()`/`run()` here and state the trust
+ * tier as `capability` instead.
+ */
+import type {
+  SerializedEditorState,
+  SerializedElementNode,
+  SerializedTextNode,
+} from 'lexical'
+import type { App } from 'obsidian'
+import { v4 as uuidv4 } from 'uuid'
+
+import type { YoloSettings } from '../../settings/schema/setting.types'
+import type { AssistantWorkspaceScope } from '../../types/assistant.types'
+import type {
+  ChatAssistantMessage,
+  ChatMessage,
+  ChatToolMessage,
+  ChatUserMessage,
+} from '../../types/chat'
+import { ToolCallResponseStatus } from '../../types/tool-call.types'
+import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
+import { getChatModelClient } from '../llm/manager'
+import type { InProcessToolServer } from '../mcp/inProcessToolServer'
+import type { McpManager } from '../mcp/mcpManager'
+import { getToolName } from '../mcp/tool-name-utils'
+import type {
+  ModuleToolSetRegistry,
+  RegisteredModuleToolSetV1,
+} from '../modules/moduleToolSetRegistry'
+import { toModuleToolSetEnablement } from '../modules/moduleToolSetRegistry'
+import { listLiteSkillEntries } from '../skills/liteSkills'
+import { isSkillEnabledForAssistant } from '../skills/skillPolicy'
+
+import { resolveAgentApiContext } from './agent-api-context'
+import { resolveAgentCapabilityProfile } from './capability-profile'
+import type { YoloAgentCapability } from './capability-profile'
+import { resolveWorkspaceScopeForRuntimeInput } from './chat-runtime-inputs'
+import { resolveChatModeRuntime } from './chat-runtime-profiles'
+import { resolveAutoContextCompactionInput } from './compaction'
+import { DEFAULT_ASSISTANT_ID } from './default-assistant'
+import type {
+  AgentConversationState,
+  AgentRunActivity,
+  AgentRunStatus,
+  AgentSessionService,
+} from './service'
+import { getEnabledAssistantToolNames } from './tool-preferences'
+import type { AgentRuntimeLoopConfig, AgentRuntimeRunInput } from './types'
+
+export type YoloAgentContext =
+  | { type: 'file'; path: string }
+  | { type: 'folder'; path: string }
+  | { type: 'skill'; name: string }
+  | { type: 'markdown'; path?: string; content: string }
+  | { type: 'canvas'; path?: string; content: string }
+  | { type: 'text'; content: string }
+
+export type YoloAgentRunRequest = {
+  /**
+   * 新对话的单轮 prompt。与 `messages` 互斥：传了 `messages` 就忽略 `prompt`。
+   * 二者至少传一个。
+   */
+  prompt?: string
+  /**
+   * 预置对话历史（含本次要发给模型的最后一条 user message）。
+   * 传入时 runtime 直接使用这些消息，不再从 `prompt` 构建新 user message。
+   * 用于链式 subagent 调用复用前缀缓存。
+   */
+  messages?: ChatMessage[]
+  assistantId?: string
+  /** Override the assistant model for this run. */
+  modelId?: string
+  mode?: 'ask' | 'agent' | 'agent-full'
+  /** Auto-approve tool calls (YOLO). Only effective in Agent mode. */
+  yolo?: boolean
+  context?: YoloAgentContext[]
+  /**
+   * Trust tier shorthand for callers that have no chat surface to resolve a
+   * chat mode from: expands to this run's host tool grant and its
+   * `bashReadOnly` setting through `resolveAgentCapabilityProfile`, so a
+   * caller can ask for "a read-only agent" without hand-assembling a tool
+   * name list.
+   *
+   * `tools.allowedToolNames` and `bashReadOnly` still win when given
+   * explicitly — the tier only fills in what the caller left unsaid.
+   */
+  capability?: YoloAgentCapability
+  tools?: {
+    allowedToolNames?: string[]
+    /**
+     * Optional in-process tool server scoped to this run. `stream()`
+     * registers it with the shared `McpManager` before the run starts and
+     * disposes it (idempotently) once the run settles — completed, aborted,
+     * or errored — so it never outlives its run.
+     *
+     * Its tool names are unioned into the run's `allowedToolNames` rather
+     * than intersected against it like `allowedToolNames` above: they exist
+     * only for this run and have no persisted per-assistant toggle to
+     * intersect against (see `narrowAllowedToolNames` / moduleAgent.ts, the
+     * only current caller).
+     */
+    inProcessServer?: {
+      name: string
+      server: InProcessToolServer
+    }
+  }
+  /**
+   * 覆盖 assistant 的 workspace scope。学习模块 subagent 按参考资料范围
+   * 动态传入；不传时回退到 assistant 的 scope。
+   */
+  workspaceScope?: AssistantWorkspaceScope
+  /**
+   * 强制本次 run 的 bash 工具调用使用结构性只读变体：mkdir/mv/rm/rmdir 一律
+   * command not found，且不受审批档位影响。通常不必显式传：`capability:
+   * 'vault-read'` 已经会把它设成 true。
+   */
+  bashReadOnly?: boolean
+  systemPromptOverride?: string
+  activity?: AgentRunActivity
+  abortSignal?: AbortSignal
+}
+
+export type YoloAgentRunResult = {
+  conversationId: string
+  text: string
+  status: 'completed' | 'aborted' | 'error'
+  errorMessage?: string
+}
+
+export type YoloAgentEvent =
+  | {
+      type: 'state'
+      conversationId: string
+      status: AgentRunStatus
+    }
+  | {
+      type: 'text'
+      conversationId: string
+      messageId: string
+      text: string
+      delta: string
+      streaming: boolean
+    }
+  | {
+      type: 'tool'
+      conversationId: string
+      toolCallId: string
+      name: string
+      status:
+        | 'pending'
+        | 'running'
+        | 'completed'
+        | 'error'
+        | 'awaiting_approval'
+      /** Parsed tool-call arguments (only when arguments are complete). */
+      arguments?: Record<string, unknown>
+    }
+  | {
+      type: 'completed'
+      conversationId: string
+      text: string
+    }
+  | {
+      type: 'error'
+      conversationId: string
+      message: string
+    }
+
+export type YoloAgentApi = {
+  run(request: YoloAgentRunRequest): Promise<YoloAgentRunResult>
+  stream(request: YoloAgentRunRequest): AsyncIterable<YoloAgentEvent>
+  abort(conversationId: string): boolean
+}
+
+type AgentApiRunInput = {
+  conversationId: string
+  sourceUserMessageId: string
+  loopConfig: AgentRuntimeLoopConfig
+  input: AgentRuntimeRunInput
+  activity?: AgentRunActivity
+}
+
+export type AgentRunApiOptions = {
+  app: App
+  getSettings: () => YoloSettings
+  getAgentService: () => AgentSessionService
+  getMcpManager: () => Promise<McpManager>
+  /**
+   * Optional so pre-existing test fixtures that construct this service
+   * without a plugin instance keep compiling — a caller that omits it simply
+   * gets no module tool sets in `assistantEnabledToolNames`, matching the
+   * behavior before module tool sets existed. The real host (`main.ts`) always provides it.
+   */
+  getModuleToolSetRegistry?: () => ModuleToolSetRegistry
+}
+
+export class AgentRunApi implements YoloAgentApi {
+  private readonly abortControllers = new Map<string, AbortController>()
+
+  constructor(private readonly options: AgentRunApiOptions) {}
+
+  async run(request: YoloAgentRunRequest): Promise<YoloAgentRunResult> {
+    let conversationId = ''
+    let text = ''
+    let errorMessage: string | undefined
+    let status: YoloAgentRunResult['status'] = 'completed'
+
+    for await (const event of this.stream(request)) {
+      conversationId = event.conversationId
+      if (event.type === 'text' || event.type === 'completed') {
+        text = event.text
+      }
+      if (event.type === 'state' && event.status === 'aborted') {
+        status = 'aborted'
+      }
+      if (event.type === 'error') {
+        status = 'error'
+        errorMessage = event.message
+      }
+    }
+
+    return {
+      conversationId,
+      text,
+      status,
+      ...(errorMessage ? { errorMessage } : {}),
+    }
+  }
+
+  async *stream(request: YoloAgentRunRequest): AsyncIterable<YoloAgentEvent> {
+    const conversationId = uuidv4()
+    const abortController = new AbortController()
+    const abortExternal = () => abortController.abort()
+
+    this.abortControllers.set(conversationId, abortController)
+    if (request.abortSignal) {
+      if (request.abortSignal.aborted) {
+        abortController.abort()
+      } else {
+        request.abortSignal.addEventListener('abort', abortExternal, {
+          once: true,
+        })
+      }
+    }
+
+    let disposeInProcessServer: (() => void) | undefined
+    try {
+      const mcpManager = await this.options.getMcpManager()
+      if (request.tools?.inProcessServer) {
+        disposeInProcessServer = mcpManager.registerInProcessServer(
+          request.tools.inProcessServer.name,
+          request.tools.inProcessServer.server,
+        )
+      }
+
+      const resolved = await resolveAgentApiRunInput({
+        request,
+        conversationId,
+        abortSignal: abortController.signal,
+        app: this.options.app,
+        settings: this.options.getSettings(),
+        agentService: this.options.getAgentService(),
+        mcpManager,
+        moduleToolSets: this.options.getModuleToolSetRegistry?.().getSnapshot(),
+      })
+
+      for await (const event of streamResolvedAgentRunEvents({
+        conversationId,
+        sourceUserMessageId: resolved.sourceUserMessageId,
+        loopConfig: resolved.loopConfig,
+        input: resolved.input,
+        activity: resolved.activity,
+        agentService: this.options.getAgentService(),
+      })) {
+        yield event
+      }
+    } catch (error) {
+      yield {
+        type: 'error',
+        conversationId,
+        message: normalizeErrorMessage(error),
+      }
+    } finally {
+      abortController.abort()
+      request.abortSignal?.removeEventListener('abort', abortExternal)
+      this.abortControllers.delete(conversationId)
+      disposeInProcessServer?.()
+    }
+  }
+
+  abort(conversationId: string): boolean {
+    const controller = this.abortControllers.get(conversationId)
+    controller?.abort()
+    const serviceAborted = this.options
+      .getAgentService()
+      .abortConversation(conversationId)
+    return Boolean(controller) || serviceAborted
+  }
+}
+
+export async function* streamResolvedAgentRunEvents({
+  conversationId,
+  sourceUserMessageId,
+  loopConfig,
+  input,
+  activity,
+  agentService,
+}: {
+  conversationId: string
+  sourceUserMessageId: string
+  loopConfig: AgentRuntimeLoopConfig
+  input: AgentRuntimeRunInput
+  activity?: AgentRunActivity
+  agentService: AgentSessionService
+}): AsyncIterable<YoloAgentEvent> {
+  const queue = new AsyncEventQueue<YoloAgentEvent>()
+  let previous = createEmptySnapshotTracker()
+  let settled = false
+
+  // 会话快照只在语义边界发布，纯 token 增量走 assistant render stream。模块侧
+  // 的 `text` 事件仍然要保持逐块的增量粒度，所以这里额外订阅当前 assistant
+  // 消息的展示流；两条通道共用同一份 `assistantTextById` 游标，delta 不会重复。
+  const renderStream: {
+    messageId: string | null
+    unsubscribe: (() => void) | null
+  } = { messageId: null, unsubscribe: null }
+
+  const pushAssistantText = ({
+    messageId,
+    text,
+    streaming,
+  }: {
+    messageId: string
+    text: string
+    streaming: boolean
+  }) => {
+    const previousText = previous.assistantTextById.get(messageId) ?? ''
+    if (previousText === text) {
+      return
+    }
+    previous.assistantTextById.set(messageId, text)
+    queue.push({
+      type: 'text',
+      conversationId,
+      messageId,
+      text,
+      delta: text.startsWith(previousText)
+        ? text.slice(previousText.length)
+        : '',
+      streaming,
+    })
+  }
+
+  const followRenderStream = (messageId: string | null) => {
+    if (messageId === renderStream.messageId) {
+      return
+    }
+    renderStream.unsubscribe?.()
+    renderStream.unsubscribe = null
+    renderStream.messageId = messageId
+    if (!messageId) {
+      return
+    }
+    renderStream.unsubscribe = agentService.subscribeAssistantRenderStream(
+      conversationId,
+      messageId,
+      (value) => {
+        pushAssistantText({
+          messageId: value.messageId,
+          text: value.content,
+          streaming: value.phase === 'streaming',
+        })
+      },
+    )
+  }
+
+  const unsubscribe = agentService.subscribe(
+    conversationId,
+    (state) => {
+      const nextEvents = conversationStateToEvents({
+        state,
+        sourceUserMessageId,
+        previous,
+      })
+      previous = nextEvents.nextTracker
+      for (const event of nextEvents.events) {
+        queue.push(event)
+      }
+      followRenderStream(
+        findAssistantMessageForUser(state.messages, sourceUserMessageId)?.id ??
+          null,
+      )
+      if (
+        state.status === 'completed' ||
+        state.status === 'aborted' ||
+        state.status === 'error'
+      ) {
+        settled = true
+        queue.close()
+      }
+    },
+    { emitCurrent: false },
+  )
+
+  void agentService
+    .run({
+      conversationId,
+      persistState: false,
+      loopConfig,
+      input,
+      activity,
+    })
+    .catch((error) => {
+      queue.push({
+        type: 'error',
+        conversationId,
+        message: normalizeErrorMessage(error),
+      })
+      settled = true
+      queue.close()
+    })
+
+  try {
+    for await (const event of queue) {
+      yield event
+    }
+  } finally {
+    if (!settled) {
+      agentService.abortConversation(conversationId)
+    }
+    unsubscribe()
+    renderStream.unsubscribe?.()
+  }
+}
+
+export async function resolveAgentApiRunInput({
+  request,
+  conversationId,
+  abortSignal,
+  app,
+  settings,
+  agentService,
+  mcpManager,
+  moduleToolSets,
+}: {
+  request: YoloAgentRunRequest
+  conversationId: string
+  abortSignal: AbortSignal
+  app: App
+  settings: YoloSettings
+  agentService: AgentSessionService
+  mcpManager: McpManager
+  /**
+   * Registry snapshot of module-contributed tool sets (whiteboard, etc.).
+   * Optional so
+   * the many test call sites that don't exercise module tool sets don't need
+   * to pass one; a caller that omits it just resolves with none available,
+   * same as before this parameter existed.
+   */
+  moduleToolSets?: readonly RegisteredModuleToolSetV1[]
+}): Promise<AgentApiRunInput> {
+  const assistantId =
+    request.assistantId ?? settings.currentAssistantId ?? DEFAULT_ASSISTANT_ID
+  const assistant =
+    settings.assistants.find((candidate) => candidate.id === assistantId) ??
+    null
+  const requestedModelId =
+    request.modelId || assistant?.modelId || settings.chatModelId
+  const resolvedClient = getChatModelClient({
+    settings,
+    modelId: requestedModelId,
+  })
+  const provider = settings.providers.find(
+    (candidate) => candidate.id === resolvedClient.model.providerId,
+  )
+  const assistantEnabledToolNames = getEnabledAssistantToolNames(
+    assistant,
+    toModuleToolSetEnablement(moduleToolSets ?? []),
+  )
+  const requestedMode = request.mode ?? 'ask'
+  const mode = requestedMode === 'agent-full' ? 'agent' : requestedMode
+  const chatModeRuntime = resolveChatModeRuntime({
+    mode,
+    yoloEnabled:
+      requestedMode === 'agent-full' ? true : (request.yolo ?? false),
+    assistant,
+    assistantEnabledToolNames,
+  })
+  const capabilityProfile =
+    request.capability !== undefined
+      ? resolveAgentCapabilityProfile(request.capability)
+      : undefined
+  const allowedToolNames = mergeInProcessServerToolNames(
+    narrowAllowedToolNames(
+      chatModeRuntime.allowedToolNames,
+      request.tools?.allowedToolNames ??
+        (capabilityProfile
+          ? [...capabilityProfile.allowedHostToolNames]
+          : undefined),
+    ),
+    request.tools?.inProcessServer,
+  )
+  const allowedSkillPaths = await resolveAllowedSkillPaths({
+    app,
+    settings,
+    assistant,
+  })
+  const requestContextBuilder = new RequestContextBuilder(
+    app,
+    {
+      ...settings,
+      currentAssistantId: assistant?.id,
+    },
+    {
+      includeSkills: true,
+      systemPromptSnapshotStore: agentService.getSystemPromptSnapshotStore(),
+      getPromptSourceRevision: () =>
+        agentService.getPromptSourceWatcher().getRevision(),
+      promptSourcePathsCallback: (paths) =>
+        agentService.getPromptSourceWatcher().setWatchedPaths(paths),
+      resolveModuleFileTextRenderer: (extension) =>
+        mcpManager.resolveModuleFileTextRenderer(extension),
+    },
+  )
+  const resolvedContext = await resolveAgentApiContext({
+    app,
+    settings,
+    context: request.context,
+  })
+  let messages: ChatMessage[]
+  let sourceUserMessageId: string
+
+  if (request.messages && request.messages.length > 0) {
+    messages = request.messages
+    const lastUser = [...request.messages]
+      .reverse()
+      .find((message) => message.role === 'user')
+    if (!lastUser) {
+      throw new Error('request.messages must contain at least one user message')
+    }
+    sourceUserMessageId = lastUser.id
+  } else {
+    if (!request.prompt) {
+      throw new Error('Either prompt or messages must be provided')
+    }
+    const compiledPrompt =
+      await requestContextBuilder.compilePlainUserMessagePrompt({
+        prompt: buildAgentApiPrompt({
+          prompt: request.prompt,
+          context: resolvedContext.textBlocks,
+        }),
+        mentionables: resolvedContext.mentionables,
+        selectedSkills: resolvedContext.selectedSkills,
+      })
+    sourceUserMessageId = uuidv4()
+    messages = [
+      buildAgentApiUserMessage({
+        id: sourceUserMessageId,
+        content: createPlainTextEditorState(request.prompt),
+        promptContent: compiledPrompt.promptContent,
+        mentionables: resolvedContext.mentionables,
+        selectedSkills: resolvedContext.selectedSkills,
+      }),
+    ]
+  }
+
+  return {
+    conversationId,
+    sourceUserMessageId,
+    activity: request.activity,
+    loopConfig: chatModeRuntime.loopConfig,
+    input: {
+      providerClient: resolvedClient.providerClient,
+      model: resolvedClient.model,
+      apiType: provider?.apiType ?? null,
+      messages,
+      conversationId,
+      assistantId: assistant?.id,
+      sourceUserMessageId,
+      requestContextBuilder,
+      mcpManager,
+      abortSignal,
+      allowedToolNames,
+      systemPromptOverride: request.systemPromptOverride,
+      toolPreferences: chatModeRuntime.toolPreferences,
+      builtinCapabilityPreferences:
+        chatModeRuntime.builtinCapabilityPreferences,
+      toolServerPreferences: chatModeRuntime.toolServerPreferences,
+      runtimeMode: chatModeRuntime.runtimeMode,
+      bypassToolApproval: chatModeRuntime.bypassToolApproval,
+      modePersonaPrompt: chatModeRuntime.modePersonaPrompt,
+      modePersonaModuleId: chatModeRuntime.modePersonaModuleId,
+      contextPolicy: chatModeRuntime.contextPolicy,
+      workspaceScope:
+        request.workspaceScope ??
+        resolveWorkspaceScopeForRuntimeInput(assistant),
+      bashReadOnly: request.bashReadOnly ?? capabilityProfile?.bashReadOnly,
+      allowedSkillPaths,
+      autoContextCompaction: resolveAutoContextCompactionInput({
+        settings,
+        model: resolvedClient.model,
+      }),
+      requestParams: {
+        deliveryMode: 'incremental',
+        primaryRequestTimeoutMs:
+          settings.continuationOptions.primaryRequestTimeoutMs,
+        streamFallbackRecoveryEnabled:
+          settings.continuationOptions.streamFallbackRecoveryEnabled,
+      },
+    },
+  }
+}
+
+export function buildAgentApiPrompt({
+  prompt,
+  context,
+}: {
+  prompt: string
+  context?: Array<
+    Extract<YoloAgentContext, { type: 'text' | 'markdown' | 'canvas' }>
+  >
+}): string {
+  const blocks = (context ?? []).map((entry) => {
+    if (entry.type === 'markdown') {
+      const label = entry.path
+        ? `Markdown context: ${entry.path}`
+        : 'Markdown context'
+      return `${label}\n\n\`\`\`markdown\n${entry.content}\n\`\`\``
+    }
+    if (entry.type === 'canvas') {
+      const label = entry.path
+        ? `Canvas context: ${entry.path}`
+        : 'Canvas context'
+      return `${label}\n\n\`\`\`json\n${entry.content}\n\`\`\``
+    }
+    return entry.content
+  })
+
+  return [prompt, ...blocks]
+    .filter((part) => part.trim().length > 0)
+    .join('\n\n')
+}
+
+function createPlainTextEditorState(text: string): SerializedEditorState {
+  const textNode: SerializedTextNode = {
+    detail: 0,
+    format: 0,
+    mode: 'normal',
+    style: '',
+    text,
+    type: 'text',
+    version: 1,
+  }
+  const paragraph = {
+    children: [textNode],
+    direction: 'ltr',
+    format: '',
+    indent: 0,
+    type: 'paragraph',
+    version: 1,
+    textFormat: 0,
+    textStyle: '',
+  } as SerializedElementNode<SerializedTextNode>
+
+  return {
+    root: {
+      children: [paragraph],
+      direction: 'ltr',
+      format: '',
+      indent: 0,
+      type: 'root',
+      version: 1,
+    },
+  }
+}
+
+export function buildAgentApiUserMessage({
+  id,
+  content,
+  promptContent,
+  mentionables,
+  selectedSkills,
+}: {
+  id: string
+  content?: ChatUserMessage['content']
+  promptContent: ChatUserMessage['promptContent']
+  mentionables: ChatUserMessage['mentionables']
+  selectedSkills?: ChatUserMessage['selectedSkills']
+}): ChatUserMessage {
+  return {
+    role: 'user',
+    id,
+    content: content ?? null,
+    promptContent,
+    mentionables,
+    selectedSkills,
+  }
+}
+
+export function narrowAllowedToolNames(
+  runtimeAllowedToolNames: string[] | undefined,
+  requestedAllowedToolNames: string[] | undefined,
+): string[] | undefined {
+  if (!requestedAllowedToolNames) return runtimeAllowedToolNames
+  if (!runtimeAllowedToolNames) return []
+
+  const requested = new Set(requestedAllowedToolNames)
+  return runtimeAllowedToolNames.filter((name) => requested.has(name))
+}
+
+/**
+ * Unions a run-scoped in-process tool server's tool names into
+ * `allowedToolNames`. Deliberately a union, not a further narrowing: these
+ * tools are supplied by the caller for this run alone and were never in the
+ * assistant's persisted tool preferences for `narrowAllowedToolNames` to
+ * have intersected against in the first place.
+ */
+export function mergeInProcessServerToolNames(
+  allowedToolNames: string[] | undefined,
+  inProcessServer: NonNullable<YoloAgentRunRequest['tools']>['inProcessServer'],
+): string[] | undefined {
+  if (!inProcessServer) return allowedToolNames
+  const serverToolNames = inProcessServer.server
+    .listTools()
+    .map((tool) => getToolName(inProcessServer.name, tool.name))
+  if (serverToolNames.length === 0) return allowedToolNames
+  return [...new Set([...(allowedToolNames ?? []), ...serverToolNames])]
+}
+
+export function conversationStateToEvents({
+  state,
+  sourceUserMessageId,
+  previous,
+}: {
+  state: AgentConversationState
+  sourceUserMessageId: string
+  previous: SnapshotTracker
+}): { events: YoloAgentEvent[]; nextTracker: SnapshotTracker } {
+  const events: YoloAgentEvent[] = [
+    {
+      type: 'state',
+      conversationId: state.conversationId,
+      status: state.status,
+    },
+  ]
+  const assistantMessage = findAssistantMessageForUser(
+    state.messages,
+    sourceUserMessageId,
+  )
+  const nextTracker: SnapshotTracker = {
+    assistantTextById: new Map(previous.assistantTextById),
+    toolStatusById: new Map(previous.toolStatusById),
+  }
+  let currentText = ''
+
+  if (assistantMessage) {
+    const previousText =
+      previous.assistantTextById.get(assistantMessage.id) ?? ''
+    currentText = assistantMessage.content
+    const delta = currentText.startsWith(previousText)
+      ? currentText.slice(previousText.length)
+      : ''
+    nextTracker.assistantTextById.set(assistantMessage.id, currentText)
+
+    if (delta.length > 0 || previousText !== currentText) {
+      events.push({
+        type: 'text',
+        conversationId: state.conversationId,
+        messageId: assistantMessage.id,
+        text: currentText,
+        delta,
+        streaming:
+          assistantMessage.metadata?.generationState === 'streaming' &&
+          state.status === 'running',
+      })
+    }
+  }
+
+  for (const event of toolEventsFromMessages({
+    conversationId: state.conversationId,
+    messages: state.messages,
+    sourceUserMessageId,
+    previous,
+    nextTracker,
+  })) {
+    events.push(event)
+  }
+
+  if (state.status === 'completed') {
+    events.push({
+      type: 'completed',
+      conversationId: state.conversationId,
+      text: currentText,
+    })
+  } else if (state.status === 'error') {
+    events.push({
+      type: 'error',
+      conversationId: state.conversationId,
+      message: state.errorMessage ?? 'Agent run failed',
+    })
+  }
+
+  return { events, nextTracker }
+}
+
+type SnapshotTracker = {
+  assistantTextById: Map<string, string>
+  toolStatusById: Map<string, YoloAgentEvent & { type: 'tool' }>
+}
+
+function createEmptySnapshotTracker(): SnapshotTracker {
+  return {
+    assistantTextById: new Map(),
+    toolStatusById: new Map(),
+  }
+}
+
+function findAssistantMessageForUser(
+  messages: ChatMessage[],
+  sourceUserMessageId: string,
+): ChatAssistantMessage | null {
+  // In tool-calling loops, multiple assistant messages share the same
+  // sourceUserMessageId. The final output lives in the last one.
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (
+      message.role === 'assistant' &&
+      message.metadata?.sourceUserMessageId === sourceUserMessageId
+    ) {
+      return message
+    }
+  }
+
+  const userIndex = messages.findIndex(
+    (message) => message.role === 'user' && message.id === sourceUserMessageId,
+  )
+  if (userIndex < 0) {
+    return null
+  }
+
+  for (let i = messages.length - 1; i > userIndex; i -= 1) {
+    if (messages[i].role === 'assistant') {
+      return messages[i] as ChatAssistantMessage
+    }
+  }
+
+  return null
+}
+
+function toolEventsFromMessages({
+  conversationId,
+  messages,
+  sourceUserMessageId,
+  previous,
+  nextTracker,
+}: {
+  conversationId: string
+  messages: ChatMessage[]
+  sourceUserMessageId: string
+  previous: SnapshotTracker
+  nextTracker: SnapshotTracker
+}): Array<YoloAgentEvent & { type: 'tool' }> {
+  const events: Array<YoloAgentEvent & { type: 'tool' }> = []
+  const relevantToolMessages = messages.filter(
+    (message): message is ChatToolMessage =>
+      message.role === 'tool' &&
+      message.metadata?.sourceUserMessageId === sourceUserMessageId,
+  )
+
+  for (const message of relevantToolMessages) {
+    for (const toolCall of message.toolCalls) {
+      const args = toolCall.request.arguments
+      const parsedArgs = args?.kind === 'complete' ? args.value : undefined
+      const event: YoloAgentEvent & { type: 'tool' } = {
+        type: 'tool',
+        conversationId,
+        toolCallId: toolCall.request.id,
+        name: toolCall.request.name,
+        status: mapToolStatus(toolCall.response.status),
+        ...(parsedArgs ? { arguments: parsedArgs } : {}),
+      }
+      const previousEvent = previous.toolStatusById.get(event.toolCallId)
+      nextTracker.toolStatusById.set(event.toolCallId, event)
+      if (!previousEvent || previousEvent.status !== event.status) {
+        events.push(event)
+      }
+    }
+  }
+
+  return events
+}
+
+function mapToolStatus(
+  status: ToolCallResponseStatus,
+): Extract<YoloAgentEvent, { type: 'tool' }>['status'] {
+  switch (status) {
+    case ToolCallResponseStatus.PendingApproval:
+    case ToolCallResponseStatus.AwaitingUserInput:
+      return 'awaiting_approval'
+    case ToolCallResponseStatus.Running:
+      return 'running'
+    case ToolCallResponseStatus.Success:
+      return 'completed'
+    case ToolCallResponseStatus.Error:
+    case ToolCallResponseStatus.Rejected:
+    case ToolCallResponseStatus.Aborted:
+      return 'error'
+    default:
+      return 'pending'
+  }
+}
+
+async function resolveAllowedSkillPaths({
+  app,
+  settings,
+  assistant,
+}: {
+  app: App
+  settings: YoloSettings
+  assistant: YoloSettings['assistants'][number] | null
+}): Promise<string[]> {
+  if (!assistant) {
+    return []
+  }
+
+  const disabledSkillNames = settings.skills?.disabledSkillIds ?? []
+  const skillEntries = await listLiteSkillEntries(app, { settings })
+  return skillEntries
+    .filter((skill) =>
+      isSkillEnabledForAssistant({
+        assistant,
+        skillName: skill.name,
+        disabledSkillNames,
+      }),
+    )
+    .map((skill) => skill.path)
+}
+
+function normalizeErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+  if (typeof error === 'string') {
+    return error
+  }
+  return JSON.stringify(error)
+}
+
+class AsyncEventQueue<T> implements AsyncIterable<T> {
+  private readonly values: T[] = []
+  private readonly waiters: Array<(result: IteratorResult<T>) => void> = []
+  private closed = false
+
+  push(value: T): void {
+    if (this.closed) {
+      return
+    }
+    const waiter = this.waiters.shift()
+    if (waiter) {
+      waiter({ done: false, value })
+      return
+    }
+    this.values.push(value)
+  }
+
+  close(): void {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    while (this.waiters.length > 0) {
+      this.waiters.shift()?.({ done: true, value: undefined })
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<T> {
+    while (true) {
+      const next = await this.next()
+      if (next.done) {
+        return
+      }
+      yield next.value
+    }
+  }
+
+  private next(): Promise<IteratorResult<T>> {
+    const value = this.values.shift()
+    if (value) {
+      return Promise.resolve({ done: false, value })
+    }
+    if (this.closed) {
+      return Promise.resolve({ done: true, value: undefined })
+    }
+    return new Promise((resolve) => {
+      this.waiters.push(resolve)
+    })
+  }
+}

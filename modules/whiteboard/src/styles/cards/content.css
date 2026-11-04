@@ -1,0 +1,235 @@
+/* A web card's frame. Sandbox flags and the http(s)-only rule live in
+ * ui/canvas.ts (WEB_FRAME_SANDBOX) — this is only its geometry. */
+.yolo-whiteboard-card-web-frame {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: var(--background-primary);
+}
+
+/* Obsidian's windowed preview, mounted by the Host API's markdown content
+ * view (ui.createMarkdownContentView) — the single content path both note and
+ * text cards take. It arrives sized to fill and scrolling on its own; what is
+ * ours is the inset and the card-scale type size, both matched to the editor
+ * below so clicking into a card does not shift what is written in it.
+ *
+ * `.markdown-preview-view` alone sets the padding and font size Obsidian uses
+ * for a full document page (0,1,0), so a two-class selector is what it takes
+ * to state the card's instead. */
+.yolo-whiteboard-card-body .markdown-preview-view {
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+/* ---- Block spacing: the preview laid out on the editor's lines ----
+ *
+ * The editor lays a card out line by line: a block takes the lines it is
+ * written on, and what lies between two blocks is the blank lines the source
+ * has there — one, a run pasted in, or none at all under a heading. The
+ * preview spaces blocks by kind instead (the theme's `--p-spacing`, a
+ * heading's own spacing, a quote's em), and has no way to do otherwise from
+ * the HTML: Markdown renders any number of blank lines, none included, as the
+ * same break. So clicking into a card moved what was written in it.
+ *
+ * Both of a card's previews are rendered in sections — the one-pass render
+ * asks for them (cardContent.ts), the windowed preview has them anyway — and
+ * the host marks each with the blank lines that follow its block
+ * (`--yolo-markdown-blank-lines-after`). Here a block takes no margin of its
+ * own and its section is followed by that many body lines: the editor's
+ * layout, block for block. On the section rather than the block, because a
+ * table's section scrolls sideways, and margins inside it stay inside. */
+
+/* The card's body line, as a length. Registered so `1lh` is resolved where it
+ * is declared — on the preview and on the editor's content, both at the
+ * card's type size — and inherited from there as that length. Unregistered,
+ * it would be resolved again at every use, and a heading would get its own,
+ * taller line. */
+@property --yolo-whiteboard-card-line {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 0px;
+}
+
+/* `--p-spacing` still spaces paragraphs inside a block — a quote's, a list
+ * item's, a callout's — where the editor has a line for each blank one too.
+ * The editor's half is content it renders rather than lines (a callout, a
+ * table), spaced by the same variable, so it gets the same value. */
+.yolo-whiteboard-card-body .markdown-preview-view,
+.yolo-whiteboard-editor-host .cm-content {
+  --yolo-whiteboard-card-line: 1lh;
+  --p-spacing: var(--yolo-whiteboard-card-line);
+  /* Obsidian's `--table-drag-handle-size` (below), which it only defines on
+   * the editor's table. */
+  --yolo-whiteboard-table-handles: var(--size-4-4);
+}
+
+.is-mobile .yolo-whiteboard-card-body .markdown-preview-view {
+  --yolo-whiteboard-table-handles: var(--size-4-6);
+}
+
+/* A section, not the windowed preview's spacer or its header and footer. Its
+ * own formatting context, so that it is as tall as its block, margins and
+ * all — a rule's, a table's — and the blank lines after it are all that
+ * separates it from the next. The fallback is the one blank line blocks are
+ * normally written apart by. */
+.yolo-whiteboard-card-body
+  .markdown-preview-view.markdown-rendered
+  .markdown-preview-sizer
+  > div:not(.mod-ui, .markdown-preview-pusher) {
+  display: flow-root;
+  margin-bottom: calc(
+    var(--yolo-markdown-blank-lines-after, 1) * var(--yolo-whiteboard-card-line)
+  );
+}
+
+/* As specific as Obsidian's reset of the first section's block
+ * (`… .markdown-preview-pusher + div:not(.mod-ui) > :first-child`, 0,5,1), and
+ * well past its heading rule (0,3,3). */
+.yolo-whiteboard-card-body
+  .markdown-preview-view.markdown-rendered
+  .markdown-preview-sizer
+  > div:not(.mod-ui)
+  > * {
+  margin-block: 0;
+}
+
+/* The editor shows a table with room around it for its drag handles and its
+ * add-row button (Obsidian's `--table-drag-handle-size` of padding, above and
+ * below) — room it needs, so the preview keeps the same. */
+.yolo-whiteboard-card-body
+  .markdown-preview-view.markdown-rendered
+  .markdown-preview-sizer
+  > div:not(.mod-ui)
+  > table {
+  margin-block: var(--yolo-whiteboard-table-handles);
+}
+
+/* A rule is a line of its own in the editor, drawn through its middle. Its
+ * thickness is Obsidian's, which is what the editor draws it with. */
+.yolo-whiteboard-card-body
+  .markdown-preview-view.markdown-rendered
+  .markdown-preview-sizer
+  > div:not(.mod-ui)
+  > hr {
+  margin-block: calc(
+    (var(--yolo-whiteboard-card-line) - var(--hr-thickness)) / 2
+  );
+  border-top-width: var(--hr-thickness);
+}
+
+/* A code block's fences are lines in the editor, at the code's size; the
+ * preview draws neither. A line's worth of padding above and below the code
+ * stands in for them, and the code's own lines (block, so they are measured
+ * at its line height rather than the paragraph's around it) do the rest.
+ * Inside a callout too, which the editor shows rendered just like this. */
+.yolo-whiteboard-card-body :is(.markdown-preview-view, .cm-embed-block) pre {
+  padding-block: 0;
+}
+
+.yolo-whiteboard-card-body
+  :is(.markdown-preview-view, .cm-embed-block)
+  pre
+  > code {
+  display: block;
+  padding-block: 1lh;
+}
+
+/* Items of a loose list — written with a blank line between them — hold
+ * paragraphs, and Obsidian takes the margin off an item's last one, running
+ * the items together; the editor shows the blank line. Not after the last
+ * item, where it would add to what the list's section is followed by. */
+.yolo-whiteboard-card-body
+  :is(.markdown-preview-view, .cm-embed-block)
+  li:not(:last-child)
+  > p:last-of-type {
+  margin-bottom: var(--yolo-whiteboard-card-line);
+}
+
+/* A task's checkbox is centred on its line in the editor. Sat on the baseline
+ * as the preview has it, it is tall enough to push its line taller. */
+.yolo-whiteboard-card-body
+  :is(.markdown-preview-view, .cm-embed-block)
+  .task-list-item-checkbox {
+  vertical-align: middle;
+  top: -0.1em;
+}
+
+/* Only a body holding the whole document scrolls — in practice the focused
+ * card, the only one that gets one (cardRenderer's `renderMarkdownInto`).
+ * Every other card is rendered with just the slice it can show, so a
+ * scrollbar on one would be an offer to reach content that was never built —
+ * and a card whose content overshoots its box by a line would grow one for no
+ * reason.
+ *
+ * Keyed on the mounted content rather than on the selection: see
+ * CARD_BODY_SCROLLS_CLASS for the frame of the note's top that the other
+ * spelling paints on the way out.
+ *
+ * The scrollbar is an affordance, not a control: the content mask keeps the
+ * whole card unhittable, so it cannot be dragged. What moves the content is
+ * the wheel, routed by the canvas's own handler. */
+.yolo-whiteboard-card-body .markdown-preview-view {
+  overflow: hidden;
+}
+
+/* Never the render on its way out: it holds a slice, not the document, and a
+ * scrollbar appearing on it for the frames a handover lasts is one more thing
+ * moving in a card that should look still. */
+.yolo-whiteboard-card-body-scrolls
+  .markdown-preview-view:not(.yolo-whiteboard-card-handoff) {
+  overflow: auto;
+}
+
+/* A card shows as much of its note as it has room for and clips the rest, so
+ * text running into the bottom edge is the one sign there is more — and a
+ * hard cut through a line reads as a rendering fault rather than as "more
+ * below". The last stretch fades instead. Only where the card is not
+ * scrolling (a scrolled card has its own bottom to reach, and would fade its
+ * last line there) and not being edited; a card whose text ends above the
+ * band has nothing there to fade, so a short note pays nothing. */
+.yolo-whiteboard-card-body:not(.yolo-whiteboard-card-body-scrolls):not(
+    .yolo-whiteboard-editor-host
+  )
+  > .markdown-preview-view {
+  mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - 24px),
+    transparent 100%
+  );
+}
+
+/* Same inset, on CodeMirror's scroll container rather than on its content:
+ * putting it on `.cm-content` would also lose to Obsidian's own
+ * `.markdown-source-view.mod-cm6 .cm-content { padding: 0 }` (0,3,0 against
+ * our 0,2,0); nothing styles the scroller's padding, so nothing has to be
+ * fought here. */
+.yolo-whiteboard-editor-host .cm-scroller {
+  padding: 6px 10px;
+  overflow: auto;
+}
+
+.yolo-whiteboard-editor-host .cm-editor {
+  height: 100%;
+  font-size: 13px;
+}
+
+.yolo-whiteboard-card-missing,
+.yolo-whiteboard-card-unsupported-placeholder {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px 10px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.yolo-whiteboard-card-missing {
+  color: var(--text-error);
+}
+
+.yolo-whiteboard-card-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+}

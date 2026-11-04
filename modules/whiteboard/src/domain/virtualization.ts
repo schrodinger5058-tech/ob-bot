@@ -1,0 +1,270 @@
+// Pure-logic viewport virtualization engine, migrated from the S1/S2 spikes
+// (algorithm ported unchanged from `git show
+// spike/s2-editor-lifecycle:src/features/whiteboard-spike/virtualization.ts`
+// per that spike's "对正式实现的架构建议" #1 and #3):
+//   - input is {cards, viewportRect, pinnedIds}, output is a
+//     {toMount, toUnmount} diff — no DOM dependency, so swapping the mount
+//     consumer (innerHTML -> MarkdownRenderer -> React, etc.) never requires
+//     touching this module.
+//   - "currently interacting" cards (dragged, edited, selected, ...) are
+//     exempted from the unload decision via a generic `pinnedIds` set rather
+//     than a one-off drag special-case.
+//
+// Recompute throttling (~70ms) and per-frame drain quotas
+// are *not* this module's job — those are host-loop concerns owned by the
+// (not-yet-built) canvas UI, which calls `recompute()` on a debounce and
+// `drain()` once per animation frame.
+
+export type VirtualCardRect = Readonly<{
+  id: string
+  x: number
+  y: number
+  w: number
+  h: number
+}>
+
+export type WorldRect = Readonly<{
+  left: number
+  top: number
+  right: number
+  bottom: number
+}>
+
+export type CanvasView = Readonly<{
+  tx: number
+  ty: number
+  scale: number
+}>
+
+/**
+ * Screen-space viewport (+ buffer) projected into world coordinates. Buffer
+ * is defined in screen pixels and divided by `scale` here so its on-screen
+ * visual width stays constant across zoom levels.
+ */
+export function computeWorldViewportRect(
+  viewportWidthPx: number,
+  viewportHeightPx: number,
+  view: CanvasView,
+  bufferPx: number,
+): WorldRect {
+  const buf = bufferPx / view.scale
+  return {
+    left: -view.tx / view.scale - buf,
+    top: -view.ty / view.scale - buf,
+    right: (viewportWidthPx - view.tx) / view.scale + buf,
+    bottom: (viewportHeightPx - view.ty) / view.scale + buf,
+  }
+}
+
+/** Whether a card's footprint overlaps a world rectangle — the viewport test
+ * both virtualization and the canvas's alignment candidates are asking. */
+export function intersectsViewport(
+  card: Omit<VirtualCardRect, 'id'>,
+  rect: WorldRect,
+): boolean {
+  return (
+    card.x < rect.right &&
+    card.x + card.w > rect.left &&
+    card.y < rect.bottom &&
+    card.y + card.h > rect.top
+  )
+}
+
+/**
+ * Whether a card is on screen: at least half of it in the viewport — or,
+ * zoomed in past the viewport's size, covering at least half of the
+ * viewport. `view` is the viewport in world coordinates (no buffer).
+ */
+export function isMostlyInView(
+  card: VirtualCardRect,
+  view: WorldRect,
+): boolean {
+  const w = Math.min(card.x + card.w, view.right) - Math.max(card.x, view.left)
+  const h = Math.min(card.y + card.h, view.bottom) - Math.max(card.y, view.top)
+  if (!(w > 0 && h > 0)) return false
+  const shown = w * h
+  const viewArea = (view.right - view.left) * (view.bottom - view.top)
+  return shown >= (card.w * card.h) / 2 || shown >= viewArea / 2
+}
+
+/**
+ * A card counts as "should be visible" if it geometrically intersects the
+ * (buffered) viewport where it is seen — its place in `moved` while a
+ * gesture carries it — OR it is pinned (being edited or resized). This
+ * single `vis` value feeds both the mount and unmount branches in
+ * `recompute()` below, so a pinned off-screen card does get queued for
+ * mount, not just protected from unmount. That is why a drag does not pin
+ * what it carries, and reports where it has carried it instead.
+ */
+function wantsVisible(
+  card: VirtualCardRect,
+  rect: WorldRect,
+  pinnedIds: ReadonlySet<string>,
+  moved: ReadonlyMap<string, Omit<VirtualCardRect, 'id'>> | null,
+): boolean {
+  if (pinnedIds.has(card.id)) return true
+  return intersectsViewport(moved?.get(card.id) ?? card, rect)
+}
+
+export class VirtualizationEngine {
+  private readonly mountedIds = new Set<string>()
+  private readonly mountQueue: string[] = []
+  private readonly unmountQueue: string[] = []
+  private readonly mountQueueSet = new Set<string>()
+  private readonly unmountQueueSet = new Set<string>()
+  private changes = 0
+
+  /** Counts the changes made to what is mounted outside `recompute` — the
+   * ones a `recompute` with the same inputs would answer differently: a
+   * caller that skips a `recompute` whose inputs are unchanged also asks this
+   * has not moved. */
+  get revision(): number {
+    return this.changes
+  }
+
+  get mounted(): ReadonlySet<string> {
+    return this.mountedIds
+  }
+
+  isPendingMount(id: string): boolean {
+    return this.mountQueueSet.has(id)
+  }
+
+  /** How many cards are waiting for the mount quota to reach them — for a
+   * caller that has to know when the screen it asked for is finally on it
+   * (canvas.ts holds the overview canvas up until this reaches zero). */
+  get pendingMountCount(): number {
+    return this.mountQueue.length
+  }
+
+  /**
+   * Forgets everything: no card is mounted, nothing is queued.
+   *
+   * For the caller that has just torn down every card's DOM (canvas.ts's
+   * `teardownAllCards`, on a board reload). Clearing only the queues would
+   * leave `mountedIds` claiming cards that no longer exist in the document,
+   * and the next `recompute()` would then see every card as already mounted
+   * and queue nothing — a board reloaded in place (an external edit, a sync,
+   * our own self-heal write-back) would come up empty until the whole view
+   * was rebuilt.
+   */
+  reset(): void {
+    this.changes += 1
+    this.mountedIds.clear()
+    this.mountQueue.length = 0
+    this.unmountQueue.length = 0
+    this.mountQueueSet.clear()
+    this.unmountQueueSet.clear()
+  }
+
+  /**
+   * Re-derives which cards should be mounted/unmounted given the current
+   * viewport rect and pinned set, and queues the diff. Call this on a
+   * debounce (not every frame) — recompute throttling and drain-quota
+   * throttling are two independent knobs, both owned by the caller.
+   *
+   * `moved` is where a gesture in progress has put the cards it moves,
+   * before the board is told: those are asked about where they are seen,
+   * not where the board last had them. A drag carries its cards across the
+   * viewport, and one that carries three hundred — a PDF spread under its
+   * title — must mount the ones that come into view, not all of them.
+   */
+  recompute(
+    cards: readonly VirtualCardRect[],
+    viewportRect: WorldRect,
+    pinnedIds: ReadonlySet<string>,
+    moved: ReadonlyMap<string, Omit<VirtualCardRect, 'id'>> | null = null,
+  ): void {
+    for (const card of cards) {
+      const vis = wantsVisible(card, viewportRect, pinnedIds, moved)
+      const isMounted = this.mountedIds.has(card.id)
+      if (vis && !isMounted) {
+        if (!this.mountQueueSet.has(card.id)) {
+          this.mountQueue.push(card.id)
+          this.mountQueueSet.add(card.id)
+        }
+        if (this.unmountQueueSet.has(card.id)) {
+          this.unmountQueueSet.delete(card.id)
+          const idx = this.unmountQueue.indexOf(card.id)
+          if (idx !== -1) this.unmountQueue.splice(idx, 1)
+        }
+      } else if (!vis && isMounted) {
+        if (!this.unmountQueueSet.has(card.id)) {
+          this.unmountQueue.push(card.id)
+          this.unmountQueueSet.add(card.id)
+        }
+      } else if (!vis && this.mountQueueSet.has(card.id)) {
+        // Queued for a mount it no longer wants: the card left the viewport
+        // before the drain quota reached it. Without this the mount is still
+        // paid in full — the element built, its content constructed — and the
+        // next tick queues the unmount that undoes it: work for a card that
+        // was never on screen. Most visible on the way into the overview
+        // tier, where every card leaves at once, but this is the general
+        // case, not that one.
+        //
+        // Splicing an array the queue is otherwise only pushed to and drained
+        // from the front of, for symmetry with the unmount-cancel above and
+        // with `markUnmounted`: at these lengths (a screenful's worth) the
+        // scan is not worth a second index to keep consistent.
+        this.mountQueueSet.delete(card.id)
+        const idx = this.mountQueue.indexOf(card.id)
+        if (idx !== -1) this.mountQueue.splice(idx, 1)
+      }
+    }
+  }
+
+  /**
+   * Ignores viewport intersection and force-queues every card for mount —
+   * used when virtualization is turned off entirely. Kept for parity with
+   * the engine's contract even though 1.0's UI doesn't expose the toggle.
+   */
+  recomputeAllVisible(cards: readonly VirtualCardRect[]): void {
+    for (const card of cards) {
+      if (!this.mountedIds.has(card.id) && !this.mountQueueSet.has(card.id)) {
+        this.mountQueue.push(card.id)
+        this.mountQueueSet.add(card.id)
+      }
+    }
+    this.unmountQueue.length = 0
+    this.unmountQueueSet.clear()
+  }
+
+  /**
+   * Drains up to `mountQuota`/`unmountQuota` ids off the front of each
+   * queue and marks them mounted/unmounted immediately (the caller is
+   * expected to perform the matching DOM mount/unmount synchronously, or at
+   * least start it, bounding how many *start* per frame).
+   */
+  drain(
+    mountQuota: number,
+    unmountQuota: number,
+  ): { toMount: string[]; toUnmount: string[] } {
+    const toMount = this.mountQueue.splice(0, mountQuota)
+    for (const id of toMount) {
+      this.mountQueueSet.delete(id)
+      this.mountedIds.add(id)
+    }
+    const toUnmount = this.unmountQueue.splice(0, unmountQuota)
+    for (const id of toUnmount) {
+      this.unmountQueueSet.delete(id)
+      this.mountedIds.delete(id)
+    }
+    return { toMount, toUnmount }
+  }
+
+  /** Escape hatch for callers that mount/unmount outside the normal diff. */
+  markMounted(id: string): void {
+    this.changes += 1
+    this.mountedIds.add(id)
+  }
+
+  markUnmounted(id: string): void {
+    this.changes += 1
+    this.mountedIds.delete(id)
+    const mIdx = this.mountQueue.indexOf(id)
+    if (mIdx !== -1) {
+      this.mountQueue.splice(mIdx, 1)
+      this.mountQueueSet.delete(id)
+    }
+  }
+}

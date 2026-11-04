@@ -1,0 +1,179 @@
+import type { OfficialModuleCatalogV1 } from './officialModuleCatalog'
+import { OfficialModuleCatalogSource } from './officialModuleCatalogSource'
+
+const version = (
+  value: string,
+  hostApi = '^1.4.0',
+  platforms: readonly ('desktop' | 'mobile')[] = ['desktop', 'mobile'],
+) => ({
+  version: value,
+  hostApi,
+  platforms,
+  dataSchemas: { settings: { readMin: 0, readMax: 1, write: 1 } },
+  manifestUrl: `https://github.com/Lapis0x0/obsidian-yolo/releases/download/learning%2Fv${value}/module.json`,
+  manifest: { byteSize: 10, sha256: 'a'.repeat(64) },
+})
+
+const catalog = (
+  versions: ReturnType<typeof version>[],
+): OfficialModuleCatalogV1 =>
+  ({
+    schemaVersion: 1,
+    modules: [
+      {
+        id: 'learning',
+        icon: 'graduation-cap',
+        localizations: {
+          en: { name: 'Learning', description: 'Spaced repetition' },
+          zh: { name: '学习', description: '间隔重复' },
+          it: { name: 'Apprendimento', description: 'Ripetizione' },
+        },
+        versions,
+      },
+    ],
+  }) as OfficialModuleCatalogV1
+
+function source(
+  initial: OfficialModuleCatalogV1,
+  activeVersion?: string,
+  fresh = initial,
+) {
+  const client = {
+    load: jest.fn(async () => initial),
+    loadFresh: jest.fn(async () => fresh),
+  }
+  return {
+    client,
+    source: new OfficialModuleCatalogSource({
+      client,
+      locale: 'en',
+      getCompatibility: async () => ({
+        hostApi: '1.4.0',
+        platform: 'desktop' as const,
+        ...(activeVersion !== undefined ? { activeVersion } : {}),
+      }),
+    }),
+  }
+}
+
+describe('OfficialModuleCatalogSource latest-only policy', () => {
+  it('offers the latest compatible module and retains its descriptor', async () => {
+    const fixture = source(catalog([version('1.2.0')]))
+    await expect(fixture.source.load()).resolves.toEqual([
+      {
+        id: 'learning',
+        version: '1.2.0',
+        icon: 'graduation-cap',
+        name: 'Learning',
+        description: 'Spaced repetition',
+      },
+    ])
+    expect(
+      fixture.source.getResolvedArtifactDescriptor(
+        'learning',
+        '1.2.0',
+        'desktop',
+      )?.version,
+    ).toBe('1.2.0')
+  })
+
+  it('offers latest when it is newer than an active installation', async () => {
+    const fixture = source(catalog([version('1.2.0')]), '1.1.0')
+    await expect(fixture.source.load()).resolves.toMatchObject([
+      { id: 'learning', version: '1.2.0' },
+    ])
+  })
+
+  it('resolves the active version so a rebuilt artifact can be repaired', async () => {
+    const rebuilt = {
+      ...version('1.2.0'),
+      hostApi: '^1.4.0',
+      manifest: { byteSize: 12, sha256: 'b'.repeat(64) },
+    }
+    const fixture = source(catalog([rebuilt]), '1.2.0')
+    await expect(fixture.source.load()).resolves.toMatchObject([
+      { id: 'learning', version: '1.2.0' },
+    ])
+    expect(fixture.source.getResolvedVersion('learning')?.version).toBe('1.2.0')
+    expect(
+      fixture.source.getResolvedArtifactDescriptor(
+        'learning',
+        '1.2.0',
+        'desktop',
+      )?.manifest.sha256,
+    ).toBe('b'.repeat(64))
+  })
+
+  it('does not resolve a version older than the active installation', async () => {
+    const fixture = source(catalog([version('1.1.0')]), '1.2.0')
+    await expect(fixture.source.load()).resolves.toMatchObject([
+      { id: 'learning', version: '1.2.0' },
+    ])
+    expect(fixture.source.getResolvedVersion('learning')).toBeUndefined()
+  })
+
+  it('does not backtrack to an older compatible version', async () => {
+    const fixture = source(
+      catalog([version('2.0.0', '^2.0.0'), version('1.2.0')]),
+    )
+    await expect(fixture.source.load()).resolves.toMatchObject([
+      {
+        id: 'learning',
+        version: '',
+        compatibilityIssues: [{ kind: 'host-api' }],
+      },
+    ])
+    expect(fixture.source.getResolvedVersion('learning')).toBeUndefined()
+  })
+
+  it('keeps a newer version held back only by the Host API as awaiting the core update', async () => {
+    const newer = {
+      ...version('2.0.0', '^2.0.0'),
+      releaseNotes: {
+        url: 'https://example.com/release-note.md',
+        byteSize: 5,
+        sha256: 'c'.repeat(64),
+      },
+    }
+    const fixture = source(catalog([newer]), '1.2.0')
+    await expect(fixture.source.load()).resolves.toMatchObject([
+      {
+        id: 'learning',
+        version: '1.2.0',
+        compatibilityIssues: [{ kind: 'host-api' }],
+        awaitingCoreUpdate: {
+          version: '2.0.0',
+          releaseNotes: newer.releaseNotes,
+        },
+      },
+    ])
+    expect(fixture.source.getResolvedVersion('learning')).toBeUndefined()
+  })
+
+  it('does not mark an update as awaiting the core when the platform rules it out', async () => {
+    const fixture = source(
+      catalog([version('2.0.0', '^2.0.0', ['mobile'])]),
+      '1.2.0',
+    )
+    const [entry] = await fixture.source.load()
+    expect(entry?.awaitingCoreUpdate).toBeUndefined()
+  })
+
+  it('replaces the snapshot only after a fresh Feed succeeds', async () => {
+    const fixture = source(
+      catalog([version('1.1.0')]),
+      undefined,
+      catalog([version('1.2.0')]),
+    )
+    expect((await fixture.source.load())[0]?.version).toBe('1.1.0')
+    expect((await fixture.source.loadFresh())[0]?.version).toBe('1.2.0')
+    expect((await fixture.source.load())[0]?.version).toBe('1.2.0')
+  })
+
+  it('does not expose an install candidate when latest is platform-incompatible', async () => {
+    const fixture = source(catalog([version('1.2.0', '^1.4.0', ['mobile'])]))
+    await expect(fixture.source.load()).resolves.toMatchObject([
+      { version: '', compatibilityIssues: [{ kind: 'platform' }] },
+    ])
+  })
+})

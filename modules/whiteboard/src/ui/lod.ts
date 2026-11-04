@@ -1,0 +1,310 @@
+// Pure level-of-detail helpers for the canvas's one zoom-based rendering-tier
+// switch (constants.ts's OVERVIEW_SCALE_THRESHOLD). Kept out of domain/
+// despite being pure/DOM-free because this isn't board *data* logic — it's UI
+// presentation policy (what scale counts as too small for a card to be worth
+// an element, what string a card shows in place of its content) that has no
+// `.yoloboard` representation and has no reason to move if the file format
+// ever changes.
+
+import type { BoardNode } from '../domain/fileFormat'
+import { basenameWithoutExtension, fileNodeKind } from '../domain/naming'
+
+import {
+  CARD_CONTENT_EXTRA_LINES,
+  CARD_CONTENT_MAX_CHARS,
+  CARD_CONTENT_MIN_LINE_WORLD_PX,
+} from './constants'
+
+/**
+ * Whether the board should be drawn by the overview canvas now that the camera
+ * has reached `scale`, given whether it already is.
+ *
+ * Two thresholds rather than one: the DOM gives the board up below
+ * `band.enter` and takes it back only once the camera is above `band.restore`
+ * (constants.ts's OVERVIEW_SCALE_THRESHOLD / OVERVIEW_RESTORE_SCALE). The gap
+ * is what keeps a zoom that settles on the boundary from unmounting and
+ * remounting every visible card on alternate throttle ticks — see
+ * OVERVIEW_RESTORE_DOUBLINGS for why the band is the width it is.
+ *
+ * Evaluated at the canvas's existing visibility-recompute throttle, not per
+ * frame (src/ui/canvas.ts's updateOverviewState()).
+ */
+export function nextOverviewState(
+  scale: number,
+  overview: boolean,
+  band: Readonly<{ enter: number; restore: number }>,
+): boolean {
+  return overview ? scale < band.restore : scale < band.enter
+}
+
+const MAX_TITLE_LENGTH = 60
+
+function truncate(text: string, maxLength: number): string {
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text
+}
+
+/**
+ * The label a card shows in place of its content — the title block a mounted
+ * card wears until its content is built, and the line the overview canvas
+ * draws for a card that has no element at all. A file node shows its backing
+ * file's basename, a link node its URL, a text node its first line (trimmed
+ * and truncated) — "note 卡显示文件名、text 卡显示首行截断". A
+ * group node never shows one: its label is chrome, drawn at every zoom, so
+ * this returns it unchanged for the callers that ask.
+ *
+ * A text node's leading `#` markers are dropped: the line is being shown as
+ * a title, not as markdown, and a card that opens with a heading — the most
+ * common way to title one — would otherwise wear its syntax in the one place
+ * the syntax is never rendered. Only the heading marker goes; a first line
+ * that starts with a bullet or a quote is prose the user wrote that way.
+ *
+ * A PDF card read past its first page also says which page it is on
+ * (`pageLabels.card`, the caller's localized "name · p. N"), because below
+ * the threshold that is all a card has to say about where its reader was —
+ * and a board of papers is exactly the board zoomed out to find one. A
+ * spread's sheet says only its page (`pageLabels.sheet`): the spread's title
+ * names the document, and the name on every sheet would bury the numbers.
+ */
+export type PdfPageLabels = Readonly<{
+  /** "name · p. N": a PDF card read past its first page. */
+  card: (name: string, page: number) => string
+  /** "p. N": a spread's sheet, whose document its title already names. */
+  sheet: (page: number) => string
+}>
+
+export function nodeTitleText(
+  node: BoardNode,
+  pageLabels?: PdfPageLabels,
+): string {
+  switch (node.type) {
+    case 'file': {
+      const name = basenameWithoutExtension(node.file)
+      const page = Math.floor(node.startPage ?? 1)
+      if (!pageLabels || page <= 1 || fileNodeKind(node.file) !== 'pdf') {
+        return name
+      }
+      return pageLabels.card(name, page)
+    }
+    case 'link':
+      return truncate(node.url, MAX_TITLE_LENGTH)
+    case 'group':
+      return truncate(node.label ?? '', MAX_TITLE_LENGTH)
+    case 'pdf-page':
+      return pageLabels ? pageLabels.sheet(node.page) : String(node.page)
+    case 'text': {
+      const newlineIndex = node.text.indexOf('\n')
+      const firstLine =
+        newlineIndex === -1 ? node.text : node.text.slice(0, newlineIndex)
+      const title = firstLine.trim().replace(/^#{1,6}\s+/, '')
+      return truncate(title, MAX_TITLE_LENGTH)
+    }
+  }
+}
+
+/** Where a title may break: after a run of spaces, or on either side of a
+ * CJK character — the opportunities the title block's text gets from CSS. */
+const TITLE_SEGMENT = /\s+|[⺀-鿿가-힯豈-﫿＀-￯]|[^\s⺀-鿿가-힯豈-﫿＀-￯]+/g
+
+/**
+ * A title laid out in lines no wider than `maxWidth`, at most `maxLines` of
+ * them — what the title block does with its text (style.css's
+ * `.yolo-whiteboard-card-title-block`), for the overview canvas, which has
+ * only `fillText` and must break lines itself so a card's face does not change
+ * as it crosses the tier.
+ *
+ * Breaks where the element would: at spaces and around CJK characters, and
+ * inside a word only when the word alone is wider than the line
+ * (`overflow-wrap: anywhere`). A title that needs more lines than there are
+ * ends its last one with an ellipsis rather than being cut mid-glyph.
+ *
+ * `measure` is the width of a string in the same unit as `maxWidth`.
+ */
+export function wrapTitleLines(
+  text: string,
+  maxWidth: number,
+  maxLines: number,
+  measure: (text: string) => number,
+): string[] {
+  if (maxLines < 1 || maxWidth <= 0) return []
+  const lines: string[] = []
+  let line = ''
+  // The last line is kept as it stands, trailing space and all, until the
+  // title is known to go past it: it is where the ellipsis goes.
+  let last = ''
+  const push = (): boolean => {
+    if (lines.length === maxLines - 1) {
+      last = line
+      return false
+    }
+    lines.push(line.trimEnd())
+    line = ''
+    return true
+  }
+  const segments = text.match(TITLE_SEGMENT) ?? []
+  let rest = ''
+  outer: for (let i = 0; i < segments.length; i += 1) {
+    let segment = segments[i]
+    if (line === '' && /^\s/.test(segment)) continue
+    if (measure(line + segment) <= maxWidth) {
+      line += segment
+      continue
+    }
+    if (line !== '' && measure(segment.trimEnd()) <= maxWidth) {
+      if (!push()) {
+        rest = segments.slice(i).join('')
+        break
+      }
+      if (!/^\s/.test(segment)) line = segment
+      continue
+    }
+    // Wider than a line on its own: cut it wherever it stops fitting.
+    while (segment !== '') {
+      const fit = longestFit(line, segment, maxWidth, measure)
+      line += segment.slice(0, fit)
+      segment = segment.slice(fit)
+      if (segment === '') break
+      if (!push()) {
+        rest = segment + segments.slice(i + 1).join('')
+        break outer
+      }
+    }
+  }
+  if (rest.trim() !== '') {
+    const tail = `${last}${rest}`
+    const cut = longestFit('', tail, maxWidth, (candidate) =>
+      measure(`${candidate}…`),
+    )
+    lines.push(`${tail.slice(0, cut).trimEnd()}…`)
+  } else if (line !== '') {
+    lines.push(line.trimEnd())
+  }
+  return lines
+}
+
+/** How many leading characters of `segment` fit after `line`, at least one
+ * when `line` is empty so a line always makes progress. Binary search:
+ * `measure` is the cost. */
+function longestFit(
+  line: string,
+  segment: string,
+  maxWidth: number,
+  measure: (text: string) => number,
+): number {
+  let low = 0
+  let high = segment.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    if (measure(line + segment.slice(0, mid)) <= maxWidth) low = mid
+    else high = mid - 1
+  }
+  return line === '' ? Math.max(low, 1) : low
+}
+
+/**
+ * The slice of a card's markdown that its body can actually show.
+ *
+ * A card is a window onto its document: `startLine` says where the window
+ * sits, and the card's height says how much fits. An unfocused card clips and
+ * does not scroll (style.css's content mask), so the renderer only ever
+ * needs that much source — see constants.ts's CARD_CONTENT_MIN_LINE_WORLD_PX
+ * for why a line budget derived from the height cannot come up short.
+ * Everything outside the window is parsed, post-processed and laid out for a
+ * reader who has no way to reach it.
+ *
+ * Counted in *source lines*, not characters, because that is the unit whose
+ * relationship to rendered height is knowable: every non-blank source line
+ * renders as at least one line box, while a character count says nothing
+ * about how tall anything is. Blank lines are kept but not counted — they
+ * separate blocks rather than occupying height, and a run of them would
+ * otherwise eat the budget and leave the card half empty.
+ *
+ * The two ends are not symmetric. The *end* only ever cuts: what it leaves
+ * open — an unterminated fence, half a table — renders as the partial block
+ * it is, which is exactly what the card was going to show of it anyway. The
+ * *start* cannot be so casual: begin inside a fenced block and its closing
+ * fence reads as an opening one, so the rest of the card renders as code.
+ * `blockStartAtOrBefore` therefore backs the start up to the nearest block
+ * boundary, which is also the more honest place to begin reading.
+ */
+export function cardMarkdownWindow(
+  markdown: string,
+  bodyHeightWorldPx: number,
+  startLine = 0,
+): string {
+  const budget =
+    Math.ceil(Math.max(bodyHeightWorldPx, 0) / CARD_CONTENT_MIN_LINE_WORLD_PX) +
+    CARD_CONTENT_EXTRA_LINES
+  const lines = markdown.split('\n')
+  const start = blockStartLine(lines, startLine)
+  let counted = 0
+  let end = lines.length
+  for (let i = start; i < lines.length; i += 1) {
+    if (lines[i].trim() !== '') counted += 1
+    if (counted >= budget) {
+      end = i + 1
+      break
+    }
+  }
+  const window = lines.slice(start, end).join('\n')
+  if (window.length <= CARD_CONTENT_MAX_CHARS) return window
+  const hardCut = window.slice(0, CARD_CONTENT_MAX_CHARS)
+  const lastBreak = hardCut.lastIndexOf('\n')
+  return lastBreak > 0 ? hardCut.slice(0, lastBreak) : hardCut
+}
+
+/**
+ * The last line at or before `line` that a block starts on — the first
+ * non-blank line after a blank one, ignoring anything inside a fenced code
+ * block, where a blank line separates nothing.
+ *
+ * This is the quantum a reading window moves in, and every surface has to
+ * agree on it. A clipped card can only begin flush at a block: it has no
+ * scroll offset to hide the top of one with. So the position is snapped when
+ * it is *recorded* (canvas.ts's `commitReadingWindow`) rather than when it is
+ * rendered — snap at render and the scrollable preview, which does begin mid
+ * block, would sit a block away from what the same card shows when it is not
+ * selected. Applied again here anyway: `startLine` comes out of a file a
+ * person can edit, and beginning inside a fence renders the rest of the card
+ * as code.
+ *
+ * Scanned from the top rather than backwards from `line`, because whether a
+ * line is inside a fence is only knowable by counting the fences before it.
+ * That is the same one pass over the lines the budget above already costs.
+ */
+export function blockStartLine(
+  source: string | readonly string[],
+  line: number,
+): number {
+  if (!(line > 0)) return 0
+  const lines = typeof source === 'string' ? source.split('\n') : source
+  const target = Math.floor(line)
+  let openFence: string | null = null
+  let previousBlank = true
+  let candidate = 0
+  const last = Math.min(target, lines.length - 1)
+  for (let i = 0; i <= last; i += 1) {
+    const text = lines[i].trim()
+    const fence = text.startsWith('```')
+      ? '```'
+      : text.startsWith('~~~')
+        ? '~~~'
+        : null
+    if (openFence !== null) {
+      // Only the marker that opened this block can close it: a `~~~` inside a
+      // ``` block is content, not a fence.
+      if (fence === openFence) openFence = null
+      previousBlank = false
+      continue
+    }
+    if (fence !== null) {
+      if (previousBlank) candidate = i
+      openFence = fence
+      previousBlank = false
+      continue
+    }
+    const blank = text === ''
+    if (!blank && previousBlank) candidate = i
+    previousBlank = blank
+  }
+  return candidate
+}

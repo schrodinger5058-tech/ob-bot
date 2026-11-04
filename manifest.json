@@ -1,1 +1,14 @@
-{"id":"ob-bot","name":"ob-bot","version":"0.1.0","minAppVersion":"1.8.7","description":"Independent bots, group orchestration and approved vault tools, built for mobile.","author":"schrodinger5058-tech","isDesktopOnly":false}
+{
+  "id": "ob-bot",
+  "name": "ob-bot",
+  "version": "0.2.0-dev",
+  "minAppVersion": "1.8.7",
+  "description": "YOLO-based multi-bot workspace with native agent orchestration.",
+  "author": "schrodinger5058-tech",
+  "authorUrl": "https://github.com/Lapis0x0",
+  "fundingUrl": {
+    "爱发电": "https://afdian.com/a/lapis0x0",
+    "Buy Me a Coffee": "https://buymeacoffee.com/lapis0x0"
+  },
+  "isDesktopOnly": false
+}

@@ -1,0 +1,1132 @@
+// `.yoloboard` schema v1 — the single point that knows this file format.
+//
+// The format is a **superset of JSON Canvas 1.0** (https://jsoncanvas.org/
+// spec/1.0/). Every concept Canvas has, we spell the way Canvas spells it:
+//
+//   - one flat `nodes` array holding `text` / `file` / `link` / `group` nodes, rather
+//     than a `cards` array beside a separate `groups` collection — a group is
+//     a kind of node, not a second population;
+//   - `color` is a node (and edge) attribute, with Canvas's `canvasColor`
+//     values: the presets "1".."6", or a hex string;
+//   - edges name their ends `fromNode`/`toNode`, their anchors
+//     `fromSide`/`toSide`, and their arrowheads `fromEnd`/`toEnd`, with
+//     Canvas's defaults (no arrow at the source, an arrow at the target).
+//
+// Two deliberate deviations:
+//   - geometry is `w`/`h`, not Canvas's `width`/`height` (an abbreviation, not
+//     a different concept; renaming would churn every geometry helper for no
+//     conceptual gain);
+//   - we add `version` and `camera` at the top level — the viewport state
+//     Canvas cannot hold is one of the reasons this is our own format.
+//
+// Everything else Canvas defines but we do not yet render (`subpath` on file
+// nodes, `background`/`backgroundStyle` on groups) round-trips untouched
+// through the `extra` bag below, so an import loses nothing.
+//
+// Zero dependencies, no host/DOM/Obsidian imports (Module Boundaries,
+// CLAUDE.md): this file is pure data-in, data-out.
+//
+// Forward compatibility: an unrecognized field at the file, node, or edge
+// level is preserved verbatim on parse (in an `extra` bag) and written back
+// on serialize, so a future schema addition round-trips through an older
+// build of this module without data loss.
+
+export const YOLOBOARD_SCHEMA_VERSION = 1
+
+export type NodeId = string
+/** What joins the ids on the way to a node behind a portal into the one id
+ * the board knows it by — `portal/card` (domain/nodePath.ts). */
+export const NODE_PATH_SEPARATOR = '/'
+export type EdgeId = string
+export type NodeSide = 'top' | 'right' | 'bottom' | 'left'
+/** JSON Canvas's `fromEnd`/`toEnd`: whether that end of an edge is an arrow. */
+export type EdgeEnd = 'none' | 'arrow'
+/**
+ * JSON Canvas's `canvasColor`: one of the six presets ("1".."6") or a hex
+ * string ("#FF0000"). Kept as an unconstrained string — an unknown value is
+ * preserved rather than dropped, and what a colour *looks* like is the
+ * rendering layer's business, not the file format's.
+ */
+export type NodeColor = string
+
+const NODE_SIDES: readonly NodeSide[] = ['top', 'right', 'bottom', 'left']
+const EDGE_ENDS: readonly EdgeEnd[] = ['none', 'arrow']
+
+/** Unrecognized JSON fields captured at a given nesting level, preserved verbatim. */
+export type ExtraFields = Readonly<Record<string, unknown>>
+
+export type BoardNodeBase = Readonly<{
+  id: NodeId
+  x: number
+  y: number
+  w: number
+  h: number
+  /** JSON Canvas `color`. Absent = the theme's default for that node kind. */
+  color?: NodeColor
+  /** Unknown fields read from this node's JSON object, round-tripped on write. */
+  extra: ExtraFields
+}>
+
+/**
+ * Which source line this card's body starts at — the card is a window onto
+ * its document, and this is where the window sits.
+ *
+ * Not in JSON Canvas, and deliberately in the file rather than in memory: a
+ * card parked on section six is showing what its owner put there, the same
+ * way its position and size are. It travels with the board for the reason
+ * `camera` does.
+ *
+ * Fractional, because it is the coordinate both the rendered preview and the
+ * live editor speak (the host's `getScrollLine`/`scrollToLine`): 12.5 is line
+ * 12, half of it above the top edge. Absent — the common case — means the
+ * card starts at the top of its document.
+ */
+type ReadingWindow = Readonly<{ startLine?: number }>
+
+/**
+ * Where a PDF card is being read: the same window as `startLine`, in the
+ * coordinate a paged document speaks. The integer part is the 1-based page at
+ * the card's top edge and the fraction how far down that page the edge sits —
+ * 3.25 is page 3 with its top quarter scrolled past.
+ *
+ * A fraction of the page rather than a pixel offset, because nothing about a
+ * card fixes its pixels: the card can be resized, which re-lays every page at
+ * a new width, and the same place has to come back. Absent means the top of
+ * page 1. A separate field rather than `startLine` read differently: a file
+ * node's kind follows its path, and a card whose file is renamed from `.md`
+ * to `.pdf` must not reinterpret a line number as a page.
+ */
+type PageWindow = Readonly<{ startPage?: number }>
+
+/**
+ * Where a portal — a file card onto another board (domain/naming.ts's
+ * `board` kind) — is looking: the point of that board, in its own world
+ * units, at the card's top-left corner, and how large that board is shown
+ * there against this one (`scale`, 1 when absent). The card's size is how
+ * much of it shows. Absent means the top-left corner of everything on it, at
+ * this board's scale. Not in JSON Canvas: there the card is a card onto a
+ * file.
+ */
+type BoardWindow = Readonly<{ view?: PortalView }>
+
+export type PortalView = Readonly<{ x: number; y: number; scale?: number }>
+
+/** A rectangle in world units — what a spread remembers for its title and
+ * each of its pages. Written to the file as an `[x, y, w, h]` tuple: a
+ * three-hundred-page spread is three hundred of them. */
+export type SpreadRect = Readonly<{
+  x: number
+  y: number
+  w: number
+  h: number
+}>
+
+/**
+ * A PDF card's other way of being drawn: its pages laid out on the board like
+ * sheets of paper, each one placed on its own, under a title that stands for
+ * the whole document.
+ *
+ * Not in JSON Canvas, and the node's own `x`/`y`/`w`/`h` stay the reader
+ * card's whichever way it is drawn: a reader that does not know the field
+ * (Obsidian Canvas) shows an ordinary PDF card where the card last was. The
+ * layout outlives `open` — putting the pages away and bringing them back puts
+ * every sheet where it was left.
+ *
+ * On the board a spread is never this field (domain/spread.ts's
+ * `expandBoard`): while it is open, the node stands for its title and each page
+ * is a `pdf-page` node of its own, so dragging, snapping, grouping and edges
+ * reach a sheet the way they reach any card. The field is what those are
+ * folded back into for the file.
+ */
+export type PdfSpread = Readonly<{
+  open: boolean
+  title: SpreadRect
+  pages: readonly SpreadPage[]
+}>
+
+/** Where a spread's page was left, and the colour it was given if any —
+ * the one thing a sheet carries of its own besides its place. Written as
+ * `[x, y, w, h]`, or `[x, y, w, h, color]` for a coloured one. */
+export type SpreadPage = SpreadRect & Readonly<{ color?: NodeColor }>
+
+/**
+ * The spread fields a file node can carry: `spread` as it is in the file,
+ * and `readerRect` only on the board, where an open spread's node is its
+ * title and the reader card's rectangle has to wait somewhere for it to be
+ * put away (domain/spread.ts). A node carries one or neither, never both.
+ */
+type SpreadDisplay = Readonly<{ spread?: PdfSpread; readerRect?: SpreadRect }>
+
+/**
+ * How a text node is drawn: as a card, or as bare text written on the board.
+ *
+ * Not in JSON Canvas. Bare text has no frame and no window: it shows all of
+ * its content, and its height is whatever that content takes at its width —
+ * the node's `h` is what it was last measured at, kept so that edges,
+ * placement and a board opened elsewhere have a size to work with. A reader
+ * that does not know the field (Obsidian Canvas) shows the same markdown as a
+ * card, which loses nothing.
+ *
+ * `autoWidth` says who chose the width: set, the text is as wide as its
+ * longest line up to a cap, and `w` follows it as it is typed; absent, the
+ * width is the one someone gave it and the text wraps inside it. Two
+ * fields rather than one, because a width alone cannot say which of the two
+ * it is, and the two behave oppositely the next time the text changes.
+ */
+type TextDisplay = Readonly<{ plain?: boolean; autoWidth?: boolean }>
+
+/** JSON Canvas text node: markdown that lives in the board file itself. */
+export type TextNode = BoardNodeBase &
+  ReadingWindow &
+  TextDisplay &
+  Readonly<{
+    type: 'text'
+    text: string
+  }>
+
+/**
+ * JSON Canvas file node: a reference to a vault file. Markdown, PDF, image,
+ * audio, video and HTML files each render as their own kind of card
+ * (domain/naming.ts's `fileNodeKind`); every other extension renders as a
+ * placeholder. One node type rather than the old `note`/`pdf` pair,
+ * because "which file is this" is a path question, not a schema question —
+ * and Canvas has always modelled it that way.
+ */
+export type FileNode = BoardNodeBase &
+  ReadingWindow &
+  PageWindow &
+  SpreadDisplay &
+  BoardWindow &
+  Readonly<{
+    type: 'file'
+    /** Vault-relative path to the backing file. */
+    file: string
+  }>
+
+/**
+ * JSON Canvas link node: a web page, embedded live in the card. The one node
+ * kind whose content lives outside the vault entirely, which is why it is its
+ * own type rather than a file node with an `http` path.
+ */
+export type LinkNode = BoardNodeBase &
+  Readonly<{
+    type: 'link'
+    url: string
+  }>
+
+/**
+ * JSON Canvas group node: a labelled frame behind the cards. Membership is
+ * geometric (a node inside the frame is in the group) rather than stored, the
+ * same way Canvas does it.
+ */
+export type GroupNode = BoardNodeBase &
+  Readonly<{
+    type: 'group'
+    label?: string
+  }>
+
+/**
+ * One sheet of an open spread (`PdfSpread`), on the board.
+ *
+ * Never in a file: it exists only between domain/spread.ts's `expandBoard`,
+ * which makes one per page when a board is read, and `collapseBoard`, which
+ * folds them back into their PDF's node before it is written. Its id is
+ * derived from its parent's (`pdfPageNodeId`), so an edge or a selection can
+ * name it like any node.
+ */
+export type PdfPageNode = BoardNodeBase &
+  Readonly<{
+    type: 'pdf-page'
+    /** The PDF node whose spread this sheet belongs to. */
+    parent: NodeId
+    /** The parent's file, copied so a sheet can be drawn from itself. */
+    file: string
+    /** 1-based. */
+    page: number
+  }>
+
+export type BoardNode = TextNode | FileNode | LinkNode | GroupNode | PdfPageNode
+
+/** Whether a node is bare text rather than a card (`TextDisplay`). */
+export function isPlainText(
+  node: BoardNode | undefined,
+): node is TextNode & Readonly<{ plain: true }> {
+  return node?.type === 'text' && node.plain === true
+}
+
+/** A passage of text an anchor names, with a little of what surrounds it —
+ * how it is told apart from the same words elsewhere, and found again when
+ * what is around it moves. */
+export type EdgeAnchorQuote = Readonly<{
+  exact: string
+  prefix?: string
+  suffix?: string
+}>
+
+/**
+ * The passage inside a card that an edge end reaches, when it reaches a
+ * passage rather than the whole card. Not in JSON Canvas: there the edge
+ * reaches the card, which is also where it is drawn whenever the passage
+ * cannot be (the card scrolled elsewhere, not drawn, the passage gone).
+ *
+ * - `pdf`: a passage on one page of a PDF, in the same coordinates as a
+ *   highlight in its annotation file (domain/pdfAnnotations.ts's
+ *   `HighlightAnchor`) — PDF user space, one quad of eight numbers per line —
+ *   so it is placed without a text layer, and the text layer's selection
+ *   tuple is a hint. An end on a PDF's card also names the anchor's page in
+ *   `fromPage`/`toPage`, so the end lands on that page's sheet when the
+ *   document is spread out.
+ * - `text`: a passage of a text or note card's Markdown source, by its words
+ *   and their context; `offset` is where in the source it was last found.
+ */
+export type EdgeAnchor =
+  | Readonly<{
+      kind: 'pdf'
+      /** 1-based. */
+      page: number
+      quadPoints: readonly number[]
+      quote: EdgeAnchorQuote
+      selection?: readonly [number, number, number, number]
+    }>
+  | Readonly<{
+      kind: 'text'
+      quote: EdgeAnchorQuote
+      offset: number
+    }>
+
+export type Edge = Readonly<{
+  id: EdgeId
+  fromNode: NodeId
+  toNode: NodeId
+  /** Anchor side on the source/target node. Omitted = pick from relative position at render time (not this module's job). */
+  fromSide?: NodeSide
+  toSide?: NodeSide
+  /**
+   * The page of a PDF node an end is attached to (1-based), when it is one
+   * sheet of the document rather than the whole of it. Not in JSON Canvas:
+   * there the edge reaches the PDF's card, which is still where it goes while
+   * the spread is put away. On the board an open spread's page is a node of
+   * its own and the edge names it instead (domain/spread.ts).
+   */
+  fromPage?: number
+  toPage?: number
+  /** The passage inside the node an end reaches (`EdgeAnchor`), when not the
+   * whole of it. */
+  fromAnchor?: EdgeAnchor
+  toAnchor?: EdgeAnchor
+  /** JSON Canvas defaults: 'none' at the source, 'arrow' at the target. */
+  fromEnd: EdgeEnd
+  toEnd: EdgeEnd
+  color?: NodeColor
+  label?: string
+  /** Unknown fields read from this edge's JSON object, round-tripped on write. */
+  extra: ExtraFields
+}>
+
+export type Camera = Readonly<{
+  x: number
+  y: number
+  scale: number
+}>
+
+export type Board = Readonly<{
+  version: 1
+  camera: Camera
+  nodes: readonly BoardNode[]
+  edges: readonly Edge[]
+  /** Unknown top-level fields, round-tripped on write. */
+  extra: ExtraFields
+}>
+
+export type BoardParseIssue =
+  | Readonly<{ type: 'invalid-json'; message: string }>
+  | Readonly<{ type: 'invalid-schema'; message: string }>
+  | Readonly<{
+      type: 'invalid-node'
+      index: number
+      id?: string
+      message: string
+    }>
+  | Readonly<{ type: 'duplicate-node-id'; index: number; id: string }>
+  | Readonly<{
+      type: 'invalid-edge'
+      index: number
+      id?: string
+      message: string
+    }>
+  | Readonly<{
+      type: 'dangling-edge'
+      id: string
+      from: string
+      to: string
+    }>
+
+export type BoardParseResult =
+  | Readonly<{ ok: true; board: Board; issues: readonly BoardParseIssue[] }>
+  | Readonly<{ ok: false; issues: readonly BoardParseIssue[] }>
+
+export const DEFAULT_CAMERA: Camera = Object.freeze({ x: 0, y: 0, scale: 1 })
+
+export function emptyBoard(): Board {
+  return {
+    version: YOLOBOARD_SCHEMA_VERSION,
+    camera: DEFAULT_CAMERA,
+    nodes: [],
+    edges: [],
+    extra: {},
+  }
+}
+
+/**
+ * Parses raw `.yoloboard` file text. An empty/blank file parses to a fresh
+ * empty board. A JSON syntax error, a non-object root, an unsupported
+ * `version`, or a `nodes`/`edges` field present but not an array makes the
+ * whole file unparsable (`ok: false`) — the document cannot be trusted at all
+ * in that case. Anything narrower (a single malformed node, a malformed edge,
+ * an edge referencing a missing node) is dropped and reported as an issue
+ * instead, so one bad record doesn't take down an otherwise-good board.
+ */
+export function parseBoard(raw: string): BoardParseResult {
+  if (!raw.trim()) return { ok: true, board: emptyBoard(), issues: [] }
+
+  let json: unknown
+  try {
+    json = JSON.parse(raw)
+  } catch (error) {
+    return {
+      ok: false,
+      issues: [
+        {
+          type: 'invalid-json',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      ],
+    }
+  }
+  return parseBoardValue(json)
+}
+
+/**
+ * `parseBoard` for a value already read out of JSON — the same rules, for a
+ * caller that has an object in hand rather than file text (domain/
+ * clipboard.ts, whose payload is a board fragment in JSON Canvas spelling).
+ */
+export function parseBoardValue(json: unknown): BoardParseResult {
+  if (!isPlainObject(json)) {
+    return {
+      ok: false,
+      issues: [
+        {
+          type: 'invalid-schema',
+          message: '.yoloboard root must be a JSON object',
+        },
+      ],
+    }
+  }
+
+  if (json.version !== undefined && json.version !== YOLOBOARD_SCHEMA_VERSION) {
+    return {
+      ok: false,
+      issues: [
+        {
+          type: 'invalid-schema',
+          message: `Unsupported .yoloboard version: ${describeUnknown(json.version)}`,
+        },
+      ],
+    }
+  }
+
+  const rawNodes = json.nodes
+  const rawEdges = json.edges
+  if (rawNodes !== undefined && !Array.isArray(rawNodes)) {
+    return {
+      ok: false,
+      issues: [
+        {
+          type: 'invalid-schema',
+          message: '.yoloboard "nodes" must be an array',
+        },
+      ],
+    }
+  }
+  if (rawEdges !== undefined && !Array.isArray(rawEdges)) {
+    return {
+      ok: false,
+      issues: [
+        {
+          type: 'invalid-schema',
+          message: '.yoloboard "edges" must be an array',
+        },
+      ],
+    }
+  }
+
+  const issues: BoardParseIssue[] = []
+  const nodes = parseNodes(Array.isArray(rawNodes) ? rawNodes : [], issues)
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  const edges = parseEdges(
+    Array.isArray(rawEdges) ? rawEdges : [],
+    nodeIds,
+    issues,
+  )
+
+  const board: Board = {
+    version: YOLOBOARD_SCHEMA_VERSION,
+    camera: parseCamera(json.camera),
+    nodes,
+    edges,
+    extra: extractExtra(json, TOP_LEVEL_KEYS),
+  }
+  return { ok: true, board, issues }
+}
+
+/** Serializes a board with a stable field order and 2-space indent, so diffs reflect real changes. */
+export function serializeBoard(board: Board): string {
+  const nodeIds = new Set(board.nodes.map((node) => node.id))
+  const out: Record<string, unknown> = {
+    version: board.version,
+    camera: { x: board.camera.x, y: board.camera.y, scale: board.camera.scale },
+    nodes: board.nodes.map(serializeNode),
+    edges: board.edges.map((edge) => serializeEdge(edge, nodeIds)),
+    ...board.extra,
+  }
+  return `${JSON.stringify(out, null, 2)}\n`
+}
+
+// --- nodes ---------------------------------------------------------------
+
+const NODE_COMMON_KEYS = ['id', 'type', 'x', 'y', 'w', 'h', 'color'] as const
+const TEXT_NODE_KEYS = [
+  ...NODE_COMMON_KEYS,
+  'text',
+  'startLine',
+  'plain',
+  'autoWidth',
+] as const
+const FILE_NODE_KEYS = [
+  ...NODE_COMMON_KEYS,
+  'file',
+  'startLine',
+  'startPage',
+  'spread',
+  'view',
+] as const
+const LINK_NODE_KEYS = [...NODE_COMMON_KEYS, 'url'] as const
+const GROUP_NODE_KEYS = [...NODE_COMMON_KEYS, 'label'] as const
+
+function parseNodes(
+  raw: readonly unknown[],
+  issues: BoardParseIssue[],
+): BoardNode[] {
+  const nodes: BoardNode[] = []
+  const seenIds = new Set<string>()
+  raw.forEach((entry, index) => {
+    const node = parseNode(entry, index, issues)
+    if (!node) return
+    if (seenIds.has(node.id)) {
+      issues.push({ type: 'duplicate-node-id', index, id: node.id })
+      return
+    }
+    seenIds.add(node.id)
+    nodes.push(node)
+  })
+  return nodes
+}
+
+function parseNode(
+  entry: unknown,
+  index: number,
+  issues: BoardParseIssue[],
+): BoardNode | null {
+  if (!isPlainObject(entry)) {
+    issues.push({
+      type: 'invalid-node',
+      index,
+      message: 'Node must be a JSON object',
+    })
+    return null
+  }
+  const id = entry.id
+  if (typeof id !== 'string' || id.length === 0) {
+    issues.push({
+      type: 'invalid-node',
+      index,
+      message: 'Node "id" must be a non-empty string',
+    })
+    return null
+  }
+  const base = parseNodeGeometry(entry, index, id, issues)
+  if (!base) return null
+
+  switch (entry.type) {
+    case 'text': {
+      const text = entry.text
+      if (typeof text !== 'string') {
+        issues.push({
+          type: 'invalid-node',
+          index,
+          id,
+          message: 'Text node requires "text" to be a string',
+        })
+        return null
+      }
+      return {
+        ...base,
+        type: 'text',
+        text,
+        ...parseReadingWindow(entry),
+        ...parseTextDisplay(entry),
+        extra: extractExtra(entry, TEXT_NODE_KEYS),
+      }
+    }
+    case 'file': {
+      const file = entry.file
+      if (typeof file !== 'string' || file.length === 0) {
+        issues.push({
+          type: 'invalid-node',
+          index,
+          id,
+          message: 'File node requires a non-empty "file"',
+        })
+        return null
+      }
+      return {
+        ...base,
+        type: 'file',
+        file,
+        ...parseReadingWindow(entry),
+        ...parsePageWindow(entry),
+        ...parseSpread(entry),
+        ...parseBoardWindow(entry),
+        extra: extractExtra(entry, FILE_NODE_KEYS),
+      }
+    }
+    case 'link': {
+      const url = entry.url
+      if (typeof url !== 'string' || url.length === 0) {
+        issues.push({
+          type: 'invalid-node',
+          index,
+          id,
+          message: 'Link node requires a non-empty "url"',
+        })
+        return null
+      }
+      return {
+        ...base,
+        type: 'link',
+        url,
+        extra: extractExtra(entry, LINK_NODE_KEYS),
+      }
+    }
+    case 'group': {
+      const label = typeof entry.label === 'string' ? entry.label : undefined
+      return {
+        ...base,
+        type: 'group',
+        ...(label === undefined ? {} : { label }),
+        extra: extractExtra(entry, GROUP_NODE_KEYS),
+      }
+    }
+    default:
+      issues.push({
+        type: 'invalid-node',
+        index,
+        id,
+        message: `Unknown node "type": ${String(entry.type)}`,
+      })
+      return null
+  }
+}
+
+/**
+ * A window position is dropped rather than repaired when it is nonsense: a
+ * card that cannot say where it starts starts at the top, which is what a
+ * card without the field does anyway. Not an issue worth reporting — unlike
+ * geometry, nothing about the board is lost.
+ */
+function parseReadingWindow(entry: Record<string, unknown>): {
+  startLine?: number
+} {
+  const value = entry.startLine
+  if (!isFiniteNumber(value) || value <= 0) return {}
+  return { startLine: value }
+}
+
+/** Bare text is written `true` or not at all; anything else is a card. */
+function parseTextDisplay(entry: Record<string, unknown>): {
+  plain?: boolean
+  autoWidth?: boolean
+} {
+  if (entry.plain !== true) return {}
+  return entry.autoWidth === true
+    ? { plain: true, autoWidth: true }
+    : { plain: true }
+}
+
+/** The same rule for a page window: the top of page 1 is 1, and anything
+ * that is not a place at or past it is no window at all. */
+function parsePageWindow(entry: Record<string, unknown>): {
+  startPage?: number
+} {
+  const value = entry.startPage
+  if (!isFiniteNumber(value) || value <= 1) return {}
+  return { startPage: value }
+}
+
+/** A portal's window is a finite point, or there is none. */
+function parseBoardWindow(entry: Record<string, unknown>): BoardWindow {
+  const view = entry.view
+  if (!isPlainObject(view)) return {}
+  const { x, y, scale } = view
+  if (!isFiniteNumber(x) || !isFiniteNumber(y)) return {}
+  return isFiniteNumber(scale) && scale > 0 && scale !== 1
+    ? { view: { x, y, scale } }
+    : { view: { x, y } }
+}
+
+/**
+ * A spread is kept only whole: a title and at least one page, every one of
+ * them a finite rectangle. Anything less is dropped, and the card is a card —
+ * expanding it again lays its pages out afresh, which loses a layout nobody
+ * could have been shown anyway.
+ */
+function parseSpread(entry: Record<string, unknown>): { spread?: PdfSpread } {
+  const raw = entry.spread
+  if (!isPlainObject(raw)) return {}
+  const title = parseSpreadRect(raw.title)
+  if (!title || !Array.isArray(raw.pages) || raw.pages.length === 0) return {}
+  const pages: SpreadPage[] = []
+  for (const value of raw.pages) {
+    const page = parseSpreadPage(value)
+    if (!page) return {}
+    pages.push(page)
+  }
+  return { spread: { open: raw.open === true, title, pages } }
+}
+
+function parseSpreadRect(value: unknown): SpreadRect | null {
+  if (!Array.isArray(value) || value.length !== 4) return null
+  if (!value.every(isFiniteNumber)) return null
+  const [x, y, w, h] = value
+  if (w <= 0 || h <= 0) return null
+  return { x, y, w, h }
+}
+
+function parseSpreadPage(value: unknown): SpreadPage | null {
+  if (!Array.isArray(value) || value.length !== 5) {
+    return parseSpreadRect(value)
+  }
+  const rect = parseSpreadRect(value.slice(0, 4))
+  const color: unknown = value[4]
+  if (!rect || !isNonEmptyString(color)) return null
+  return { ...rect, color }
+}
+
+function serializeSpread(
+  spread: PdfSpread | undefined,
+): Record<string, unknown> | undefined {
+  if (!spread) return undefined
+  const tuple = (rect: SpreadRect) => [rect.x, rect.y, rect.w, rect.h]
+  return {
+    open: spread.open ? true : undefined,
+    title: tuple(spread.title),
+    pages: spread.pages.map((page) =>
+      page.color === undefined ? tuple(page) : [...tuple(page), page.color],
+    ),
+  }
+}
+
+function parseNodeGeometry(
+  entry: Record<string, unknown>,
+  index: number,
+  id: string,
+  issues: BoardParseIssue[],
+): Omit<BoardNodeBase, 'extra'> | null {
+  const { x, y, w, h } = entry
+  if (![x, y, w, h].every(isFiniteNumber)) {
+    issues.push({
+      type: 'invalid-node',
+      index,
+      id,
+      message: 'Node "x"/"y"/"w"/"h" must be finite numbers',
+    })
+    return null
+  }
+  const color = isNonEmptyString(entry.color) ? entry.color : undefined
+  return {
+    id,
+    x: x as number,
+    y: y as number,
+    w: w as number,
+    h: h as number,
+    ...(color === undefined ? {} : { color }),
+  }
+}
+
+export function serializeNode(node: BoardNode): Record<string, unknown> {
+  const common = {
+    id: node.id,
+    type: node.type,
+    x: node.x,
+    y: node.y,
+    w: node.w,
+    h: node.h,
+    color: node.color,
+  }
+  switch (node.type) {
+    case 'text':
+      return {
+        ...common,
+        text: node.text,
+        startLine: node.startLine,
+        plain: node.plain === true ? true : undefined,
+        autoWidth:
+          node.plain === true && node.autoWidth === true ? true : undefined,
+        ...node.extra,
+      }
+    case 'file':
+      return {
+        ...common,
+        file: node.file,
+        startLine: node.startLine,
+        startPage: node.startPage,
+        spread: serializeSpread(node.spread),
+        view: node.view
+          ? {
+              x: node.view.x,
+              y: node.view.y,
+              scale:
+                node.view.scale === undefined || node.view.scale === 1
+                  ? undefined
+                  : node.view.scale,
+            }
+          : undefined,
+        ...node.extra,
+      }
+    case 'link':
+      return { ...common, url: node.url, ...node.extra }
+    case 'group':
+      return { ...common, label: node.label, ...node.extra }
+    case 'pdf-page':
+      // A board is folded back (domain/spread.ts's `collapseBoard`) before
+      // anything writes it; a sheet reaching here would be written as a node
+      // no reader knows and dropped from its PDF's spread.
+      throw new Error(
+        `serializeNode: "${node.id}" is a spread page, which only exists on the board`,
+      )
+  }
+}
+
+// --- edges -----------------------------------------------------------------
+
+const EDGE_KNOWN_KEYS = [
+  'id',
+  'fromNode',
+  'toNode',
+  'fromSide',
+  'toSide',
+  'fromEnd',
+  'toEnd',
+  'fromPage',
+  'toPage',
+  'fromAnchor',
+  'toAnchor',
+  'fromPath',
+  'toPath',
+  'color',
+  'label',
+] as const
+
+function parseEdges(
+  raw: readonly unknown[],
+  nodeIds: ReadonlySet<string>,
+  issues: BoardParseIssue[],
+): Edge[] {
+  const edges: Edge[] = []
+  const seenIds = new Set<string>()
+  raw.forEach((entry, index) => {
+    const edge = parseEdge(entry, index, issues)
+    if (!edge) return
+    if (seenIds.has(edge.id)) {
+      issues.push({
+        type: 'invalid-edge',
+        index,
+        id: edge.id,
+        message: 'Duplicate edge id',
+      })
+      return
+    }
+    // An end behind a portal (`fromPath` / `toPath`) is the portal's to
+    // vouch for here: what is behind it is another file's.
+    const reaches = (id: NodeId) =>
+      nodeIds.has(id) || nodeIds.has(id.split(NODE_PATH_SEPARATOR)[0])
+    if (!reaches(edge.fromNode) || !reaches(edge.toNode)) {
+      issues.push({
+        type: 'dangling-edge',
+        id: edge.id,
+        from: edge.fromNode,
+        to: edge.toNode,
+      })
+      return
+    }
+    seenIds.add(edge.id)
+    edges.push(edge)
+  })
+  return edges
+}
+
+function parseEdge(
+  entry: unknown,
+  index: number,
+  issues: BoardParseIssue[],
+): Edge | null {
+  if (!isPlainObject(entry)) {
+    issues.push({
+      type: 'invalid-edge',
+      index,
+      message: 'Edge must be a JSON object',
+    })
+    return null
+  }
+  const { id, fromNode, toNode } = entry
+  if (typeof id !== 'string' || id.length === 0) {
+    issues.push({
+      type: 'invalid-edge',
+      index,
+      message: 'Edge "id" must be a non-empty string',
+    })
+    return null
+  }
+  if (
+    typeof fromNode !== 'string' ||
+    fromNode.length === 0 ||
+    typeof toNode !== 'string' ||
+    toNode.length === 0
+  ) {
+    issues.push({
+      type: 'invalid-edge',
+      index,
+      id,
+      message: 'Edge "fromNode"/"toNode" must be non-empty node ids',
+    })
+    return null
+  }
+  const fromSide = isNodeSide(entry.fromSide) ? entry.fromSide : undefined
+  const toSide = isNodeSide(entry.toSide) ? entry.toSide : undefined
+  // JSON Canvas defaults, applied here so nothing downstream has to know them.
+  const fromEnd = isEdgeEnd(entry.fromEnd) ? entry.fromEnd : 'none'
+  const toEnd = isEdgeEnd(entry.toEnd) ? entry.toEnd : 'arrow'
+  const color = isNonEmptyString(entry.color) ? entry.color : undefined
+  const label = typeof entry.label === 'string' ? entry.label : undefined
+  const fromPage = parseEdgePage(entry.fromPage)
+  const toPage = parseEdgePage(entry.toPage)
+  const fromAnchor = parseEdgeAnchor(entry.fromAnchor)
+  const toAnchor = parseEdgeAnchor(entry.toAnchor)
+  return {
+    id,
+    fromNode: withEdgePath(fromNode, entry.fromPath),
+    toNode: withEdgePath(toNode, entry.toPath),
+    fromSide,
+    toSide,
+    ...(fromPage === undefined ? {} : { fromPage }),
+    ...(toPage === undefined ? {} : { toPage }),
+    ...(fromAnchor === undefined ? {} : { fromAnchor }),
+    ...(toAnchor === undefined ? {} : { toAnchor }),
+    fromEnd,
+    toEnd,
+    color,
+    label,
+    extra: extractExtra(entry, EDGE_KNOWN_KEYS),
+  }
+}
+
+/** An end behind a portal names the portal as its node, and the way in as
+ * its path: on the board, one id (domain/nodePath.ts). A path that is not a
+ * list of plain ids is no path, and the end reaches the portal. */
+function withEdgePath(node: NodeId, path: unknown): NodeId {
+  if (
+    !Array.isArray(path) ||
+    path.length === 0 ||
+    !path.every(
+      (id) =>
+        typeof id === 'string' &&
+        id.length > 0 &&
+        !id.includes(NODE_PATH_SEPARATOR),
+    )
+  ) {
+    return node
+  }
+  return [node, ...(path as string[])].join(NODE_PATH_SEPARATOR)
+}
+
+/** A page an edge end names is a whole page number, from 1; anything else
+ * attaches the end to the PDF as a whole, which is what an edge without the
+ * field does. */
+function parseEdgePage(value: unknown): number | undefined {
+  return Number.isInteger(value) && (value as number) >= 1
+    ? (value as number)
+    : undefined
+}
+
+/** An anchor that is not one this version can place is dropped, and the end
+ * reaches the whole node — what an edge without the field does. */
+function parseEdgeAnchor(value: unknown): EdgeAnchor | undefined {
+  if (!isPlainObject(value)) return undefined
+  const quote = parseAnchorQuote(value.quote)
+  if (!quote) return undefined
+  if (value.kind === 'pdf') {
+    const { page, quadPoints, selection } = value
+    if (!(Number.isInteger(page) && (page as number) >= 1)) return undefined
+    if (
+      !Array.isArray(quadPoints) ||
+      quadPoints.length === 0 ||
+      quadPoints.length % 8 !== 0 ||
+      !quadPoints.every(isFiniteNumber)
+    ) {
+      return undefined
+    }
+    const hint =
+      Array.isArray(selection) &&
+      selection.length === 4 &&
+      selection.every((n) => Number.isInteger(n) && (n as number) >= 0)
+        ? (selection as unknown as readonly [number, number, number, number])
+        : undefined
+    return {
+      kind: 'pdf',
+      page: page as number,
+      quadPoints: quadPoints,
+      quote,
+      ...(hint === undefined ? {} : { selection: hint }),
+    }
+  }
+  if (value.kind === 'text') {
+    const { offset } = value
+    if (!(Number.isInteger(offset) && (offset as number) >= 0)) return undefined
+    return { kind: 'text', quote, offset: offset as number }
+  }
+  return undefined
+}
+
+function parseAnchorQuote(value: unknown): EdgeAnchorQuote | undefined {
+  if (!isPlainObject(value)) return undefined
+  const { exact, prefix, suffix } = value
+  if (typeof exact !== 'string' || exact.length === 0) return undefined
+  if (prefix !== undefined && typeof prefix !== 'string') return undefined
+  if (suffix !== undefined && typeof suffix !== 'string') return undefined
+  return {
+    exact,
+    ...(prefix === undefined ? {} : { prefix }),
+    ...(suffix === undefined ? {} : { suffix }),
+  }
+}
+
+/**
+ * `nodeIds` are the ids of the nodes the edge is written beside: an end whose
+ * node is not one of them is behind a portal, and is written as the portal
+ * and the way in. Without them, every end is written as it is.
+ */
+export function serializeEdge(
+  edge: Edge,
+  nodeIds?: ReadonlySet<NodeId>,
+): Record<string, unknown> {
+  const from = edgeEndPath(edge.fromNode, nodeIds)
+  const to = edgeEndPath(edge.toNode, nodeIds)
+  return {
+    id: edge.id,
+    fromNode: from[0],
+    toNode: to[0],
+    fromPath: from.length > 1 ? from.slice(1) : undefined,
+    toPath: to.length > 1 ? to.slice(1) : undefined,
+    fromSide: edge.fromSide,
+    toSide: edge.toSide,
+    fromPage: edge.fromPage,
+    toPage: edge.toPage,
+    fromAnchor: edge.fromAnchor,
+    toAnchor: edge.toAnchor,
+    fromEnd: edge.fromEnd,
+    toEnd: edge.toEnd,
+    color: edge.color,
+    label: edge.label,
+    ...edge.extra,
+  }
+}
+
+function edgeEndPath(
+  id: NodeId,
+  nodeIds: ReadonlySet<NodeId> | undefined,
+): readonly NodeId[] {
+  if (!nodeIds || nodeIds.has(id)) return [id]
+  return id.split(NODE_PATH_SEPARATOR)
+}
+
+// --- camera ------------------------------------------------------------
+
+function parseCamera(raw: unknown): Camera {
+  if (!isPlainObject(raw)) return DEFAULT_CAMERA
+  return {
+    x: isFiniteNumber(raw.x) ? raw.x : DEFAULT_CAMERA.x,
+    y: isFiniteNumber(raw.y) ? raw.y : DEFAULT_CAMERA.y,
+    scale: isFiniteNumber(raw.scale) ? raw.scale : DEFAULT_CAMERA.scale,
+  }
+}
+
+// --- shared helpers ------------------------------------------------------
+
+const TOP_LEVEL_KEYS = ['version', 'camera', 'nodes', 'edges'] as const
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Renders an `unknown` value for an error message without risking `[object Object]`. */
+function describeUnknown(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    value === null
+  ) {
+    return String(value)
+  }
+  try {
+    const json = JSON.stringify(value)
+    if (json !== undefined) return json
+  } catch {
+    // fall through to the generic description below
+  }
+  return Object.prototype.toString.call(value)
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+export function isNodeSide(value: unknown): value is NodeSide {
+  return (
+    typeof value === 'string' &&
+    (NODE_SIDES as readonly string[]).includes(value)
+  )
+}
+
+export function isEdgeEnd(value: unknown): value is EdgeEnd {
+  return (
+    typeof value === 'string' &&
+    (EDGE_ENDS as readonly string[]).includes(value)
+  )
+}
+
+function extractExtra(
+  raw: Record<string, unknown>,
+  knownKeys: readonly string[],
+): ExtraFields {
+  const extra: Record<string, unknown> = {}
+  for (const key of Object.keys(raw)) {
+    if (!knownKeys.includes(key)) extra[key] = raw[key]
+  }
+  return extra
+}

@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "modules": [
+    {
+      "id": "learning",
+      "icon": "graduation-cap",
+      "localizations": {
+        "en": {
+          "name": "Learning mode",
+          "description": "Build lasting knowledge from your notes with guided learning plans, spaced repetition, and review."
+        },
+        "zh": {
+          "name": "学习模式",
+          "description": "通过学习计划、间隔重复与复习，把笔记转化为能够长期掌握的知识。"
+        },
+        "it": {
+          "name": "Modalità di apprendimento",
+          "description": "Trasforma le note in conoscenze durature con piani di studio guidati, ripetizione dilazionata e ripasso."
+        }
+      },
+      "versions": [
+        {
+          "version": "0.1.4",
+          "hostApi": "^1.5.0",
+          "platforms": [
+            "desktop",
+            "mobile"
+          ],
+          "dataSchemas": {
+            "settings": {
+              "readMin": 0,
+              "readMax": 1,
+              "write": 1
+            }
+          },
+          "manifestUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/learning%2Fv0.1.4/module.json",
+          "manifest": {
+            "byteSize": 1860,
+            "sha256": "f226e62c9fb1d7785db70e49bb1fd48430c13501c1353f42d482c3081bc99120"
+          },
+          "releaseNotes": {
+            "url": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/learning%2Fv0.1.4/release-note.md",
+            "byteSize": 739,
+            "sha256": "1f4ec035a5cf9aa97c07961d6bbd440540fff2a1e08b7daef43a2ec755aebb76"
+          }
+        }
+      ]
+    },
+    {
+      "id": "whiteboard",
+      "icon": "waypoints",
+      "localizations": {
+        "en": {
+          "name": "YOLO Whiteboard",
+          "description": "An infinite canvas for spatial thinking: place note, text, and PDF cards, connect them, and read/annotate PDFs alongside your notes."
+        },
+        "zh": {
+          "name": "YOLO 白板",
+          "description": "用于空间化思考的无限画布：摆放笔记、便签与 PDF 卡片，建立连线，并在笔记旁阅读与标注 PDF。"
+        },
+        "it": {
+          "name": "Lavagna YOLO",
+          "description": "Una tela infinita per il pensiero spaziale: disponi schede di note, testo e PDF, collegale tra loro e leggi/annota i PDF accanto alle tue note."
+        }
+      },
+      "versions": [
+        {
+          "version": "0.0.8",
+          "hostApi": "^1.12.0",
+          "platforms": [
+            "desktop",
+            "mobile"
+          ],
+          "dataSchemas": {
+            "settings": {
+              "readMin": 0,
+              "readMax": 1,
+              "write": 1
+            }
+          },
+          "manifestUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/whiteboard%2Fv0.0.8/module.json",
+          "manifest": {
+            "byteSize": 1867,
+            "sha256": "130f6032dd3d0582451c41cb061c095b8e42d58983b41edca58712f06962a6ce"
+          },
+          "releaseNotes": {
+            "url": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/whiteboard%2Fv0.0.8/release-note.md",
+            "byteSize": 542,
+            "sha256": "70a388bc1d6fef47e2b0a754c4663e6e9e6cd8476e3e200a34735531b2ca89ef"
+          }
+        }
+      ]
+    }
+  ]
+}

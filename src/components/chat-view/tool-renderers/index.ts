@@ -1,0 +1,92 @@
+import { getBashChatSummary } from '../../../core/tools/bash/chat-summary'
+import { delegateSubagentRenderer } from '../../../core/tools/delegate_subagent/ui'
+import { getFileEditingPathChatSummary } from '../../../core/tools/file-editing-support'
+import { fileEditingRenderer } from '../../../core/tools/file-editing-ui'
+import { getFsReadChatSummary } from '../../../core/tools/fs_read/chat-summary'
+import { getJsEvalChatSummary } from '../../../core/tools/js_eval/chat-summary'
+import {
+  type BuiltinToolName,
+  isBuiltinToolName,
+} from '../../../core/tools/registry'
+import { terminalCommandRenderer } from '../../../core/tools/terminal_command/ui'
+import { getTodoWriteChatSummary } from '../../../core/tools/todo_write/chat-summary'
+import { getVaultSearchChatSummary } from '../../../core/tools/vault_search/chat-summary'
+import { getWebScrapeChatSummary } from '../../../core/tools/web_scrape/chat-summary'
+import { getWebSearchChatSummary } from '../../../core/tools/web_search/chat-summary'
+
+import { genericRenderer } from './generic'
+import type { ToolRenderer } from './types'
+
+/**
+ * The exhaustive chat-rendering wiring table.
+ *
+ * `satisfies Record<BuiltinToolName, ToolRenderer>` — not `Partial` — so
+ * forgetting to wire up a newly registered tool is a compile error. Every
+ * entry is explicit: `genericRenderer` for "no custom card, no summary" is
+ * written out, never omitted or defaulted; tools with a header summary but
+ * no custom card use `{ kind: 'generic', summary: ... }` instead of the
+ * shared `genericRenderer` constant.
+ *
+ * `terminal_command` is the only `body`-kind entry (see
+ * `core/tools/terminal_command/ui.tsx`); `delegate_subagent` is the only
+ * `replace`-kind entry; the four file-editing tools (`fs_edit`,
+ * `fs_write`, `edit_file`, `write_file`) share the one `content`-kind entry
+ * (`core/tools/file-editing-ui.tsx`), which shows a diff of the change
+ * instead of the arguments and result JSON. Every other tool is `generic` —
+ * with or without a `summary` — because it renders through the default
+ * collapsed card.
+ *
+ * Tools with no `summary` here (context_compact,
+ * context_prune_tool_results, ask_user_question, delegate_subagent) had no
+ * branch in the former `if` chain either — their header shows only the
+ * title, no summary text. `delegate_subagent` is a special case: its
+ * header summary comes from `ToolMessage.tsx`'s own
+ * `getDelegateSubagentSummary`, applied as a response-independent override
+ * in `getHeadlineDisplayInfo` (unlike `fs_read`'s enrichment, this one
+ * genuinely doesn't need the response — but it predates this table and
+ * `getHeadlineDisplayInfo`'s per-tool overrides were deliberately left
+ * untouched, so it isn't wired here to avoid two competing
+ * sources of truth for the same value).
+ */
+export const TOOL_RENDERERS = {
+  delegate_subagent: delegateSubagentRenderer,
+  // a bookkeeping call with no argument worth a header.
+  context_prune_tool_results: { kind: 'generic', summary: null },
+  // a bookkeeping call with no argument worth a header.
+  context_compact: { kind: 'generic', summary: null },
+  todo_write: { kind: 'generic', summary: getTodoWriteChatSummary },
+  // the question itself renders in the card body.
+  ask_user_question: { kind: 'generic', summary: null },
+  fs_read: { kind: 'generic', summary: getFsReadChatSummary },
+  fs_edit: fileEditingRenderer,
+  fs_write: fileEditingRenderer,
+  web_search: { kind: 'generic', summary: getWebSearchChatSummary },
+  web_scrape: { kind: 'generic', summary: getWebScrapeChatSummary },
+  js_eval: { kind: 'generic', summary: getJsEvalChatSummary },
+  terminal_command: terminalCommandRenderer,
+  bash: { kind: 'generic', summary: getBashChatSummary },
+  // `native_files`: same `path`-argument header summary the vault file tools
+  // use — the summary reads the tool call's own `path` argument and has no
+  // vault dependency of its own.
+  read_file: { kind: 'generic', summary: getFileEditingPathChatSummary },
+  write_file: fileEditingRenderer,
+  edit_file: fileEditingRenderer,
+  vault_search: { kind: 'generic', summary: getVaultSearchChatSummary },
+} satisfies Record<BuiltinToolName, ToolRenderer>
+
+/**
+ * Safe by-name lookup for callers that only have a `string` (a remote MCP
+ * tool name, or a retired built-in tool name still present in historical
+ * conversation data). Never index
+ * `TOOL_RENDERERS` directly with an unchecked `string`.
+ */
+export const getToolRenderer = (name: string): ToolRenderer =>
+  isBuiltinToolName(name) ? TOOL_RENDERERS[name] : genericRenderer
+
+export { genericRenderer } from './generic'
+export type {
+  ToolChatSummaryFn,
+  ToolChatSummaryLabels,
+  ToolRenderer,
+  ToolRendererProps,
+} from './types'

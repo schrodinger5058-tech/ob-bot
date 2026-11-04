@@ -1,42 +1,218 @@
-# ob-bot
+<h1 align="center">YOLO</h1>
+<p align="center">
+  Agent-native AI assistant for Obsidian — chat, write, knowledge base, and orchestration, all in one place.
+</p>
 
-Foreground multi-bot chat for Obsidian, built with plain DOM UI and mobile-compatible vault APIs. No DSH, DeepSeek Harness, Node, Electron or shell runtime dependency.
+<p align="center"><a href="https://github.com/Lapis0x0/obsidian-yolo/commits/main">
+    <img src="https://img.shields.io/github/last-commit/Lapis0x0/obsidian-yolo/main?style=flat-square&color=6c5ce7" alt="Last Commit">
+  </a>
+  <a href="https://github.com/Lapis0x0/obsidian-yolo/stargazers">
+    <img src="https://img.shields.io/github/stars/Lapis0x0/obsidian-yolo?style=flat-square&color=6c5ce7" alt="GitHub Stars">
+  </a>
+  <a href="https://github.com/Lapis0x0/obsidian-yolo/releases/latest">
+    <img src="https://img.shields.io/github/v/release/Lapis0x0/obsidian-yolo?style=flat-square&color=00b894" alt="Latest Release">
+  </a>
+  <a href="https://github.com/Lapis0x0/obsidian-yolo/releases">
+    <img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FLapis0x0%2Fobsidian-yolo%2Fdownload-metrics%2Fbadge.json&style=flat-square" alt="Downloads">
+  </a>
+  <a href="https://github.com/Lapis0x0/obsidian-yolo/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/Lapis0x0/obsidian-yolo?style=flat-square&color=636e72" alt="License">
+  </a>
+</p>
 
-## Install
+<p align="center">
+  <b>English</b> | <a href="./README_zh-CN.md">简体中文</a> | <a href="./README_it.md">Italiano</a> | <a href="./README_es.md">Español</a>
+</p>
 
-Build from source with `npm ci`, `npm run check`, `npm test`, `npm run build` (Node is only required for development). Copy **main.js**, **manifest.json**, and **styles.css** into `<vault>/.obsidian/plugins/ob-bot/`. Enable ob-bot under Settings → Community plugins. Open it using the ribbon or the **ob-bot: Open chat** command.
+<p align="center">
+  <a href="./documentation/en/README.md"><b>Documentation</b></a> | <a href="./documentation/en/getting-started.md">Getting started</a> | <a href="./documentation/en/faq.md">FAQ</a>
+</p>
 
-Alternatively, once this repository is hosted and accessible to you, use BRAT → Add beta plugin and enter its repository URL. Private repository access and BRAT compatibility have not been verified; manual installation is the supported MVP path. This is not an Obsidian community directory release.
+<p align="center">
+  <a href="https://discord.gg/d8EHm48ppU">
+    <img src="https://img.shields.io/badge/Discord-Join_the_community-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Join the Discord community">
+  </a>
+</p>
 
-## iPhone
+## Sponsors
 
-1. Install Obsidian and open your vault on iPhone.
-2. Transfer the three build files into that vault's `.obsidian/plugins/ob-bot/` using your vault sync/file-transfer workflow. Confirm hidden plugin files actually transferred; some sync services omit them.
-3. Enable community plugins, then ob-bot. Open the chat command from the command palette.
-4. Open ob-bot Settings, configure a provider key, and create a bot. Use `deepseek-chat` for DeepSeek or a model your compatible endpoint supports.
-5. Start with a DM. Create at least two bots and a group to try planning, worker execution and synthesis. Keep Obsidian in the foreground.
+<table>
+<tr>
+<td width="200" align="center" valign="middle">
+  <a href="https://fluxionai.space/register?source=github&amp;campaign=github-sidrune-yolo&amp;promo=SDRYOLO">
+    <img src="./assets/sponsor-sidrune.png" alt="Sidrune AI" width="163">
+  </a>
+</td>
+<td valign="middle">
+  Thanks to <b><a href="https://fluxionai.space/register?source=github&amp;campaign=github-sidrune-yolo&amp;promo=SDRYOLO">Sidrune AI</a></b> for sponsoring this project! Sidrune AI is an API relay that helps individual developers and businesses access and manage the world's leading AI models through one unified API. Multi-route dynamic scheduling keeps requests available, and model performance, response times, and costs are all transparent. With Fable 5.1, Sidrune AI can save you up to about 90% compared with Claude's official API pricing. Sign up through this link to get $3 in free API credit.
+  <br><br>
+  <a href="https://fluxionai.space/register?source=github&amp;campaign=github-sidrune-yolo&amp;promo=SDRYOLO"><b>Sign up for Sidrune AI →</b></a>
+</td>
+</tr>
+</table>
 
-**iPhone on-device = unverified.** Keyboard layout, safe areas, networking, streaming and suspension recovery require real-device testing. The manifest permits mobile use; that is not a device-test claim.
+## What's New
 
-## Provider and bot setup
+- **`1.6`**
+  - **On-device local embedding models and multiple knowledge bases**: index without any API key, split and manage knowledge bases independently, and let the Agent auto-pick the right one by name.
+  - **CLI chat**: on desktop, drive the Claude Code, Codex, Hermes, Pi, or Grok CLI you're already signed into from the same chat surface.
+  - **The new Learning Mode**: turn any topic and reference material into a personalized learning project with structured outlines, knowledge points, flashcards, and an interactive knowledge map, backed by FSRS spaced repetition and Anki `.apkg` import for sustainable long-term review.
 
-Settings include editable HTTPS OpenAI-compatible endpoints, password inputs for API keys, streaming, and transport choice. Built-in endpoint defaults are `https://api.deepseek.com` and `https://api.openai.com/v1`. Fetch streams when supported; choose Obsidian buffered transport for CORS failures. Buffered requests cannot be physically canceled, but Stop denies late results and pending writes.
+- **`1.5`**: Introduces a new Agent runtime that turns AI from Q&A into active collaboration—with full tool calling, MCP, Skills, desktop Bash, subagents, and web search—plus smarter long-session context and memory, refreshed hybrid RAG, focus/PDF awareness, and multi-window chat with background Agents.
 
-Keys are saved **unencrypted** in Obsidian plugin `data.json`, potentially included in vault sync/backups. They are never logged by this plugin. Endpoints receive your messages and any note content tools supply; configure only trusted endpoints. Do not commit or share data.json.
+## Highlights
 
-New bot defaults: DeepSeek, `deepseek-chat`, temperature 0.7, 4096 output tokens, conversation memory enabled, and no vault permissions. These defaults are fixed in the MVP; each bot's settings are editable. Use stable lowercase @handles. Scope takes one vault-relative folder/note per line; empty denies all notes, `*` permits visible Markdown throughout the vault. Enable each tool explicitly. Create/append/edit always require a before/after approval; closing the preview denies the write. Parent folders must already exist. Concurrent edits invalidate approval.
+<table>
+<tr>
+<td width="50%" align="center"><b>A Complete Agent Experience | Use Codex / Claude Code Inside Obsidian</b></td>
+<td width="50%" align="center"><b>Turn Vault Knowledge into Lasting Mastery</b></td>
+</tr>
+<tr valign="top">
+<td align="center"><img src="./assets/agent.webp" alt="Agent" width="100%"></td>
+<td align="center"><img src="./assets/learning-mode.gif" alt="Learning Mode" width="100%"></td>
+</tr>
+<tr valign="top">
+<td align="center">Go beyond answers. YOLO understands and works directly with your Vault, calls tools and MCP servers, and uses Skills to get real work done your way. On desktop, switch in one click to a supported CLI agent you are already signed in to and let it work directly in your Vault.</td>
+<td align="center">Turn topics and source material into a personal learning system, then use flashcards and FSRS-powered review to move from saved notes to lasting knowledge.</td>
+</tr>
+<tr>
+<td colspan="2" align="center"><b>YOLO Whiteboard | A High-Performance Obsidian Canvas</b></td>
+</tr>
+<tr>
+<td colspan="2" align="center"><img src="./assets/whiteboard.gif" alt="YOLO Whiteboard" width="100%"></td>
+</tr>
+<tr>
+<td colspan="2" align="center">For now, think of it as an Obsidian Canvas several to dozens of times faster. More features that push the boundaries of AI and human thinking are on the way.</td>
+</tr>
+</table>
 
-## Implemented
+## Features
 
-- Independent bots, editable prompts/models/providers/tools/scopes, persistent DM sessions and group creation.
-- Explicit @member routing; unaddressed group requests run a separate lead planning call, up to three separate worker calls, and a separate synthesis call. Single-member groups call their lead directly.
-- Serial foreground execution, progress tickets, streamed bubbles, stop, timeout, isolated bot/room histories and interrupted-state recovery on restart.
-- Scoped Markdown read/search and user-approved create/append/edit, with path validation and conflict checks.
-- Light/dark CSS variables, scrollable messages, safe-area padding and persistent composer while streaming.
-- Offline unit tests and a built main.js.
+Beyond the core capabilities above, YOLO also provides:
 
-## Not implemented / limits
+| Feature | Description |
+|---------|-------------|
+| 🖥️ CLI Agent (Desktop) | Reuse a supported locally signed-in CLI agent, including Claude Code, Codex, Hermes, Pi, and Grok, right inside Obsidian |
+| 🔌 External Agent Support | Connect MCP clients such as Hermes and OpenClaw to YOLO's Vault search, or delegate tasks to a configured YOLO Agent |
+| ⚡ Quick Ask | Ask, edit, and continue writing without leaving the editor |
+| 🔎 Vault RAG | Retrieve across your Vault for answers grounded in your own notes |
+| 🪟 Multi-Window Chat | Run different tasks and contexts in parallel across independent chat windows |
+| 🧠 Memory System | Lets YOLO remember preferences, habits, and long-term context for more consistent conversations |
+| 🪡 Cursor Chat | One-click context addition, conversation at your fingertips |
+| ⌨️ Tab Completion | Real-time AI-powered completion for smoother, more natural writing |
+| 🎛️ Multi-Model Support | OpenAI, Claude, Gemini, DeepSeek and other mainstream models, freely switch |
+| 🌍 i18n | Native multi-language support |
 
-No background work, recursive delegation, vector memory, attachments, encrypted credentials, automatic retry/replay, retention/pagination, group editing/deletion, bot deletion UI, configurable global defaults, native non-OpenAI provider protocols or multi-device merge handling. Planner JSON failures stop the request. Search scans at most 300 scoped notes and returns at most 20 results; note reads and conversation context are bounded. State is saved as whole-store snapshots. Group private sessions remain persisted separately from public messages. Write previews show whole before/after content rather than line diffs. No real-provider network or device tests have been performed.
+## Quick Start
 
-See NOTICE for source-study attribution. Architecture and source analysis live alongside the plugin folder in the workspace.
+1. Open Obsidian Settings → Community Plugins → Browse → Search **"YOLO"**
+2. Install and enable
+3. Configure your API key in plugin settings, or use your own ChatGPT OAuth / Gemini OAuth:
+   - [OpenAI](https://platform.openai.com/api-keys) / [Anthropic](https://console.anthropic.com/settings/keys) / [Gemini](https://aistudio.google.com/apikey) / [Groq](https://console.groq.com/keys)
+4. Open the sidebar to start chatting — or try Quick Ask by typing `@` in the editor
+
+## Installation
+
+### Community Plugin Store (Recommended)
+
+See Quick Start above.
+
+### Manual Installation
+
+1. Go to [Releases](https://github.com/Lapis0x0/obsidian-yolo/releases) and download the latest `main.js`, `manifest.json`, `styles.css`
+2. Create folder: `<vault>/.obsidian/plugins/obsidian-yolo/`
+3. Copy files to that folder, then enable the plugin in Obsidian Settings
+
+> [!WARNING]
+> YOLO cannot coexist with [Smart Composer](https://github.com/glowingjade/obsidian-smart-composer). Please disable or uninstall Smart Composer before using YOLO.
+
+## Roadmap
+
+- [x] Better and stronger Vault AI search
+- [x] Background Agent (long-running task automation)
+- [x] Multi-Agent orchestration (via subagents)
+- [x] Learning Mode — a dedicated study view
+- [ ] Annotation Mode — real-time AI annotations and suggestions on notes
+- [ ] Built-in assistant — a corner-pinned helper for config/agents, with auto-compaction and scheduled tasks
+- [x] Better AI whiteboard
+- [ ] Voice input & meeting notes
+
+## Documentation
+
+Full user documentation lives in **[documentation/en](./documentation/en/README.md)**:
+
+| | |
+|---|---|
+| [Getting started](./documentation/en/getting-started.md) | Install, configure a working model, run your first chat |
+| [Models & providers](./documentation/en/models.md) | Connect providers, OAuth sign-in, model parameters |
+| [Chat](./documentation/en/chat.md) | Referencing notes, the three modes, tool approvals, applying edits |
+| [Sparkle](./documentation/en/sparkle.md) | Quick Ask, Tab completion, selection rewrite |
+| [Knowledge base](./documentation/en/knowledge-base.md) | Indexing, multiple knowledge bases, local embedding models |
+| [Tools & permissions](./documentation/en/tools-and-permissions.md) | What it can touch, and how to rein it in |
+| [Memory](./documentation/en/memory.md) · [Skills](./documentation/en/skills.md) · [Agents](./documentation/en/assistants.md) | Tailoring it to you |
+| [MCP](./documentation/en/mcp.md) · [CLI agents](./documentation/en/cli-agent.md) · [Modules](./documentation/en/modules.md) | Going further |
+| [Settings reference](./documentation/en/settings-reference.md) · [FAQ](./documentation/en/faq.md) | Look things up |
+
+Also available in [简体中文](./documentation/zh-CN/README.md) and [Italiano](./documentation/it/README.md).
+
+## Feedback & Issues
+
+Hit a bug, something confusing, or have an idea? Open an issue:
+
+🐛 [Report a bug](https://github.com/Lapis0x0/obsidian-yolo/issues/new?template=bug_report.yml) · ✨ [Request a feature](https://github.com/Lapis0x0/obsidian-yolo/issues/new?template=feature_request.yml)
+
+What helps:
+
+- Bug reports with a clear reproduction (Obsidian version, OS, plugin version, what you did, what happened)
+- "I tried X and got Y" reports — UX papercuts, confusing wording, broken docs, outdated translations
+- Concrete feature ideas tied to a real use case ("when I do A, I want B because C")
+
+Please search existing issues first to avoid duplicates.
+
+## Contributing
+
+All forms of contribution are welcome — bug reports, documentation improvements, feature enhancements.
+
+**Please open an issue first to discuss feasibility and implementation for major features.**
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full guide: what we welcome, AI-assisted PR policy, size guidelines, and dev setup.
+
+## Acknowledgments
+
+Thanks to [Smart Composer](https://github.com/glowingjade/obsidian-smart-composer) for the original work — without them, there would be no YOLO.
+
+Special thanks to [Kilo Code](https://kilo.ai) for their sponsorship. Kilo is an open-source AI coding assistant platform with 500+ AI models, helping developers build and iterate faster.
+
+<p align="center">
+  <a href="https://kilo.ai" target="_blank">
+    <img src="https://img.shields.io/badge/Sponsored_by-Kilo_Code-FF6B6B?style=for-the-badge" alt="Sponsored by Kilo Code" height="30">
+  </a>
+</p>
+
+## Support
+
+If you find YOLO valuable, consider supporting the project:
+
+<p align="center">
+  <a href="https://buymeacoffee.com/lapis0x0" target="_blank">
+    <img src="https://img.shields.io/badge/Buy Me a Coffee-Support Developer-FFDD00?style=for-the-badge" alt="Buy Me a Coffee">
+  </a>
+  &nbsp;
+  <a href="https://afdian.com/a/lapis0x0" target="_blank">
+    <img src="https://img.shields.io/badge/爱发电-Support Developer-fd6c9e?style=for-the-badge" alt="爱发电">
+  </a>
+  &nbsp;
+  <a href="https://github.com/Lapis0x0/obsidian-yolo/blob/main/donation-qr.jpg" target="_blank">
+    <img src="https://img.shields.io/badge/WeChat/Alipay-Donation QR-00D924?style=for-the-badge" alt="WeChat/Alipay Donation QR">
+  </a>
+</p>
+
+Development logs are regularly updated on the [blog](https://www.lapis.cafe).
+
+## License
+
+[MIT License](LICENSE)
+
+## Star History
+
+[![Star History Chart](https://star-history.dera.page/svg?repos=Lapis0x0/obsidian-yolo&type=Date)](https://star-history.dera.page/#Lapis0x0/obsidian-yolo&type=date)

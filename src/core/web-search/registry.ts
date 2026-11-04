@@ -1,0 +1,34 @@
+import { anysearchProvider } from './providers/anysearch'
+import { bingProvider } from './providers/bing'
+import { deepseekSearchProvider } from './providers/deepseek'
+import { exaProvider } from './providers/exa'
+import { geminiGroundingProvider } from './providers/gemini-grounding'
+import { grokSearchProvider } from './providers/grok'
+import { jinaProvider } from './providers/jina'
+import { searxngProvider } from './providers/searxng'
+import { tavilyProvider } from './providers/tavily'
+import { zhipuProvider } from './providers/zhipu'
+import type { WebSearchProvider, WebSearchProviderOptions } from './types'
+
+const PROVIDERS: Record<string, WebSearchProvider<any>> = {
+  tavily: tavilyProvider,
+  jina: jinaProvider,
+  searxng: searxngProvider,
+  bing: bingProvider,
+  'gemini-grounding': geminiGroundingProvider,
+  grok: grokSearchProvider,
+  zhipu: zhipuProvider,
+  exa: exaProvider,
+  anysearch: anysearchProvider,
+  deepseek: deepseekSearchProvider,
+}
+
+export function getWebSearchProvider(
+  options: WebSearchProviderOptions,
+): WebSearchProvider {
+  const provider = PROVIDERS[options.type]
+  if (!provider) {
+    throw new Error(`Unknown web search provider type: ${options.type}`)
+  }
+  return provider as WebSearchProvider
+}

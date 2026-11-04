@@ -1,0 +1,286 @@
+import type { ModuleActivationCoordinator } from './moduleActivationCoordinator'
+import type { ModuleIntent, ModuleIntentStore } from './moduleIntentStore'
+import type { ModuleManager } from './moduleManager'
+import type { ModuleReadinessReconciler } from './moduleReadinessReconciler'
+import { assertModuleId } from './moduleStore'
+import type { ModuleDisposer } from './types'
+
+/**
+ * Production-owned union of synchronized intent, local device-state, and
+ * catalog module IDs. The intent backend cannot provide this safely itself.
+ */
+export type ModuleStartupReconcileSource = Readonly<{
+  listKnownModuleIds(): Promise<readonly string[]>
+  subscribe(listener: (moduleId: string) => void): ModuleDisposer
+}>
+
+export type ModuleStartupReconcilerOptions = Readonly<{
+  source: ModuleStartupReconcileSource
+  intentStore: Pick<ModuleIntentStore, 'get'>
+  readinessReconciler: Pick<ModuleReadinessReconciler, 'ensureModuleReady'>
+  activationCoordinator: Pick<
+    ModuleActivationCoordinator,
+    'activatePersistedModules' | 'activateModule'
+  >
+  runtime: Readonly<{
+    isActive(moduleId: string): boolean
+    deactivate(
+      moduleId: string,
+      options?: Readonly<{ closeViews?: boolean }>,
+      signal?: AbortSignal,
+    ): Promise<void>
+  }>
+  manager: Pick<ModuleManager, 'refresh'>
+  scheduleSafeUninstall?: (moduleId: string) => Promise<void>
+  /**
+   * Drops a device-local installation that no intent declares any more, so a
+   * device state cannot outlive the artifacts it claims. Production decides
+   * whether the artifacts are really gone before removing anything.
+   */
+  repairOrphanedInstall?: (moduleId: string) => Promise<void>
+  reportError?: (error: unknown, moduleId?: string) => void
+}>
+
+/** Owns startup ordering and synchronized-intent reconciliation. */
+export class ModuleStartupReconciler {
+  private readonly intents = new Map<string, ModuleIntent | null>()
+  private readonly pendingModuleIds = new Set<string>()
+  private unsubscribe: ModuleDisposer | undefined
+  private startup: Promise<void> | undefined
+  private updateOperation: Promise<void> = Promise.resolve()
+  private drainScheduled = false
+  private startupComplete = false
+  private disposed = false
+
+  constructor(private readonly options: ModuleStartupReconcilerOptions) {}
+
+  start(): Promise<void> {
+    if (this.disposed) return Promise.reject(disposedError())
+    if (this.startup) return this.startup
+
+    try {
+      this.unsubscribe = this.options.source.subscribe((moduleId) => {
+        if (this.disposed) return
+        try {
+          assertModuleId(moduleId, 'Module id')
+        } catch (error) {
+          this.report(error)
+          return
+        }
+        this.pendingModuleIds.add(moduleId)
+        if (this.startupComplete) this.scheduleDrain()
+      })
+    } catch (error) {
+      return Promise.reject(toError(error))
+    }
+
+    this.startup = this.runStartup().catch((error) => {
+      this.releaseSubscription()
+      throw toError(error)
+    })
+    return this.startup
+  }
+
+  async whenIdle(): Promise<void> {
+    if (this.disposed) throw disposedError()
+    if (!this.startup)
+      throw new Error('Module startup reconciler has not started')
+    await this.startup
+    while (this.drainScheduled || this.pendingModuleIds.size > 0) {
+      const operation = this.updateOperation
+      await operation
+      if (operation === this.updateOperation && !this.drainScheduled) break
+    }
+    if (this.disposed) throw disposedError()
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.pendingModuleIds.clear()
+    this.releaseSubscription()
+  }
+
+  private releaseSubscription(): void {
+    const unsubscribe = this.unsubscribe
+    this.unsubscribe = undefined
+    if (unsubscribe) {
+      try {
+        unsubscribe()
+      } catch (error) {
+        this.report(error)
+      }
+    }
+  }
+
+  private async runStartup(): Promise<void> {
+    const listed = await this.options.source.listKnownModuleIds()
+    if (this.disposed) throw disposedError()
+    for (const moduleId of listed) {
+      assertModuleId(moduleId, 'Module id')
+      this.pendingModuleIds.add(moduleId)
+    }
+
+    while (this.pendingModuleIds.size > 0) {
+      await this.reconcilePending()
+      if (this.disposed) throw disposedError()
+    }
+
+    const results =
+      await this.options.activationCoordinator.activatePersistedModules()
+    for (const result of results) {
+      if (result.status === 'failed') {
+        this.report(
+          new Error(result.error ?? 'Module activation failed'),
+          result.moduleId,
+        )
+      }
+    }
+    if (this.disposed) throw disposedError()
+    this.startupComplete = true
+    if (this.pendingModuleIds.size > 0) this.scheduleDrain()
+  }
+
+  private scheduleDrain(): void {
+    if (this.disposed || this.drainScheduled) return
+    this.drainScheduled = true
+    this.updateOperation = this.updateOperation
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          while (!this.disposed && this.pendingModuleIds.size > 0) {
+            await this.reconcilePending()
+          }
+        } finally {
+          this.drainScheduled = false
+          if (!this.disposed && this.pendingModuleIds.size > 0) {
+            this.scheduleDrain()
+          }
+        }
+      })
+  }
+
+  private async reconcilePending(): Promise<void> {
+    const moduleIds = [...this.pendingModuleIds].sort()
+    this.pendingModuleIds.clear()
+    const liveIntents: Array<{
+      moduleId: string
+      intent: ModuleIntent | null
+    }> = []
+    const uninstallIds: string[] = []
+    const orphanIds: string[] = []
+
+    for (const moduleId of moduleIds) {
+      if (this.disposed) return
+      const previous = this.intents.get(moduleId)
+      let intent: ModuleIntent | undefined
+      try {
+        intent = await this.options.intentStore.get(moduleId)
+      } catch (error) {
+        this.report(error, moduleId)
+        continue
+      }
+      if (this.disposed) return
+      const current = intent ?? null
+      this.intents.set(moduleId, current)
+
+      // Readiness repairs artifacts on disk and therefore requires a quiesced
+      // module. A source event that does not change the intent value carries
+      // no new readiness work — this session already reconciled it — and by
+      // then the module is usually running, so re-checking would only fail.
+      if (current === 'enabled' && previous !== current) {
+        try {
+          const result =
+            await this.options.readinessReconciler.ensureModuleReady(moduleId)
+          if (result.status === 'failed') {
+            this.report(
+              new Error(
+                result.error ?? 'Module readiness reconciliation failed',
+              ),
+              moduleId,
+            )
+          }
+        } catch (error) {
+          this.report(error, moduleId)
+        }
+      } else if (current === 'uninstalled') {
+        uninstallIds.push(moduleId)
+      } else if (current === null && previous !== current) {
+        // No intent at all: either a catalog module this Vault never installed,
+        // or a device state whose declaration is gone. Only the repair can tell
+        // them apart, and like readiness it is worth running once per value.
+        orphanIds.push(moduleId)
+      }
+
+      if (
+        this.startupComplete &&
+        previous !== undefined &&
+        isLiveEligible(previous) !== isLiveEligible(current)
+      ) {
+        liveIntents.push({ moduleId, intent: current })
+      }
+    }
+
+    if (this.disposed) return
+    try {
+      await this.options.manager.refresh()
+    } catch (error) {
+      this.report(error)
+    }
+    if (this.disposed) return
+
+    for (const { moduleId, intent } of liveIntents) {
+      try {
+        if (intent === 'enabled') {
+          if (!this.options.runtime.isActive(moduleId)) {
+            const result =
+              await this.options.activationCoordinator.activateModule(moduleId)
+            if (result.status === 'failed') {
+              throw new Error(result.error ?? 'Module activation failed')
+            }
+          }
+        } else if (this.options.runtime.isActive(moduleId)) {
+          await this.options.runtime.deactivate(moduleId, { closeViews: true })
+        }
+      } catch (error) {
+        this.report(error, moduleId)
+      }
+    }
+    if (this.disposed) return
+    for (const moduleId of uninstallIds) {
+      try {
+        await this.options.scheduleSafeUninstall?.(moduleId)
+      } catch (error) {
+        this.report(error, moduleId)
+      }
+    }
+    if (this.disposed) return
+    for (const moduleId of orphanIds) {
+      try {
+        await this.options.repairOrphanedInstall?.(moduleId)
+      } catch (error) {
+        this.report(error, moduleId)
+      }
+    }
+  }
+
+  private report(error: unknown, moduleId?: string): void {
+    try {
+      this.options.reportError?.(error, moduleId)
+    } catch {
+      // Diagnostics must not block reconciliation of other modules.
+    }
+  }
+}
+
+function isLiveEligible(intent: ModuleIntent | null): boolean {
+  return intent === 'enabled'
+}
+
+function disposedError(): Error {
+  return new Error('Module startup reconciler is disposed')
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
+}

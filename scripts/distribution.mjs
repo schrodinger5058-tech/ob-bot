@@ -1,0 +1,937 @@
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+import nacl from 'tweetnacl'
+import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici'
+
+import { isValidRuntimeComponentAssetName } from './runtimeComponentAssetName.mjs'
+import {
+  RUNTIME_ASSET_TAG,
+  listRegistryRuntimeAssets,
+} from './runtimeComponentReleaseAssets.mjs'
+
+if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY) {
+  setGlobalDispatcher(new EnvHttpProxyAgent())
+}
+
+const REPOSITORY = 'Lapis0x0/obsidian-yolo'
+const FEED_PATH = path.resolve('distribution/feed-v1.json')
+const SIGNATURE_PATH = path.resolve('distribution/feed-v1.sig')
+const CATALOG_PATH = path.resolve('modules/catalog-v1.json')
+const DEFAULT_MIRROR_DIR = path.resolve('.distribution-mirror')
+const DEFAULT_R2_BUCKET = 'yolo-updates'
+const R2_CONTENT_TYPES = new Map([
+  ['.js', 'application/javascript'],
+  ['.mjs', 'application/javascript'],
+  ['.json', 'application/json'],
+  ['.css', 'text/css'],
+  ['.wasm', 'application/wasm'],
+  ['.sig', 'text/plain'],
+])
+const KEY_ID = 'yolo-distribution-2026-01'
+const CORE_TAG = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2,3}$/
+const MODULE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/
+const SHA256 = /^[a-f0-9]{64}$/
+const RUNTIME_COMPONENT_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
+const MAX_FEED_BYTES = 1_000_000
+
+export async function reconcileDistribution(options = {}) {
+  const repository = options.repository ?? REPOSITORY
+  const token =
+    options.token ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN
+  const fetchImpl = options.fetchImpl ?? fetch
+  const releases =
+    options.releases ?? (await listReleases(repository, token, fetchImpl))
+  const configs = options.configs ?? (await readModuleConfigs(process.cwd()))
+  const current = await readCurrentFeed()
+  const desired = await buildDesiredSnapshot({
+    repository,
+    token,
+    fetchImpl,
+    releases,
+    configs,
+    current,
+    triggerReleaseId: options.triggerReleaseId,
+  })
+  const previousSnapshot = current
+    ? JSON.stringify({ core: current.core, modules: current.modules })
+    : null
+  const nextSnapshot = JSON.stringify({
+    core: desired.core,
+    modules: desired.modules,
+  })
+  if (previousSnapshot === nextSnapshot) {
+    return { changed: false, feed: current }
+  }
+
+  const revision = (current?.revision ?? 0) + 1
+  const feed = { schemaVersion: 1, revision, keyId: KEY_ID, ...desired }
+  const raw = encodeJson(feed)
+  if (raw.byteLength > MAX_FEED_BYTES)
+    throw new Error('Feed exceeds byte limit')
+  const signature = sign(
+    raw,
+    options.signingSecretKey ?? process.env.DISTRIBUTION_SIGNING_SECRET_KEY,
+  )
+  await mkdir(path.dirname(FEED_PATH), { recursive: true })
+  await Promise.all([
+    writeFile(FEED_PATH, raw),
+    writeFile(SIGNATURE_PATH, `${Buffer.from(signature).toString('base64')}\n`),
+    writeFile(CATALOG_PATH, encodeJson(projectCatalog(feed))),
+  ])
+  return { changed: true, feed }
+}
+
+/**
+ * Builds the local tree that `uploadSnapshotToR2` pushes to the download
+ * mirror. The mirror is a Cloudflare R2 bucket served at
+ * `updates.yoloapp.dev`, content-addressed by `mirrorPath` and latest-only:
+ * it carries just what the current Feed revision references. The
+ * authoritative copy of every artifact is the append-only `runtime-assets`
+ * Release, which clients fall back to.
+ */
+export async function buildMirrorSnapshot(options = {}) {
+  const outputDir = path.resolve(options.outputDir ?? DEFAULT_MIRROR_DIR)
+  const token =
+    options.token ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN
+  const fetchImpl = options.fetchImpl ?? fetch
+  const raw = await readFile(FEED_PATH)
+  const signature = await readFile(SIGNATURE_PATH, 'utf8')
+  const feed = JSON.parse(raw.toString('utf8'))
+  await rm(outputDir, { recursive: true, force: true })
+  await mkdir(outputDir, { recursive: true })
+  await Promise.all([
+    writeFile(path.join(outputDir, 'feed-v1.json'), raw),
+    writeFile(path.join(outputDir, 'feed-v1.sig'), signature),
+  ])
+
+  for (const asset of Object.values(feed.core.assets)) {
+    await mirrorAsset(asset, outputDir, token, fetchImpl)
+  }
+  for (const module of feed.modules) {
+    const manifestBytes = await mirrorAsset(
+      module.manifest,
+      outputDir,
+      token,
+      fetchImpl,
+    )
+    const manifest = JSON.parse(manifestBytes.toString('utf8'))
+    const files = new Map()
+    for (const variant of manifest.variants ?? []) {
+      for (const file of variant.files ?? []) files.set(file.path, file)
+    }
+    for (const file of [...files.values()].sort((a, b) =>
+      a.path.localeCompare(b.path),
+    )) {
+      await mirrorAsset(
+        {
+          name: file.name,
+          mirrorPath: `modules/${module.id}/${module.version}/${file.path}`,
+          canonicalUrl: file.url,
+          byteSize: file.byteSize,
+          sha256: file.sha256,
+        },
+        outputDir,
+        token,
+        fetchImpl,
+      )
+    }
+  }
+  const runtimeComponents = await describeRuntimeComponentArtifacts({
+    repository: REPOSITORY,
+    version: feed.core.version,
+    token,
+    fetchImpl,
+  })
+  for (const artifact of runtimeComponents) {
+    await writeMirroredAsset(artifact, artifact.bytes, outputDir)
+  }
+  return { outputDir, revision: feed.revision }
+}
+
+export async function verifyMirrorDeployment(options = {}) {
+  const baseUrl = (options.baseUrl ?? 'https://updates.yoloapp.dev').replace(
+    /\/$/,
+    '',
+  )
+  const fetchImpl = options.fetchImpl ?? fetch
+  const token =
+    options.token ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN
+  const expectedFeed = await readFile(FEED_PATH)
+  const expectedSignature = (await readFile(SIGNATURE_PATH, 'utf8')).trim()
+  const feedResponse = await fetchImpl(`${baseUrl}/feed-v1.json`, {
+    cache: 'no-store',
+  })
+  if (!feedResponse.ok)
+    throw new Error(`Mirror Feed returned HTTP ${feedResponse.status}`)
+  const actualFeed = Buffer.from(await feedResponse.arrayBuffer())
+  if (!actualFeed.equals(expectedFeed))
+    throw new Error('Mirror Feed bytes differ')
+  const signatureResponse = await fetchImpl(`${baseUrl}/feed-v1.sig`, {
+    cache: 'no-store',
+  })
+  if (!signatureResponse.ok)
+    throw new Error(
+      `Mirror signature returned HTTP ${signatureResponse.status}`,
+    )
+  if ((await signatureResponse.text()).trim() !== expectedSignature) {
+    throw new Error('Mirror signature differs')
+  }
+  const feed = JSON.parse(expectedFeed.toString('utf8'))
+  const assets = [...Object.values(feed.core.assets)]
+  for (const module of feed.modules) {
+    const manifestResponse = await fetchImpl(
+      `${baseUrl}/${module.manifest.mirrorPath}`,
+      {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(30_000),
+      },
+    )
+    if (!manifestResponse.ok) {
+      throw new Error(
+        `${module.manifest.mirrorPath} returned HTTP ${manifestResponse.status}`,
+      )
+    }
+    const manifestBytes = Buffer.from(await manifestResponse.arrayBuffer())
+    verifyBytes(manifestBytes, module.manifest)
+    const manifest = JSON.parse(manifestBytes.toString('utf8'))
+    const files = new Map()
+    for (const variant of manifest.variants ?? []) {
+      for (const file of variant.files ?? []) files.set(file.path, file)
+    }
+    for (const file of files.values()) {
+      assets.push({
+        name: file.name,
+        mirrorPath: `modules/${module.id}/${module.version}/${file.path}`,
+        canonicalUrl: file.url,
+        byteSize: file.byteSize,
+        sha256: file.sha256,
+      })
+    }
+  }
+  const runtimeComponents = await describeRuntimeComponentArtifacts({
+    repository: REPOSITORY,
+    version: feed.core.version,
+    token,
+    fetchImpl,
+  })
+  assets.push(...runtimeComponents)
+  for (const asset of assets) {
+    const response = await fetchImpl(`${baseUrl}/${asset.mirrorPath}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (!response.ok)
+      throw new Error(`${asset.mirrorPath} returned HTTP ${response.status}`)
+    verifyBytes(Buffer.from(await response.arrayBuffer()), asset)
+  }
+  return { revision: feed.revision }
+}
+
+/**
+ * Pushes a snapshot built by `buildMirrorSnapshot` to the R2 bucket backing
+ * `updates.yoloapp.dev`. R2 has no bulk-sync command, so each file is PUT
+ * individually with per-object Cache-Control (immutable content is versioned
+ * by path; the Feed itself is revalidated on every request).
+ */
+export async function uploadSnapshotToR2(options = {}) {
+  const bucket = options.bucket ?? DEFAULT_R2_BUCKET
+  const sourceDir = path.resolve(options.sourceDir ?? DEFAULT_MIRROR_DIR)
+  const run = options.run ?? runWrangler
+  const files = await listFilesRecursive(sourceDir)
+  for (const relativePath of files) {
+    const cacheControl =
+      relativePath === 'feed-v1.json' || relativePath === 'feed-v1.sig'
+        ? 'public, max-age=0, must-revalidate'
+        : 'public, max-age=31536000, immutable'
+    const contentType =
+      R2_CONTENT_TYPES.get(path.extname(relativePath)) ??
+      'application/octet-stream'
+    run([
+      'r2',
+      'object',
+      'put',
+      `${bucket}/${relativePath}`,
+      `--file=${path.join(sourceDir, relativePath)}`,
+      `--content-type=${contentType}`,
+      `--cache-control=${cacheControl}`,
+      '--remote',
+    ])
+  }
+  return { bucket, uploaded: files }
+}
+
+function runWrangler(args) {
+  execFileSync('npx', ['--no-install', 'wrangler', ...args], {
+    stdio: 'inherit',
+  })
+}
+
+async function listFilesRecursive(dir, base = dir) {
+  const entries = await readdir(dir, { withFileTypes: true })
+  const files = []
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      files.push(...(await listFilesRecursive(fullPath, base)))
+    } else if (entry.isFile()) {
+      files.push(path.relative(base, fullPath))
+    }
+  }
+  return files
+}
+
+export async function buildDesiredSnapshot({
+  repository,
+  token,
+  fetchImpl,
+  releases,
+  configs,
+  current,
+  triggerReleaseId,
+}) {
+  if (triggerReleaseId !== undefined) {
+    const found = releases.some(
+      (release) => String(release.id) === String(triggerReleaseId),
+    )
+    if (!found)
+      throw new Error(`Trigger Release was not found: ${triggerReleaseId}`)
+  }
+  const published = releases.filter(
+    (release) => !release.draft && !release.prerelease,
+  )
+  const coreRelease = highestRelease(
+    published.filter((release) => CORE_TAG.test(release.tag_name ?? '')),
+    (release) => release.tag_name,
+  )
+  if (!coreRelease) throw new Error('No published Core Release was found')
+  const core = await describeCoreRelease(
+    repository,
+    coreRelease,
+    token,
+    fetchImpl,
+  )
+  assertNoVersionRollback(current?.core, core, 'Core')
+
+  const modules = []
+  for (const config of configs.sort((a, b) => a.id.localeCompare(b.id))) {
+    const prefix = `${config.id}/v`
+    const candidates = published.filter((release) => {
+      const tag = release.tag_name ?? ''
+      return (
+        tag.startsWith(prefix) && MODULE_VERSION.test(tag.slice(prefix.length))
+      )
+    })
+    if (candidates.length === 0) {
+      if (current?.modules.some((module) => module.id === config.id)) {
+        throw new Error(`Published module disappeared: ${config.id}`)
+      }
+      continue
+    }
+    const release = highestRelease(candidates, (candidate) =>
+      candidate.tag_name.slice(prefix.length),
+    )
+    const module = await describeModuleRelease(
+      repository,
+      release,
+      config,
+      token,
+      fetchImpl,
+    )
+    assertNoVersionRollback(
+      current?.modules.find((entry) => entry.id === config.id),
+      module,
+      `Module ${config.id}`,
+    )
+    modules.push(module)
+  }
+  for (const module of current?.modules ?? []) {
+    if (!configs.some((config) => config.id === module.id)) {
+      throw new Error(`Official module config disappeared: ${module.id}`)
+    }
+  }
+  return { core, modules }
+}
+
+export function assertNewReleaseVersion(releases, tag) {
+  const published = releases.filter(
+    (release) => !release.draft && !release.prerelease,
+  )
+  let candidates
+  let version
+  if (CORE_TAG.test(tag)) {
+    version = tag
+    candidates = published.filter((release) =>
+      CORE_TAG.test(release.tag_name ?? ''),
+    )
+  } else {
+    const match = tag.match(/^([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\/v(.+)$/)
+    if (!match || !MODULE_VERSION.test(match[2])) {
+      throw new Error(`Release tag is invalid: ${tag}`)
+    }
+    const prefix = `${match[1]}/v`
+    version = match[2]
+    candidates = published.filter(
+      (release) =>
+        release.tag_name?.startsWith(prefix) &&
+        MODULE_VERSION.test(release.tag_name.slice(prefix.length)),
+    )
+  }
+  if (candidates.length === 0) return
+  const latest = highestRelease(candidates, (release) =>
+    release.tag_name.includes('/v')
+      ? release.tag_name.slice(release.tag_name.indexOf('/v') + 2)
+      : release.tag_name,
+  )
+  const latestVersion = latest.tag_name.includes('/v')
+    ? latest.tag_name.slice(latest.tag_name.indexOf('/v') + 2)
+    : latest.tag_name
+  if (compareVersions(version, latestVersion) <= 0) {
+    throw new Error(
+      `Release ${tag} must be newer than published ${latest.tag_name}`,
+    )
+  }
+}
+
+async function describeCoreRelease(repository, release, token, fetchImpl) {
+  const version = release.tag_name
+  const assets = Object.create(null)
+  for (const [key, name] of [
+    ['mainJs', 'main.js'],
+    ['manifestJson', 'manifest.json'],
+    ['stylesCss', 'styles.css'],
+  ]) {
+    const bytes = await downloadReleaseAsset(
+      requireAsset(release, name),
+      token,
+      fetchImpl,
+    )
+    assets[key] = describeAsset(
+      repository,
+      release.tag_name,
+      name,
+      `core/${version}/${name}`,
+      bytes,
+    )
+  }
+  const manifest = JSON.parse(
+    (
+      await downloadReleaseAsset(
+        requireAsset(release, 'manifest.json'),
+        token,
+        fetchImpl,
+      )
+    ).toString('utf8'),
+  )
+  if (manifest.version !== version)
+    throw new Error(`Core manifest version mismatch: ${version}`)
+  const noteAsset = release.assets?.find(
+    (asset) => asset.name === 'release-note.md',
+  )
+  const note = noteAsset
+    ? (await downloadReleaseAsset(noteAsset, token, fetchImpl)).toString('utf8')
+    : String(release.body ?? '')
+  return {
+    version,
+    minAppVersion: manifest.minAppVersion,
+    releaseUrl: release.html_url,
+    releaseNotes: splitReleaseNotes(note),
+    assets,
+  }
+}
+
+async function describeModuleRelease(
+  repository,
+  release,
+  config,
+  token,
+  fetchImpl,
+) {
+  const version = release.tag_name.slice(`${config.id}/v`.length)
+  const configAsset = release.assets?.find(
+    (asset) => asset.name === 'module-config.json',
+  )
+  const releasedConfig = configAsset
+    ? JSON.parse(
+        (await downloadReleaseAsset(configAsset, token, fetchImpl)).toString(
+          'utf8',
+        ),
+      )
+    : config
+  if (releasedConfig.id !== config.id) {
+    throw new Error(`Module config identity mismatch: ${config.id}`)
+  }
+  const manifestBytes = await downloadReleaseAsset(
+    requireAsset(release, 'module.json'),
+    token,
+    fetchImpl,
+  )
+  const manifest = JSON.parse(manifestBytes.toString('utf8'))
+  if (manifest.id !== config.id || manifest.version !== version) {
+    throw new Error(`Module manifest identity mismatch: ${config.id}`)
+  }
+  const platforms = [
+    ...new Set((manifest.variants ?? []).map((variant) => variant.platform)),
+  ].sort()
+  if (platforms.length === 0)
+    throw new Error(`Module has no platforms: ${config.id}`)
+  const noteBytes = await downloadReleaseAsset(
+    requireAsset(release, 'release-note.md'),
+    token,
+    fetchImpl,
+  )
+  const manifestDescriptor = describeAsset(
+    repository,
+    release.tag_name,
+    'module.json',
+    `modules/${config.id}/${version}/module.json`,
+    manifestBytes,
+  )
+  const noteDescriptor = describeAsset(
+    repository,
+    release.tag_name,
+    'release-note.md',
+    null,
+    noteBytes,
+  )
+  return {
+    id: config.id,
+    icon: releasedConfig.icon,
+    localizations: releasedConfig.localizations,
+    version,
+    hostApi: manifest.hostApi,
+    platforms,
+    dataSchemas: manifest.dataSchemas,
+    releaseUrl: release.html_url,
+    releaseNotes: splitReleaseNotes(noteBytes.toString('utf8')),
+    releaseNote: noteDescriptor,
+    manifest: manifestDescriptor,
+  }
+}
+
+function projectCatalog(feed) {
+  return {
+    schemaVersion: 1,
+    modules: feed.modules.map((module) => ({
+      id: module.id,
+      icon: module.icon,
+      localizations: module.localizations,
+      versions: [
+        {
+          version: module.version,
+          hostApi: module.hostApi,
+          platforms: module.platforms,
+          dataSchemas: module.dataSchemas,
+          manifestUrl: module.manifest.canonicalUrl,
+          manifest: {
+            byteSize: module.manifest.byteSize,
+            sha256: module.manifest.sha256,
+          },
+          releaseNotes: {
+            url: module.releaseNote.canonicalUrl,
+            byteSize: module.releaseNote.byteSize,
+            sha256: module.releaseNote.sha256,
+          },
+        },
+      ],
+    })),
+  }
+}
+
+async function mirrorAsset(asset, outputDir, token, fetchImpl) {
+  validateDescriptor(asset)
+  const bytes = await downloadUrl(asset.canonicalUrl, token, fetchImpl)
+  await writeMirroredAsset(asset, bytes, outputDir)
+  return bytes
+}
+
+async function writeMirroredAsset(asset, bytes, outputDir) {
+  verifyBytes(bytes, asset)
+  const target = path.resolve(outputDir, asset.mirrorPath)
+  if (!target.startsWith(`${outputDir}${path.sep}`))
+    throw new Error('Mirror path escapes output')
+  await mkdir(path.dirname(target), { recursive: true })
+  await writeFile(target, bytes)
+}
+
+export async function describeRuntimeComponentArtifacts(options) {
+  const repository = options.repository ?? REPOSITORY
+  const { version, token, fetchImpl = fetch } = options
+  if (!CORE_TAG.test(version)) {
+    throw new Error('Runtime component Core version is invalid')
+  }
+  // `registry.json` stays committed — it is the contract that declares each
+  // artifact's byteSize/sha256 — so the tag tells us exactly what this Core
+  // version shipped with.
+  const registryBytes = await downloadUrl(
+    `https://raw.githubusercontent.com/${repository}/${version}/runtime-components/registry.json`,
+    token,
+    fetchImpl,
+  )
+  let registry
+  try {
+    registry = JSON.parse(registryBytes.toString('utf8'))
+  } catch {
+    throw new Error('Runtime component registry is not valid JSON')
+  }
+  const components = validateRuntimeComponentRegistry(registry)
+  const artifacts = []
+  // The bytes themselves come from the permanent `runtime-assets` Release,
+  // never from this checkout: reconcile runs on main, which may be many
+  // component rebuilds ahead of the Core version being mirrored, so local
+  // `dist/` is simply the wrong bytes. Content addressing makes the Release
+  // correct for any version, current or historical.
+  for (const entry of listRegistryRuntimeAssets({ components })) {
+    const canonicalUrl = `https://github.com/${repository}/releases/download/${RUNTIME_ASSET_TAG}/${encodeURIComponent(entry.releaseName)}`
+    const bytes = await downloadUrl(canonicalUrl, token, fetchImpl)
+    const artifact = {
+      name: entry.name,
+      mirrorPath: `runtime-components/sha256/${entry.sha256}/${entry.name}`,
+      canonicalUrl,
+      byteSize: entry.byteSize,
+      sha256: entry.sha256,
+      bytes,
+    }
+    verifyBytes(bytes, artifact)
+    artifacts.push(artifact)
+  }
+  return artifacts
+}
+
+/**
+ * Reads a runtime component registry tagged on an arbitrary published Core
+ * version — including old releases, which only ever wrote schema v1 (no
+ * `assets`). v1 is normalized to `assets: []`; v2's `assets` (if present)
+ * is validated with the same rules as the host's own parser
+ * (`RuntimeComponentAssetDescriptor` in `runtimeComponentManifest.ts`).
+ * Unlike that host parser, this does NOT require every currently-known
+ * component id to be present — a historical tag's registry legitimately
+ * only lists whichever components existed as of that tag.
+ */
+function validateRuntimeComponentRegistry(registry) {
+  if (
+    !registry ||
+    typeof registry !== 'object' ||
+    Array.isArray(registry) ||
+    (registry.schemaVersion !== 1 && registry.schemaVersion !== 2) ||
+    !Array.isArray(registry.components) ||
+    registry.components.length === 0
+  ) {
+    throw new Error('Runtime component registry is invalid')
+  }
+  const ids = new Set()
+  return registry.components.map((descriptor) => {
+    if (
+      !descriptor ||
+      typeof descriptor !== 'object' ||
+      Array.isArray(descriptor) ||
+      typeof descriptor.id !== 'string' ||
+      !RUNTIME_COMPONENT_ID.test(descriptor.id) ||
+      ids.has(descriptor.id) ||
+      descriptor.entry !==
+        `runtime-components/${descriptor.id}/dist/entry.js` ||
+      !Number.isSafeInteger(descriptor.byteSize) ||
+      descriptor.byteSize <= 0 ||
+      typeof descriptor.sha256 !== 'string' ||
+      !SHA256.test(descriptor.sha256)
+    ) {
+      throw new Error('Runtime component registry is invalid')
+    }
+    ids.add(descriptor.id)
+    const assets =
+      registry.schemaVersion === 2
+        ? validateRuntimeComponentAssets(descriptor.id, descriptor.assets)
+        : []
+    return { ...descriptor, assets }
+  })
+}
+
+function validateRuntimeComponentAssets(componentId, assets) {
+  if (assets === undefined) return []
+  if (!Array.isArray(assets) || assets.length === 0) {
+    throw new Error('Runtime component registry is invalid')
+  }
+  const names = new Set()
+  for (const asset of assets) {
+    if (
+      !asset ||
+      typeof asset !== 'object' ||
+      Array.isArray(asset) ||
+      !isValidRuntimeComponentAssetName(asset.name) ||
+      names.has(asset.name) ||
+      asset.path !==
+        `runtime-components/${componentId}/dist/assets/${asset.name}` ||
+      !Number.isSafeInteger(asset.byteSize) ||
+      asset.byteSize <= 0 ||
+      typeof asset.sha256 !== 'string' ||
+      !SHA256.test(asset.sha256)
+    ) {
+      throw new Error('Runtime component registry is invalid')
+    }
+    names.add(asset.name)
+  }
+  return assets
+}
+
+function describeAsset(repository, tag, name, mirrorPath, bytes) {
+  return {
+    name,
+    ...(mirrorPath ? { mirrorPath } : {}),
+    canonicalUrl: `https://github.com/${repository}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`,
+    byteSize: bytes.byteLength,
+    sha256: sha256(bytes),
+  }
+}
+
+function validateDescriptor(asset) {
+  if (
+    !asset ||
+    typeof asset.name !== 'string' ||
+    typeof asset.mirrorPath !== 'string' ||
+    !asset.mirrorPath ||
+    asset.mirrorPath.startsWith('/') ||
+    asset.mirrorPath
+      .split('/')
+      .some((part) => !part || part === '.' || part === '..') ||
+    typeof asset.canonicalUrl !== 'string' ||
+    !asset.canonicalUrl.startsWith(
+      'https://github.com/Lapis0x0/obsidian-yolo/releases/download/',
+    ) ||
+    !Number.isSafeInteger(asset.byteSize) ||
+    asset.byteSize <= 0 ||
+    !SHA256.test(asset.sha256)
+  ) {
+    throw new Error('Asset descriptor is invalid')
+  }
+}
+
+function verifyBytes(bytes, descriptor) {
+  if (
+    bytes.byteLength !== descriptor.byteSize ||
+    sha256(bytes) !== descriptor.sha256
+  ) {
+    throw new Error(`Asset integrity mismatch: ${descriptor.name}`)
+  }
+}
+
+async function listReleases(repository, token, fetchImpl) {
+  const releases = []
+  for (let page = 1; ; page += 1) {
+    const response = await githubFetch(
+      `https://api.github.com/repos/${repository}/releases?per_page=100&page=${page}`,
+      token,
+      fetchImpl,
+      'application/vnd.github+json',
+    )
+    const batch = JSON.parse(await response.text())
+    if (!Array.isArray(batch))
+      throw new Error('GitHub Releases response is invalid')
+    releases.push(...batch)
+    if (batch.length < 100) return releases
+  }
+}
+
+async function readModuleConfigs(root) {
+  const entries = await readdir(path.resolve(root, 'modules'), {
+    withFileTypes: true,
+  })
+  const configs = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    try {
+      const config = JSON.parse(
+        await readFile(
+          path.resolve(root, 'modules', entry.name, 'module.config.json'),
+          'utf8',
+        ),
+      )
+      if (config.id !== entry.name)
+        throw new Error(`Module config id mismatch: ${entry.name}`)
+      configs.push(config)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+  }
+  return configs
+}
+
+async function readCurrentFeed() {
+  try {
+    return JSON.parse(await readFile(FEED_PATH, 'utf8'))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+function highestRelease(releases, versionOf) {
+  return [...releases].sort((a, b) =>
+    compareVersions(versionOf(b), versionOf(a)),
+  )[0]
+}
+
+function compareVersions(left, right) {
+  const a = left.split('.').map((part) => Number(part))
+  const b = right.split('.').map((part) => Number(part))
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const difference = (a[index] ?? 0) - (b[index] ?? 0)
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
+function assertNoVersionRollback(current, desired, label) {
+  if (current && compareVersions(desired.version, current.version) < 0) {
+    throw new Error(
+      `${label} would roll back from ${current.version} to ${desired.version}`,
+    )
+  }
+}
+
+function requireAsset(release, name) {
+  const assets = Array.isArray(release.assets) ? release.assets : []
+  const matches = assets.filter((asset) => asset.name === name)
+  if (matches.length !== 1)
+    throw new Error(`${release.tag_name} must contain one ${name}`)
+  return matches[0]
+}
+
+async function downloadReleaseAsset(asset, token, fetchImpl) {
+  if (!asset.browser_download_url) {
+    throw new Error(
+      `Release asset has no download URL: ${asset.name ?? 'unknown'}`,
+    )
+  }
+  return downloadUrl(asset.browser_download_url, token, fetchImpl)
+}
+
+async function downloadUrl(url, token, fetchImpl) {
+  const response = await githubFetch(
+    url,
+    token,
+    fetchImpl,
+    'application/octet-stream',
+  )
+  return Buffer.from(await response.arrayBuffer())
+}
+
+async function githubFetch(url, token, fetchImpl, accept) {
+  const response = await fetchImpl(url, {
+    headers: {
+      Accept: accept,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(120_000),
+  })
+  if (!response.ok)
+    throw new Error(`GET ${url} failed with HTTP ${response.status}`)
+  return response
+}
+
+function splitReleaseNotes(note) {
+  const parts = note
+    .split(/^\s*---\s*$/m)
+    .map((part) => part.trim())
+    .filter(Boolean)
+  if (parts.length !== 2)
+    throw new Error('Release note must contain two language blocks')
+  const [first, second] = parts
+  const firstCjk = (first.match(/[一-鿿]/g) ?? []).length
+  const secondCjk = (second.match(/[一-鿿]/g) ?? []).length
+  return firstCjk <= secondCjk
+    ? { en: first, zh: second }
+    : { en: second, zh: first }
+}
+
+function sign(raw, encodedSecret) {
+  if (typeof encodedSecret !== 'string' || !encodedSecret) {
+    throw new Error('DISTRIBUTION_SIGNING_SECRET_KEY is required')
+  }
+  const secret = Buffer.from(encodedSecret, 'base64')
+  const keyPair =
+    secret.byteLength === nacl.sign.seedLength
+      ? nacl.sign.keyPair.fromSeed(secret)
+      : secret.byteLength === nacl.sign.secretKeyLength
+        ? nacl.sign.keyPair.fromSecretKey(secret)
+        : null
+  if (!keyPair) throw new Error('Distribution signing secret key is invalid')
+  return nacl.sign.detached(raw, keyPair.secretKey)
+}
+
+function sha256(bytes) {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function encodeJson(value) {
+  return Buffer.from(`${JSON.stringify(value, null, 2)}\n`)
+}
+
+async function main(args) {
+  const command = args[0]
+  const values = new Map()
+  for (let index = 1; index < args.length; index += 2) {
+    const option = args[index]
+    const value = args[index + 1]
+    if (!option?.startsWith('--') || value === undefined)
+      throw new Error(`Invalid option: ${option}`)
+    values.set(option.slice(2), value)
+  }
+  if (command === 'reconcile') {
+    const result = await reconcileDistribution({
+      triggerReleaseId: values.get('trigger-release-id'),
+    })
+    console.log(
+      result.changed
+        ? `Published Feed revision ${result.feed.revision}`
+        : `Feed revision ${result.feed.revision} is current`,
+    )
+    return
+  }
+  if (command === 'assert-new-release') {
+    const tag = values.get('tag')
+    if (!tag) throw new Error('--tag is required')
+    const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN
+    const releases = await listReleases(REPOSITORY, token, fetch)
+    assertNewReleaseVersion(releases, tag)
+    console.log(`Verified that ${tag} advances its product`)
+    return
+  }
+  if (command === 'build-mirror') {
+    const result = await buildMirrorSnapshot({
+      outputDir: values.get('output-dir'),
+    })
+    console.log(
+      `Built mirror revision ${result.revision} at ${result.outputDir}`,
+    )
+    return
+  }
+  if (command === 'verify-mirror') {
+    const result = await verifyMirrorDeployment({
+      baseUrl: values.get('base-url'),
+    })
+    console.log(`Verified mirror revision ${result.revision}`)
+    return
+  }
+  if (command === 'upload-r2') {
+    const result = await uploadSnapshotToR2({
+      bucket: values.get('bucket'),
+      sourceDir: values.get('source-dir'),
+    })
+    console.log(
+      `Uploaded ${result.uploaded.length} files to R2 bucket ${result.bucket}`,
+    )
+    return
+  }
+  throw new Error(
+    'Usage: distribution.mjs <assert-new-release|reconcile|build-mirror|verify-mirror|upload-r2> [options]',
+  )
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main(process.argv.slice(2))
+}

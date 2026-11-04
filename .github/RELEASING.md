@@ -1,0 +1,60 @@
+# YOLO releases
+
+GitHub Release is the immutable archive. The signed current Feed and the
+Cloudflare R2 mirror behind `updates.yoloapp.dev` are generated after
+publication; never edit or upload them by hand.
+
+## Core
+
+```bash
+npm run release:prepare -- core <version>
+# Write latest-release-note.md.
+npm run release:check -- core <version>
+git push origin main
+git tag <version>
+git push origin <version>
+```
+
+Wait for `Release Obsidian plugin`, then `Reconcile signed update distribution`.
+
+## First-party module
+
+```bash
+npm run release:prepare -- module <id> <version>
+# Update modules/<id>/module.config.json only when product metadata changes.
+# Write modules/<id>/latest-release-note.md.
+npm run release:check -- module <id> <version>
+git push origin main
+git tag <id>/v<version>
+git push origin <id>/v<version>
+```
+
+All modules use `module-release.yml`. For a coordinated release, publish and
+fully distribute Core before tagging modules that need its Host API.
+
+## Automation and recovery
+
+The distribution workflow reconstructs the complete current snapshot from all
+published stable Releases. It only ever runs on `workflow_dispatch` — the two
+release workflows fire one at the end of a release, and there is no schedule,
+so nothing reconciles on its own. A dispatch only wakes it; every run takes the
+same reconcile path. Cloudflare failure never removes a Release or the GitHub
+Raw Feed fallback. Rerun `distribution-publish.yml` yourself; do not recreate
+or overwrite a Release.
+
+Required Actions secrets:
+
+- `DISTRIBUTION_SIGNING_SECRET_KEY`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ZONE_ID`
+
+`download-stats.yml` publishes the combined GitHub Release and Cloudflare
+mirror request total to the `download-metrics` branch once per day. In addition
+to `Account Workers R2 Storage Edit`, `CLOUDFLARE_API_TOKEN` needs `Zone
+Analytics Read` limited to `yoloapp.dev`.
+
+Before the first run, create the R2 bucket `yolo-updates`, bind
+`updates.yoloapp.dev` to it as a custom domain, and add the two Cloudflare
+secrets. Then run `distribution-publish.yml` once and verify its summary before
+releasing the first Core version that consumes the signed Feed.

@@ -1,0 +1,40 @@
+import { defineCapability } from '../define'
+import { terminalCommandDefinition } from '../terminal_command/definition'
+
+// label/description copied from the `terminal_command` entry in
+// `builtinToolUiMeta.ts`; category from `BUILTIN_TOOL_CATEGORY_MAP`
+// (`'external'`). The i18n keys are unchanged from the existing locale
+// entries. `id: 'terminal'` is a new capability id for this 1:1 tool.
+//
+// defaultEnabled/approval cross-checked against the pre-refactor sources:
+// `terminal_command` IS in `BUILTIN_DEFAULT_DISABLED_TOOL_SHORT_NAMES` ->
+// defaultEnabled: false. IS in `REQUIRE_APPROVAL_LOCAL_TOOLS` ->
+// defaultMode: 'require_approval'. IS in `ALWAYS_ALLOW_DISABLED_TOOL_NAMES`
+// -> allowAlwaysAllow: false ("禁止 always-allow 的能力：terminal、
+// vault_shell"). IS one of the three dedicated-settings tools
+// (`AgentToolsModal.tsx`'s `hasSettings` ternary) -> hasSettings: true,
+// wired to `TerminalCommandConfigModal` via `CAPABILITY_SETTINGS_LAUNCHERS`.
+export const terminalCapability = defineCapability({
+  id: 'terminal',
+  label: {
+    key: 'settings.agent.builtinTerminalCommandLabel',
+    fallback: 'Terminal Commands',
+  },
+  description: {
+    key: 'settings.agent.builtinTerminalCommandDesc',
+    fallback: 'Run commands in the local terminal. Desktop-only.',
+  },
+  category: 'external',
+  // Not in Ask: running a command is not "looking at the vault". The
+  // approval/enablement overrides that make it actually usable in Max live
+  // elsewhere — visibility and trust are separate questions.
+  chatModes: ['agent', 'max'],
+  defaultEnabled: false,
+  approval: {
+    defaultMode: 'require_approval',
+    allowedModes: ['full_access', 'require_approval'],
+    allowAlwaysAllow: false,
+  },
+  hasSettings: true,
+  tools: [terminalCommandDefinition],
+})

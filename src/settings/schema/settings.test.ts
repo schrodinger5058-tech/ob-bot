@@ -1,0 +1,737 @@
+import { DEFAULT_LOCAL_MCP_SERVER_PORT } from '../../core/mcp/localMcpServerConfig'
+import { LOCAL_EMBEDDING_PROVIDER_ID } from '../../core/rag/local-embedding/constants'
+
+import { SETTINGS_SCHEMA_VERSION } from './migrations'
+import {
+  DEFAULT_TAB_COMPLETION_LENGTH_PRESET,
+  DEFAULT_TAB_COMPLETION_OPTIONS,
+  DEFAULT_TAB_COMPLETION_SYSTEM_PROMPT,
+  DEFAULT_TAB_COMPLETION_TRIGGERS,
+} from './setting.types'
+import { parseYoloSettings } from './settings'
+
+describe('parseYoloSettings', () => {
+  it('should return default values for empty input', () => {
+    const result = parseYoloSettings({})
+    expect(result.version).toBe(SETTINGS_SCHEMA_VERSION)
+
+    expect(result.providers).toEqual([])
+
+    expect(result.chatModels).toEqual([])
+    expect(result.chatModelId).toBe('')
+    expect(result.chatTitleModelId).toBe('')
+
+    expect(result.embeddingModels).toEqual([])
+    expect(result.embeddingModelId).toBe('')
+
+    expect(result.systemPrompt).toBe('')
+    expect(result.softDismissedUpdateVersion).toBe('')
+    expect(result.mutedUpdateVersion).toBe('')
+    expect(result.mutedModuleUpdateVersions).toEqual({})
+    expect(result.pluginUpdateMode).toBe('notify')
+    expect(result.ragOptions).toMatchObject({
+      enabled: true,
+      chunkSize: 1000,
+      thresholdTokens: 20000,
+      minSimilarity: 0.0,
+      limit: 10,
+      indexPdf: true,
+      autoUpdateEnabled: true,
+      autoUpdateIntervalHours: 0,
+    })
+
+    expect(result.mcp.servers).toEqual([])
+    expect(result.mcp.discoveredCatalogs).toEqual({})
+    expect(result.yolo).toEqual({ baseDir: 'YOLO' })
+
+    expect(result.chatOptions).toMatchObject({
+      includeCurrentFileContent: true,
+      mentionDisplayMode: 'inline',
+      mentionContextMode: 'light',
+      chatInputHeight: undefined,
+      chatApplyMode: 'review-required',
+      chatMode: 'agent',
+      reasoningLevelByModelId: {},
+      chatExportIncludeThinking: false,
+      chatExportIncludeToolCalls: false,
+      lastChatSurface: 'chat',
+      lastCliRuntimeId: 'claude-code',
+    })
+
+    expect(result.notificationOptions).toMatchObject({
+      enabled: false,
+      channel: 'sound',
+      timing: 'when-unfocused',
+      notifyOnApprovalRequired: true,
+      notifyOnTaskCompleted: true,
+    })
+
+    expect(result.continuationOptions).toMatchObject({
+      enableTabCompletion: false,
+      tabCompletionSystemPrompt: DEFAULT_TAB_COMPLETION_SYSTEM_PROMPT,
+      tabCompletionLengthPreset: DEFAULT_TAB_COMPLETION_LENGTH_PRESET,
+      quickAskContextBeforeChars: 5000,
+      quickAskContextAfterChars: 2000,
+    })
+    expect(result.continuationOptions.tabCompletionOptions).toMatchObject(
+      DEFAULT_TAB_COMPLETION_OPTIONS,
+    )
+    expect(result.continuationOptions.tabCompletionTriggers).toEqual(
+      expect.arrayContaining(DEFAULT_TAB_COMPLETION_TRIGGERS),
+    )
+    expect(result.continuationOptions.continuationQuickActions).toBeUndefined()
+
+    expect(result.assistants).toEqual([])
+  })
+
+  it('defaults local MCP server settings without a schema migration', () => {
+    const result = parseYoloSettings({
+      version: 75,
+      mcp: {
+        servers: [],
+        builtinToolOptions: {},
+      },
+    })
+
+    expect(result.version).toBe(SETTINGS_SCHEMA_VERSION)
+    expect(result.mcp.localServer).toEqual({
+      enabled: false,
+      port: DEFAULT_LOCAL_MCP_SERVER_PORT,
+      token: '',
+    })
+  })
+
+  it('defaults existing tab completion triggers to insert mode', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      continuationOptions: {
+        tabCompletionTriggers: [
+          {
+            id: 'legacy-trigger',
+            type: 'regex',
+            pattern: '\\$[^$\\n]*$',
+            enabled: true,
+          },
+        ],
+      },
+    })
+
+    expect(result.continuationOptions.tabCompletionTriggers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'legacy-trigger',
+          type: 'regex',
+          pattern: '\\$[^$\\n]*$',
+          enabled: true,
+          acceptMode: 'insert',
+        }),
+      ]),
+    )
+  })
+
+  it('persists the last Chat surface and CLI provider independently', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      chatOptions: {
+        includeCurrentFileContent: true,
+        lastChatSurface: 'chat',
+        lastCliRuntimeId: 'grok',
+        cliModelIdByRuntime: { grok: 'grok-4.6' },
+        cliChatModeByRuntime: { grok: 'agent' },
+        cliAgentYoloEnabledByRuntime: { grok: false },
+      },
+    })
+
+    expect(result.chatOptions).toMatchObject({
+      lastChatSurface: 'chat',
+      lastCliRuntimeId: 'grok',
+      cliModelIdByRuntime: { grok: 'grok-4.6' },
+      cliChatModeByRuntime: { grok: 'agent' },
+      cliAgentYoloEnabledByRuntime: { grok: false },
+    })
+  })
+
+  it('preserves a legacy hidden YOLO root for the startup filesystem migration', () => {
+    expect(
+      parseYoloSettings({
+        version: SETTINGS_SCHEMA_VERSION,
+        yolo: { baseDir: '.yolo' },
+      }).yolo.baseDir,
+    ).toBe('.yolo')
+  })
+
+  it('migrates applyModelId to chatTitleModelId for legacy settings', () => {
+    const result = parseYoloSettings({
+      version: 38,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token',
+        },
+      ],
+      chatModels: [
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-5',
+          model: 'gpt-5',
+          enable: true,
+        },
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-4.1-mini',
+          model: 'gpt-4.1-mini',
+          enable: true,
+        },
+      ],
+      chatModelId: 'openai/gpt-5',
+      applyModelId: 'openai/gpt-4.1-mini',
+    })
+
+    expect(result.version).toBe(SETTINGS_SCHEMA_VERSION)
+    expect(result.chatTitleModelId).toBe('openai/gpt-4.1-mini')
+  })
+
+  it('normalizes delegate_subagent model pool to registered chat models', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiType: 'openai-compatible',
+          apiKey: 'token',
+        },
+      ],
+      chatModels: [
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-5',
+          model: 'gpt-5',
+          enable: true,
+        },
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-4.1-mini',
+          model: 'gpt-4.1-mini',
+          enable: true,
+        },
+        {
+          providerId: 'openai',
+          id: 'openai/disabled',
+          model: 'disabled',
+          enable: false,
+        },
+      ],
+      chatModelId: 'openai/gpt-5',
+      mcp: {
+        servers: [],
+        builtinCapabilityOptions: {
+          subagent_delegation: {
+            allowedModelIds: [
+              'openai/gpt-4.1-mini',
+              'openai/disabled',
+              'missing/model',
+            ],
+            preferredModelId: 'missing/model',
+          },
+        },
+      },
+    })
+
+    expect(
+      result.mcp.builtinCapabilityOptions.subagent_delegation?.allowedModelIds,
+    ).toEqual(['openai/gpt-4.1-mini', 'openai/disabled'])
+    expect(
+      result.mcp.builtinCapabilityOptions.subagent_delegation?.preferredModelId,
+    ).toBe('openai/gpt-4.1-mini')
+  })
+
+  it('initializes missing delegate_subagent model pool with the default chat model only', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiType: 'openai-compatible',
+          apiKey: 'token',
+        },
+      ],
+      chatModels: [
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-5',
+          model: 'gpt-5',
+          enable: true,
+        },
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-4.1-mini',
+          model: 'gpt-4.1-mini',
+          enable: true,
+        },
+      ],
+      chatModelId: 'openai/gpt-5',
+      mcp: {
+        servers: [],
+        builtinCapabilityOptions: {},
+      },
+    })
+
+    expect(
+      result.mcp.builtinCapabilityOptions.subagent_delegation?.allowedModelIds,
+    ).toEqual(['openai/gpt-5'])
+    expect(
+      result.mcp.builtinCapabilityOptions.subagent_delegation?.preferredModelId,
+    ).toBe('openai/gpt-5')
+  })
+
+  it('does not add retired qwen oauth defaults to version 41 settings', () => {
+    const result = parseYoloSettings({
+      version: 41,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token',
+        },
+      ],
+      chatModels: [
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-5',
+          model: 'gpt-5',
+          enable: true,
+        },
+      ],
+    })
+
+    expect(
+      result.providers.some((provider) => provider.id === 'qwen-oauth'),
+    ).toBe(false)
+    expect(
+      result.chatModels.some((model) => model.providerId === 'qwen-oauth'),
+    ).toBe(false)
+  })
+
+  it('preserves existing qwen oauth settings as a custom provider', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'qwen-oauth',
+          presetType: 'qwen-oauth',
+          apiType: 'openai-compatible',
+          baseUrl: 'https://example.com/v1',
+          apiKey: 'existing-token',
+          additionalSettings: { requestTransportMode: { desktop: 'node' } },
+          customHeaders: [{ key: 'X-Test', value: 'preserved' }],
+        },
+      ],
+      chatModels: [
+        {
+          id: 'qwen-oauth/coder-model',
+          providerId: 'qwen-oauth',
+          model: 'coder-model',
+          name: 'Existing Qwen model',
+          enable: false,
+          temperature: 0.4,
+        },
+      ],
+      chatModelId: 'qwen-oauth/coder-model',
+      chatTitleModelId: 'qwen-oauth/coder-model',
+    })
+
+    expect(result.providers).toEqual([
+      {
+        id: 'qwen-oauth',
+        presetType: 'openai-compatible',
+        apiType: 'openai-compatible',
+        baseUrl: 'https://example.com/v1',
+        apiKey: 'existing-token',
+        additionalSettings: { requestTransportMode: { desktop: 'node' } },
+        customHeaders: [{ key: 'X-Test', value: 'preserved' }],
+      },
+    ])
+    expect(result.chatModels).toEqual([
+      expect.objectContaining({
+        id: 'qwen-oauth/coder-model',
+        providerId: 'qwen-oauth',
+        model: 'coder-model',
+        name: 'Existing Qwen model',
+        enable: false,
+        temperature: 0.4,
+      }),
+    ])
+    expect(result.chatModelId).toBe('qwen-oauth/coder-model')
+    expect(result.chatTitleModelId).toBe('qwen-oauth/coder-model')
+  })
+
+  it('migrates legacy rag auto update interval 24 hours to 0', () => {
+    const result = parseYoloSettings({
+      version: 43,
+      ragOptions: {
+        autoUpdateEnabled: true,
+        autoUpdateIntervalHours: 24,
+      },
+    })
+
+    expect(result.version).toBe(SETTINGS_SCHEMA_VERSION)
+    expect(result.ragOptions.autoUpdateIntervalHours).toBe(0)
+  })
+
+  it('migrates version 66 settings to include update dismissal state', () => {
+    const result = parseYoloSettings({
+      version: 66,
+    })
+
+    expect(result.version).toBe(SETTINGS_SCHEMA_VERSION)
+    expect(result.softDismissedUpdateVersion).toBe('')
+    expect(result.mutedUpdateVersion).toBe('')
+  })
+
+  // Regression: previously the entry with an unrecognized presetType was
+  // silently dropped by `resilientArraySchema`. When users sync settings from
+  // a newer plugin version (with a preset this version doesn't know yet),
+  // that drop was wiping providers across devices. Unknown presets must now
+  // degrade to `openai-compatible` and stay in the list.
+  it('preserves providers with unknown presetType by coercing to openai-compatible', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token',
+        },
+        {
+          id: 'from-future',
+          presetType: 'not-a-provider',
+        },
+      ],
+    })
+
+    expect(result.providers).toEqual([
+      {
+        id: 'openai',
+        presetType: 'openai',
+        apiType: 'openai-responses',
+        apiKey: 'token',
+      },
+      {
+        id: 'from-future',
+        presetType: 'openai-compatible',
+        apiType: 'openai-compatible',
+      },
+    ])
+  })
+
+  it('normalizes legacy kimi providers without clearing the provider list', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'moonshot',
+          presetType: 'kimi',
+          apiKey: 'token',
+        },
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token-2',
+        },
+      ],
+    })
+
+    expect(result.providers).toEqual([
+      {
+        id: 'moonshot',
+        presetType: 'moonshot',
+        apiType: 'openai-compatible',
+        apiKey: 'token',
+      },
+      {
+        id: 'openai',
+        presetType: 'openai',
+        apiType: 'openai-responses',
+        apiKey: 'token-2',
+      },
+    ])
+  })
+
+  it('drops orphan chat and embedding models when their providers are missing', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token',
+        },
+      ],
+      chatModels: [
+        {
+          providerId: 'openai',
+          id: 'openai/gpt-5',
+          model: 'gpt-5',
+          enable: true,
+        },
+        {
+          providerId: 'missing-provider',
+          id: 'missing/model',
+          model: 'missing',
+          enable: true,
+        },
+      ],
+      embeddingModels: [
+        {
+          providerId: 'missing-provider',
+          id: 'missing/embed',
+          model: 'missing-embed',
+          dimension: 1024,
+        },
+      ],
+      chatModelId: 'missing/model',
+      chatTitleModelId: 'missing/model',
+      embeddingModelId: 'missing/embed',
+      continuationOptions: {
+        continuationModelId: 'missing/model',
+        tabCompletionModelId: 'missing/model',
+      },
+      learningOptions: { modelId: 'missing/model' },
+      assistants: [
+        {
+          id: 'assistant-1',
+          name: 'Assistant 1',
+          modelId: 'missing/model',
+        },
+      ],
+      currentAssistantId: 'missing-assistant',
+      quickAskAssistantId: 'missing-assistant',
+    })
+
+    expect(result.chatModels).toEqual([
+      {
+        providerId: 'openai',
+        id: 'openai/gpt-5',
+        model: 'gpt-5',
+        enable: true,
+      },
+    ])
+    expect(result.embeddingModels).toEqual([])
+    expect(result.chatModelId).toBe('openai/gpt-5')
+    expect(result.chatTitleModelId).toBe('openai/gpt-5')
+    expect(result.embeddingModelId).toBe('')
+    expect(result.continuationOptions.continuationModelId).toBe('openai/gpt-5')
+    expect(result.continuationOptions.tabCompletionModelId).toBe('openai/gpt-5')
+    expect(result.learningOptions).toEqual({ modelId: 'missing/model' })
+    expect(result.assistants).toEqual([
+      {
+        id: 'assistant-1',
+        name: 'Assistant 1',
+        modelId: undefined,
+        systemPrompt: '',
+      },
+    ])
+    expect(result.currentAssistantId).toBeUndefined()
+    expect(result.quickAskAssistantId).toBeUndefined()
+  })
+
+  it('keeps yolo-local embedding models even though no matching provider record exists', () => {
+    // `yolo-local` is a reserved providerId for on-device embedding models —
+    // it deliberately never has a `settings.providers` entry. Regression test for a bug
+    // where `normalizeYoloSettingsReferences` treated that as "orphaned" and
+    // silently deleted the model on every settings save.
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token',
+        },
+      ],
+      embeddingModels: [
+        {
+          providerId: LOCAL_EMBEDDING_PROVIDER_ID,
+          id: 'local/bge-small-en-v1.5',
+          model: 'bge-small-en-v1.5',
+          name: 'BGE Small (English)',
+          dimension: 384,
+        },
+      ],
+      embeddingModelId: 'local/bge-small-en-v1.5',
+    })
+
+    expect(result.embeddingModels).toEqual([
+      {
+        providerId: LOCAL_EMBEDDING_PROVIDER_ID,
+        id: 'local/bge-small-en-v1.5',
+        model: 'bge-small-en-v1.5',
+        name: 'BGE Small (English)',
+        dimension: 384,
+      },
+    ])
+    expect(result.embeddingModelId).toBe('local/bge-small-en-v1.5')
+  })
+
+  it('preserves legacy learning settings as an opaque handoff payload', () => {
+    const learningOptions = {
+      modelId: 'openai/disabled',
+      betaNoticeAcknowledged: true,
+      futureField: { enabled: true },
+    }
+    expect(
+      parseYoloSettings({
+        version: SETTINGS_SCHEMA_VERSION,
+        learningOptions,
+      }).learningOptions,
+    ).toEqual(learningOptions)
+  })
+
+  it('clears invalid model references when no valid models remain after parsing', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token',
+        },
+      ],
+      chatModels: [
+        {
+          providerId: 'openai',
+          id: '',
+          model: 'broken',
+          enable: true,
+        },
+      ],
+      embeddingModels: [
+        {
+          providerId: 'openai',
+          id: '',
+          model: 'broken-embed',
+          dimension: 1024,
+        },
+      ],
+      chatModelId: 'broken/model',
+      chatTitleModelId: 'broken/model',
+      embeddingModelId: 'broken/embed',
+      continuationOptions: {
+        continuationModelId: 'broken/model',
+        tabCompletionModelId: 'broken/model',
+      },
+      learningOptions: { modelId: 'broken/model' },
+    })
+
+    expect(result.chatModels).toEqual([])
+    expect(result.embeddingModels).toEqual([])
+    expect(result.chatModelId).toBe('')
+    expect(result.chatTitleModelId).toBe('')
+    expect(result.embeddingModelId).toBe('')
+    expect(result.continuationOptions.continuationModelId).toBe('')
+    expect(result.continuationOptions.tabCompletionModelId).toBe('')
+    expect(result.learningOptions).toEqual({ modelId: 'broken/model' })
+  })
+
+  it('deduplicates embedding models with the same provider and model', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      providers: [
+        {
+          id: 'openai',
+          presetType: 'openai',
+          apiKey: 'token',
+        },
+      ],
+      embeddingModels: [
+        {
+          providerId: 'openai',
+          id: 'openai/text-embedding-3-large',
+          model: 'text-embedding-3-large',
+          name: 'text-embedding-3-large',
+          dimension: 3072,
+        },
+        {
+          providerId: 'openai',
+          id: 'openai/text-embedding-3-large-2',
+          model: 'text-embedding-3-large',
+          name: 'text-embedding-3-large',
+          dimension: 3072,
+        },
+      ],
+      embeddingModelId: 'openai/text-embedding-3-large-2',
+    })
+
+    expect(result.embeddingModels).toEqual([
+      {
+        providerId: 'openai',
+        id: 'openai/text-embedding-3-large',
+        model: 'text-embedding-3-large',
+        name: 'text-embedding-3-large',
+        dimension: 3072,
+      },
+    ])
+    expect(result.embeddingModelId).toBe('openai/text-embedding-3-large')
+  })
+
+  it('defaults knowledgeBases to an empty array for empty input, including after the 81->82 migration', () => {
+    const empty = parseYoloSettings({})
+    expect(empty.knowledgeBases).toEqual([])
+
+    // A pre-multi-kb settings blob (version 81, no `knowledgeBases` key) runs
+    // through migrateFrom81To82, which deliberately does not synthesize one
+    // (see 81_to_82.test.ts) — the field is filled in by the schema default.
+    const migrated = parseYoloSettings({ version: 81 })
+    expect(migrated.knowledgeBases).toEqual([])
+  })
+
+  it('trims knowledge base names and drops an entry missing a required id while keeping valid siblings', () => {
+    const result = parseYoloSettings({
+      version: SETTINGS_SCHEMA_VERSION,
+      knowledgeBases: [
+        {
+          id: 'kb-a',
+          name: '  Notes  ',
+          description: '',
+          include: [],
+          exclude: [],
+        },
+        { id: 'kb-b', name: 'Second' }, // missing `description`/`include`/`exclude` — survive via `.catch()`
+        { name: 'no id at all' }, // missing required `id` — dropped by resilientArraySchema
+      ],
+    })
+
+    expect(result.knowledgeBases).toEqual([
+      { id: 'kb-a', name: 'Notes', description: '', include: [], exclude: [] },
+      { id: 'kb-b', name: 'Second', description: '', include: [], exclude: [] },
+    ])
+  })
+
+  it('throws instead of yielding defaults when two knowledge bases share an id or name', () => {
+    // A duplicate fails the whole field, which fails the whole settings
+    // parse (see knowledgeBasesFieldSchema's doc comment).
+    expect(() =>
+      parseYoloSettings({
+        version: SETTINGS_SCHEMA_VERSION,
+        chatModelId: 'kept-on-disk',
+        knowledgeBases: [
+          { id: 'dup', name: 'A', description: '', include: [], exclude: [] },
+          { id: 'dup', name: 'B', description: '', include: [], exclude: [] },
+        ],
+      }),
+    ).toThrow()
+
+    expect(() =>
+      parseYoloSettings({
+        version: SETTINGS_SCHEMA_VERSION,
+        knowledgeBases: [
+          { id: 'a', name: 'Same', description: '', include: [], exclude: [] },
+          { id: 'b', name: 'same', description: '', include: [], exclude: [] }, // case-insensitive collision
+        ],
+      }),
+    ).toThrow()
+  })
+})

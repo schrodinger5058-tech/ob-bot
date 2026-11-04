@@ -1,0 +1,110 @@
+// Pure marquee-selection math: normalizing a drag gesture's two corner
+// points into a world-space rectangle, and hit-testing board nodes against
+// it ("框选"). The canvas UI (src/ui/canvas.ts) owns the actual overlay div
+// and the screen->world conversion (via ./camera's `screenToWorld`) — this
+// module only ever sees plain world-space points/rects, keeping it DOM-free
+// like every other domain/ module.
+//
+// Selection itself (which ids are currently selected) is UI state, not board
+// data (it has no `.yoloboard` representation) — this module never touches
+// `Board`, only plain rects.
+
+import type { ScreenPoint } from './camera'
+import type { VirtualCardRect, WorldRect } from './virtualization'
+
+/**
+ * Normalizes two arbitrary corner points (the drag's start and current/end
+ * position, in the same coordinate space) into a `WorldRect` regardless of
+ * which direction the user dragged.
+ */
+export function marqueeRectFromPoints(
+  a: ScreenPoint,
+  b: ScreenPoint,
+): WorldRect {
+  return {
+    left: Math.min(a.x, b.x),
+    top: Math.min(a.y, b.y),
+    right: Math.max(a.x, b.x),
+    bottom: Math.max(a.y, b.y),
+  }
+}
+
+/**
+ * Same open-interval intersection test as virtualization.ts's viewport
+ * check, deliberately re-derived rather than imported/shared: this one
+ * answers "does the user's marquee rectangle select this card" (a UI/input
+ * concern), while virtualization's answers "is this card visible" (a
+ * rendering concern) — the two happen to share a formula today but are free
+ * to diverge (e.g. marquee could switch to full-containment) without
+ * coupling the two modules.
+ */
+function intersects(card: VirtualCardRect, rect: WorldRect): boolean {
+  return (
+    card.x < rect.right &&
+    card.x + card.w > rect.left &&
+    card.y < rect.bottom &&
+    card.y + card.h > rect.top
+  )
+}
+
+/** Ids of every node intersecting `rect`, in the input nodes' order. */
+export function nodesInMarquee(
+  nodes: readonly VirtualCardRect[],
+  rect: WorldRect,
+): string[] {
+  return nodes.filter((node) => intersects(node, rect)).map((node) => node.id)
+}
+
+/**
+ * The node a world-space point lands on, or null for open canvas. Later nodes
+ * paint over earlier ones, so the scan runs backwards and the topmost one
+ * wins — the same card the user sees under the pointer.
+ *
+ * Answering this from geometry rather than from an event's target is not a
+ * preference: a gesture that captured the pointer retargets every mouse event
+ * after it to the capturing element, so `click`/`dblclick` on a card arrive
+ * naming the viewport (see ui/canvas/interactionController.ts's
+ * onDoubleClick).
+ */
+export function nodeAtPoint(
+  nodes: readonly VirtualCardRect[],
+  point: ScreenPoint,
+): string | null {
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const card = nodes[index]
+    if (
+      point.x >= card.x &&
+      point.x <= card.x + card.w &&
+      point.y >= card.y &&
+      point.y <= card.y + card.h
+    ) {
+      return card.id
+    }
+  }
+  return null
+}
+
+/**
+ * The smallest of `frames` that contains `point`, or null — which group a
+ * pointer is inside when groups nest. The innermost is the one a press there
+ * would be about (a card dropped there joins it, a label nearest the pointer
+ * names it), so it is the one to point out.
+ */
+export function innermostFrameAt(
+  frames: readonly VirtualCardRect[],
+  point: ScreenPoint,
+): string | null {
+  let best: VirtualCardRect | null = null
+  for (const frame of frames) {
+    if (
+      point.x < frame.x ||
+      point.x > frame.x + frame.w ||
+      point.y < frame.y ||
+      point.y > frame.y + frame.h
+    ) {
+      continue
+    }
+    if (best === null || frame.w * frame.h < best.w * best.h) best = frame
+  }
+  return best?.id ?? null
+}

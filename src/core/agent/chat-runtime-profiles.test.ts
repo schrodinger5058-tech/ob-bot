@@ -1,0 +1,617 @@
+import type { RegisteredModuleChatModeV1 } from '../modules/moduleChatModeRegistry'
+import { getToolNamesForCapability, listCapabilities } from '../tools/registry'
+
+import {
+  ASSISTANT_INERT_BUILTIN_TOOL_NAMES,
+  resolveChatModeRuntime,
+  resolveNativeToolPolicy,
+} from './chat-runtime-profiles'
+
+function moduleChatMode(
+  overrides: Partial<RegisteredModuleChatModeV1['mode']> = {},
+): RegisteredModuleChatModeV1 {
+  return {
+    fullModeId: 'module:learning:chat',
+    moduleId: 'learning',
+    serverName: 'module-mode-learning-chat',
+    availability: { status: 'available' },
+    mode: {
+      id: 'chat',
+      label: { en: 'Learning' },
+      personaPrompt: 'You are the learning course assistant.',
+      capability: 'vault-read',
+      tools: [
+        {
+          name: 'start_course_generation',
+          description: 'Start generating a course.',
+          inputSchema: { type: 'object', properties: {} },
+          handler: async () => ({ ok: true }),
+          requiresApproval: true,
+        },
+        {
+          name: 'get_generation_status',
+          description: 'Get generation status.',
+          inputSchema: { type: 'object', properties: {} },
+          handler: async () => ({ ok: true }),
+        },
+      ],
+      ...overrides,
+    } as RegisteredModuleChatModeV1['mode'],
+  }
+}
+
+describe('resolveChatModeRuntime module chat mode branch', () => {
+  const assistant = {
+    toolPreferences: {
+      yolo_local__fs_write: {
+        enabled: true,
+        approvalMode: 'require_approval' as const,
+      },
+    },
+    toolServerPreferences: {
+      playwright: { approvalMode: 'full_access' as const },
+    },
+  }
+
+  it('grants the capability tier host tools + all mode tool names, ignoring the assistant enable/tool-preference toggles entirely', () => {
+    const registered = moduleChatMode()
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      assistant,
+      assistantEnabledToolNames: [], // the assistant's tool set is irrelevant here
+      moduleChatMode: registered,
+    })
+
+    expect(runtime.loopConfig).toEqual({
+      maxAutoIterations: 100,
+    })
+    expect(runtime.allowedToolNames).toEqual(
+      expect.arrayContaining([
+        'yolo_local__bash',
+        'module-mode-learning-chat__start_course_generation',
+        'module-mode-learning-chat__get_generation_status',
+      ]),
+    )
+    // vault-read must not also grant the write tool.
+    expect(runtime.allowedToolNames).not.toContain('yolo_local__fs_edit')
+    expect(runtime.toolPreferences).toBeUndefined()
+    expect(runtime.toolServerPreferences).toBeUndefined()
+  })
+
+  it('sets bashReadOnly from the capability profile (vault-read → true)', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      assistantEnabledToolNames: [],
+      moduleChatMode: moduleChatMode(),
+    })
+    expect(runtime.bashReadOnly).toBe(true)
+  })
+
+  it('sets bashReadOnly to false for vault-write capability', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      assistantEnabledToolNames: [],
+      moduleChatMode: moduleChatMode({ capability: 'vault-write' }),
+    })
+    expect(runtime.bashReadOnly).toBe(false)
+    expect(runtime.allowedToolNames).toEqual(
+      expect.arrayContaining(['yolo_local__bash', 'yolo_local__fs_edit']),
+    )
+  })
+
+  it('never bypasses tool approval, even with yoloEnabled true', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      yoloEnabled: true,
+      assistantEnabledToolNames: [],
+      moduleChatMode: moduleChatMode(),
+    })
+    expect(runtime.bypassToolApproval).toBe(false)
+  })
+
+  it("maps capability 'none' to runtimeMode 'ask', others to 'agent'", () => {
+    expect(
+      resolveChatModeRuntime({
+        mode: 'module:learning:chat',
+        assistantEnabledToolNames: [],
+        moduleChatMode: moduleChatMode({ capability: 'none' }),
+      }).runtimeMode,
+    ).toBe('ask')
+    expect(
+      resolveChatModeRuntime({
+        mode: 'module:learning:chat',
+        assistantEnabledToolNames: [],
+        moduleChatMode: moduleChatMode({ capability: 'vault-read' }),
+      }).runtimeMode,
+    ).toBe('agent')
+  })
+
+  it('carries the persona prompt, owning module id, and useAssistant: false', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      assistantEnabledToolNames: [],
+      moduleChatMode: moduleChatMode(),
+    })
+    expect(runtime.modePersonaPrompt).toBe(
+      'You are the learning course assistant.',
+    )
+    expect(runtime.modePersonaModuleId).toBe('learning')
+    expect(runtime.moduleChatModeId).toBe('module:learning:chat')
+    expect(runtime.contextPolicy).toEqual({ useAssistant: false })
+  })
+
+  it("builds moduleToolApprovalPolicies keyed by full tool name from each tool's requiresApproval", () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      assistantEnabledToolNames: [],
+      moduleChatMode: moduleChatMode(),
+    })
+    expect(runtime.moduleToolApprovalPolicies).toEqual(
+      new Map([
+        ['module-mode-learning-chat__start_course_generation', true],
+        ['module-mode-learning-chat__get_generation_status', false],
+      ]),
+    )
+  })
+
+  it('builds an empty moduleToolApprovalPolicies map when the mode declares no tools', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      assistantEnabledToolNames: [],
+      moduleChatMode: moduleChatMode({ tools: undefined }),
+    })
+    expect(runtime.moduleToolApprovalPolicies).toEqual(new Map())
+  })
+
+  it('falls back to the built-in branch when moduleChatMode is missing (defensive)', () => {
+    // Callers are expected to resolve the effective mode before calling —
+    // this only guards against a mismatched/missing lookup rather than
+    // throwing.
+    const runtime = resolveChatModeRuntime({
+      mode: 'module:learning:chat',
+      assistant,
+      assistantEnabledToolNames: ['yolo_local__fs_read'],
+    })
+    expect(runtime.bashReadOnly).toBe(false)
+    expect(runtime.contextPolicy).toEqual({ useAssistant: true })
+    expect(runtime.moduleToolApprovalPolicies).toBeUndefined()
+  })
+})
+
+describe('resolveChatModeRuntime', () => {
+  const assistantEnabledToolNames = [
+    'yolo_local__fs_read',
+    'yolo_local__fs_write',
+    'yolo_local__terminal_command',
+  ]
+
+  const assistant = {
+    toolPreferences: {
+      yolo_local__fs_write: {
+        enabled: true,
+        approvalMode: 'require_approval' as const,
+      },
+    },
+    toolServerPreferences: {
+      playwright: { approvalMode: 'full_access' as const },
+    },
+  }
+
+  it('filters write tools in ask mode and disables bypass', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'ask',
+      assistant,
+      assistantEnabledToolNames,
+    })
+
+    expect(runtime.allowedToolNames).toEqual(['yolo_local__fs_read'])
+    expect(runtime.toolPreferences).toBeUndefined()
+    expect(runtime.toolServerPreferences).toBeUndefined()
+    expect(runtime.bypassToolApproval).toBe(false)
+    expect(runtime.runtimeMode).toBe('ask')
+  })
+
+  it('keeps full tool set in agent mode with per-tool preferences', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'agent',
+      assistant,
+      assistantEnabledToolNames,
+    })
+
+    expect(runtime.allowedToolNames).toEqual(assistantEnabledToolNames)
+    expect(runtime.toolPreferences).toEqual(assistant.toolPreferences)
+    expect(runtime.toolServerPreferences).toEqual(
+      assistant.toolServerPreferences,
+    )
+    expect(runtime.bypassToolApproval).toBe(false)
+    expect(runtime.runtimeMode).toBe('agent')
+  })
+
+  it('enables bypass only when agent mode and YOLO are combined', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'agent',
+      yoloEnabled: true,
+      assistant,
+      assistantEnabledToolNames,
+    })
+
+    expect(runtime.allowedToolNames).toEqual(assistantEnabledToolNames)
+    expect(runtime.toolPreferences).toEqual(assistant.toolPreferences)
+    expect(runtime.toolServerPreferences).toEqual(
+      assistant.toolServerPreferences,
+    )
+    expect(runtime.bypassToolApproval).toBe(true)
+    expect(runtime.runtimeMode).toBe('agent')
+  })
+
+  it('ignores YOLO outside agent mode', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'ask',
+      yoloEnabled: true,
+      assistant,
+      assistantEnabledToolNames,
+    })
+
+    expect(runtime.bypassToolApproval).toBe(false)
+  })
+
+  // Per-mode visibility comes entirely from each capability's own
+  // `chatModes`; the table itself is locked by
+  // `core/tools/registry.test.ts`. These cases pin the *behavior* that
+  // derivation has to produce at this layer.
+  it('withholds every write/plan capability from ask mode', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'ask',
+      assistant,
+      assistantEnabledToolNames: [
+        'yolo_local__fs_read',
+        'yolo_local__fs_edit',
+        'yolo_local__fs_write',
+        'yolo_local__terminal_command',
+        'yolo_local__todo_write',
+        // bash stays: vault_shell declares 'ask'.
+        'yolo_local__bash',
+      ],
+    })
+
+    expect(runtime.allowedToolNames).toEqual([
+      'yolo_local__fs_read',
+      'yolo_local__bash',
+    ])
+  })
+
+  it('leaves tools it does not own alone (MCP servers, module tool sets)', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'ask',
+      assistant,
+      assistantEnabledToolNames: [
+        'playwright__browser_click',
+        'yolo_whiteboard__create_board',
+        'yolo_local__fs_write',
+      ],
+    })
+
+    expect(runtime.allowedToolNames).toEqual([
+      'playwright__browser_click',
+      'yolo_whiteboard__create_board',
+    ])
+  })
+
+  it('blocks todo_write in ask mode, same as the other blocked tools', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'ask',
+      assistant,
+      assistantEnabledToolNames: [
+        'yolo_local__fs_read',
+        'yolo_local__todo_write',
+      ],
+    })
+
+    expect(runtime.allowedToolNames).toEqual(['yolo_local__fs_read'])
+  })
+
+  it('allows todo_write in agent mode', () => {
+    const runtime = resolveChatModeRuntime({
+      mode: 'agent',
+      assistant,
+      assistantEnabledToolNames: [
+        'yolo_local__fs_read',
+        'yolo_local__todo_write',
+      ],
+    })
+
+    expect(runtime.allowedToolNames).toEqual([
+      'yolo_local__fs_read',
+      'yolo_local__todo_write',
+    ])
+  })
+
+  // YOLO Max is the third built-in mode: same runtime shape as Agent, a
+  // different capability grant.
+  describe('max mode', () => {
+    // Everything an assistant could have enabled, so the assertions below
+    // measure what the *mode* grants rather than what the fixture happened to
+    // list.
+    const everyBuiltinTool = [
+      'yolo_local__fs_read',
+      'yolo_local__fs_edit',
+      'yolo_local__fs_write',
+      'yolo_local__bash',
+      'yolo_local__js_eval',
+      'yolo_local__read_file',
+      'yolo_local__write_file',
+      'yolo_local__edit_file',
+      'yolo_local__terminal_command',
+      'yolo_local__todo_write',
+      'yolo_local__web_search',
+      'yolo_local__delegate_subagent',
+      'yolo_local__ask_user_question',
+      'yolo_local__context_compact',
+      'playwright__browser_click',
+    ]
+
+    it('exposes the native file tools and the real terminal, and hides the vault-API tools they replace', () => {
+      const runtime = resolveChatModeRuntime({
+        mode: 'max',
+        assistant,
+        assistantEnabledToolNames: everyBuiltinTool,
+      })
+
+      expect(runtime.allowedToolNames).toEqual([
+        'yolo_local__read_file',
+        'yolo_local__write_file',
+        'yolo_local__edit_file',
+        'yolo_local__terminal_command',
+        'yolo_local__todo_write',
+        'yolo_local__web_search',
+        'yolo_local__delegate_subagent',
+        'yolo_local__ask_user_question',
+        'yolo_local__context_compact',
+        // Not this layer's business — MCP servers pass through untouched.
+        'playwright__browser_click',
+      ])
+      // The vault-API file tools, the virtual bash, and js_eval are the four
+      // Max drops.
+      expect(runtime.allowedToolNames).not.toContain('yolo_local__fs_read')
+      expect(runtime.allowedToolNames).not.toContain('yolo_local__fs_edit')
+      expect(runtime.allowedToolNames).not.toContain('yolo_local__fs_write')
+      expect(runtime.allowedToolNames).not.toContain('yolo_local__bash')
+      expect(runtime.allowedToolNames).not.toContain('yolo_local__js_eval')
+    })
+
+    it('runs the same loop and assistant wiring as agent mode', () => {
+      const runtime = resolveChatModeRuntime({
+        mode: 'max',
+        assistant,
+        assistantEnabledToolNames,
+      })
+
+      expect(runtime.loopConfig).toEqual({
+        maxAutoIterations: 100,
+      })
+      expect(runtime.toolPreferences).toEqual(assistant.toolPreferences)
+      expect(runtime.toolServerPreferences).toEqual(
+        assistant.toolServerPreferences,
+      )
+      expect(runtime.bashReadOnly).toBe(false)
+      expect(runtime.contextPolicy).toEqual({ useAssistant: true })
+      expect(runtime.runtimeMode).toBe('max')
+    })
+
+    it('honours its own YOLO flag', () => {
+      expect(
+        resolveChatModeRuntime({
+          mode: 'max',
+          assistant,
+          assistantEnabledToolNames,
+        }).bypassToolApproval,
+      ).toBe(false)
+      expect(
+        resolveChatModeRuntime({
+          mode: 'max',
+          yoloEnabled: true,
+          assistant,
+          assistantEnabledToolNames,
+        }).bypassToolApproval,
+      ).toBe(true)
+    })
+
+    it('grants native_files and the terminal unconditionally, and opens always-allow on the terminal', () => {
+      const overrides = resolveChatModeRuntime({
+        mode: 'max',
+        assistant,
+        assistantEnabledToolNames,
+      }).capabilityOverrides
+      expect([...(overrides ?? [])]).toEqual([
+        ['native_files', { forceEnabled: true }],
+        ['terminal', { forceEnabled: true, allowAlwaysAllow: true }],
+      ])
+    })
+
+    it('keeps a forced capability in the tool set even when the assistant has it off', () => {
+      // The assistant enabled neither native_files nor terminal — Max grants
+      // them anyway, which is what makes "Max is a real terminal" true rather
+      // than conditional on an unrelated Agent-mode switch.
+      const runtime = resolveChatModeRuntime({
+        mode: 'max',
+        assistant,
+        assistantEnabledToolNames: ['yolo_local__todo_write'],
+      })
+      expect(runtime.allowedToolNames).toEqual([
+        'yolo_local__todo_write',
+        'yolo_local__read_file',
+        'yolo_local__write_file',
+        'yolo_local__edit_file',
+        'yolo_local__terminal_command',
+      ])
+    })
+
+    it('adds each forced tool once even when the assistant already enabled it', () => {
+      const runtime = resolveChatModeRuntime({
+        mode: 'max',
+        assistant,
+        assistantEnabledToolNames: ['yolo_local__terminal_command'],
+      })
+      expect(runtime.allowedToolNames).toEqual([
+        'yolo_local__terminal_command',
+        'yolo_local__read_file',
+        'yolo_local__write_file',
+        'yolo_local__edit_file',
+      ])
+    })
+
+    it('leaves ask and agent with no capability override and no vault boundary', () => {
+      for (const mode of ['ask', 'agent'] as const) {
+        const runtime = resolveChatModeRuntime({
+          mode,
+          assistant,
+          assistantEnabledToolNames,
+        })
+        expect(runtime.capabilityOverrides).toBeUndefined()
+        expect(runtime.vaultPathBoundary).toBeUndefined()
+      }
+    })
+
+    it('carries no vault boundary without an app to locate the vault with', () => {
+      expect(
+        resolveChatModeRuntime({
+          mode: 'max',
+          assistant,
+          assistantEnabledToolNames,
+        }).vaultPathBoundary,
+      ).toBeUndefined()
+    })
+
+    it('carries no environment prompt without an app to read the vault path from', () => {
+      // Real call sites all pass `app`; omitting it is what the module-branch
+      // and policy tests here do, and it must not throw.
+      expect(
+        resolveChatModeRuntime({
+          mode: 'max',
+          assistant,
+          assistantEnabledToolNames,
+        }).modeEnvironmentPrompt,
+      ).toBeUndefined()
+    })
+  })
+
+  describe('resolveNativeToolPolicy', () => {
+    const policyFor = (mode: 'ask' | 'agent' | 'max', yoloEnabled = false) =>
+      resolveNativeToolPolicy(
+        resolveChatModeRuntime({
+          mode,
+          yoloEnabled,
+          assistant,
+          assistantEnabledToolNames,
+        }),
+      )
+
+    it('promises a provider-run toolset no more than Agent does, even in Max', () => {
+      expect(policyFor('ask')).toBe('read-only')
+      expect(policyFor('agent')).toBe('edit')
+      expect(policyFor('max')).toBe('edit')
+    })
+
+    it('lifts the restriction in Max under YOLO, same as Agent', () => {
+      expect(policyFor('agent', true)).toBe('unrestricted')
+      expect(policyFor('max', true)).toBe('unrestricted')
+    })
+  })
+
+  // YOLO Max: the `native_files`
+  // tools are enabled by default at the capability level, so they land in
+  // `assistantEnabledToolNames` for every assistant. The only thing keeping
+  // them out of Ask and Agent is `native_files`'s `chatModes: ['max']`.
+  describe('native_files (chatModes: max)', () => {
+    const withNativeFiles = [
+      'yolo_local__fs_read',
+      'yolo_local__read_file',
+      'yolo_local__write_file',
+      'yolo_local__edit_file',
+    ]
+
+    it('hides the native tools in agent mode, unlike the ask-only exclusions', () => {
+      const runtime = resolveChatModeRuntime({
+        mode: 'agent',
+        assistant,
+        assistantEnabledToolNames: withNativeFiles,
+      })
+
+      expect(runtime.allowedToolNames).toEqual(['yolo_local__fs_read'])
+    })
+
+    it('hides the native tools in ask mode too', () => {
+      const runtime = resolveChatModeRuntime({
+        mode: 'ask',
+        assistant,
+        assistantEnabledToolNames: withNativeFiles,
+      })
+
+      expect(runtime.allowedToolNames).toEqual(['yolo_local__fs_read'])
+    })
+
+    it('still hides them when YOLO is on in agent mode', () => {
+      const runtime = resolveChatModeRuntime({
+        mode: 'agent',
+        yoloEnabled: true,
+        assistant,
+        assistantEnabledToolNames: withNativeFiles,
+      })
+
+      expect(runtime.allowedToolNames).toEqual(['yolo_local__fs_read'])
+      expect(runtime.bypassToolApproval).toBe(true)
+    })
+  })
+})
+
+describe('ASSISTANT_INERT_BUILTIN_TOOL_NAMES', () => {
+  // A switch the user can move is a promise that moving it does something. The
+  // agent editor drops these rows rather than showing a switch that cannot
+  // keep it — the failure is not cosmetic: a user who turns `native_files`
+  // "off" would be told this agent cannot reach their filesystem, while Max
+  // goes on reading and writing it.
+  it('holds native_files, whose switch no mode obeys', () => {
+    for (const name of getToolNamesForCapability('native_files')) {
+      expect(ASSISTANT_INERT_BUILTIN_TOOL_NAMES.has(name)).toBe(true)
+    }
+  })
+
+  it('leaves terminal alone, since agent mode does obey its switch', () => {
+    for (const name of getToolNamesForCapability('terminal')) {
+      expect(ASSISTANT_INERT_BUILTIN_TOOL_NAMES.has(name)).toBe(false)
+    }
+  })
+
+  // The property, so a capability added later is judged rather than assumed:
+  // a tool is here exactly when no mode both exposes its capability and then
+  // leaves the choice to the assistant.
+  it('holds a capability exactly when every mode exposing it forces it on', () => {
+    for (const capability of listCapabilities()) {
+      const forcedEverywhere =
+        capability.chatModes.length > 0 &&
+        capability.chatModes.every((mode) => {
+          const runtime = resolveChatModeRuntime({
+            mode,
+            yoloEnabled: false,
+            assistant: {
+              toolPreferences: {},
+              builtinCapabilityPreferences: {
+                [capability.id]: { enabled: false },
+              },
+              toolServerPreferences: {},
+            },
+            assistantEnabledToolNames: [],
+          })
+          const names = getToolNamesForCapability(capability.id)
+          return names.every((name) => runtime.allowedToolNames?.includes(name))
+        })
+
+      const names = getToolNamesForCapability(capability.id)
+      for (const name of names) {
+        expect(ASSISTANT_INERT_BUILTIN_TOOL_NAMES.has(name)).toBe(
+          forcedEverywhere,
+        )
+      }
+    }
+  })
+})
