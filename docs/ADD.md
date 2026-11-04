@@ -1,0 +1,3 @@
+# Additive implementation
+
+Small host feature in src/features/ob-bot. Bots reuse YOLO Assistant profiles and settings. A separate versioned plugin-directory JSON holds DM UUID bindings, groups and tickets (never provider credentials). ChatManager creates and restores bot-bound native chats. Groups use AgentRunApi → AgentSessionService → NativeAgentRuntime with explicit read-only capability; separate calls for lead planning, each worker, and merge. Policy: three workers, concurrency one, one planning round, two delegation hops; no recursive delegation. Unknown Grokbot visual design needs user screenshots.
