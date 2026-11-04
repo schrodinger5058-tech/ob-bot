@@ -18,3 +18,7 @@ The full Jest suite and repository-wide lint were not run. Focused tests verify 
 Artifacts: repository-root `main.js` (~5.6 MB), `styles.css` (~488 KB), `manifest.json` (ob-bot, 0.2.0-dev). Build artifacts follow upstream gitignore and are not committed. Runtime component and module build outputs also remain generated artifacts. Initial rsync was unavailable; a Python copy excluding .git/node_modules was used. An initial npm command ran from the workspace root and exited without installing; installation was rerun successfully from the project directory.
 
 No Obsidian GUI, popout, side-by-side optional module activation, or iPhone device tests were performed. iPhone on-device unverified.
+
+## Remote delivery blocker
+
+Normal pushes to `origin/refactor/yolo-base` were attempted three times. The remote rejected the first with `fatal error in commit_refs_rules`, and the next two with `Internal Server Error` (GitHub request IDs `E992:C20B5:6C96BB:9B2C52:6AEB1430` and `EC33:27C9D5:6B5C1B:99AB40:6AEB1440`, 2026-11-04 11:17 UTC). Read access works; `refs/heads/legacy/v0.1.0` and `refs/tags/v0.1.0` remain `603d0de4671aea47419685699064407575dfaeca`. No force push or remote rule changes were attempted. The branch is committed locally; a Git bundle is provided at `/workspace/ob-bot-work/ob-bot-refactor.bundle` as a transfer fallback. Origin push is not complete.

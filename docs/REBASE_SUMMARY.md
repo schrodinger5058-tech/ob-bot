@@ -38,3 +38,7 @@ Importer is not implemented. Back up the complete old plugin directory/data.json
 Grokbot home, DM, group, bot detail, settings and tasks: **needs user screenshots**. No proprietary visual details were invented. The original exact ten acceptance bullets are unavailable; ACCEPTANCE.md explicitly uses a provisional ten-category mapping from this reset request.
 
 **iPhone on-device unverified.** Remote MCP is disabled on mobile in the inherited baseline. Streaming/network transports, keyboard/safe-area behavior, WASM/IndexedDB pressure, suspension recovery, CLI gates, module coexistence and Obsidian popout behavior require real application/device tests.
+
+## Delivery status
+
+Local work is committed and the worktree is clean. Origin branch creation is blocked by repeated server-side rejection (`commit_refs_rules`, then GitHub `Internal Server Error`); see BUILD_STATUS.md. The required push gate remains unmet. Retry `git push -u origin refactor/yolo-base` after the remote issue is resolved. A transfer bundle is available at `/workspace/ob-bot-work/ob-bot-refactor.bundle`.
